@@ -1,0 +1,393 @@
+﻿# harness-cli
+
+Lightweight Rust prototype for an LLM harness CLI focused on cache-friendly calls,
+provider onboarding, native shell execution profiles, and forgiving local tools.
+
+## Install and launch
+
+Install the short launcher into Cargo's bin directory:
+
+```powershell
+cargo install --path . --bin harness --force
+```
+
+Then start the interactive interface like other terminal agents:
+
+```powershell
+harness
+```
+
+On first launch, if no provider is configured yet, `harness` opens a
+Ratatui/Crossterm terminal setup screen with a status header, workspace/config
+paths, command hints, and the `[no provider] >` prompt. From there, run
+`/provider add` to start provider setup from the interface; the current provider
+wizard still reuses the existing prompt flow. After a provider with at least one
+model is saved, the same launch starts the REPL with that provider; later
+`harness` opens the REPL directly. Non-interactive runs fall back to the
+line-mode setup screen so tests and pipes do not enter raw mode.
+
+## Current commands
+
+List models from an OpenAI-compatible provider:
+
+```powershell
+harness provider models --name custom --url https://api.example.com/v1 --key $env:API_KEY
+```
+
+List built-in subscription profile hints:
+
+```powershell
+harness provider subscriptions
+```
+
+List saved providers without printing API keys:
+
+```powershell
+harness provider list --config .harness/providers.json
+```
+
+Save every discovered model into a local config:
+
+```powershell
+harness provider add --config .harness/providers.json --name custom --url https://api.example.com/v1 --key $env:API_KEY --add-all
+```
+
+Interactively enter provider details, list models, and choose `0) Add all` or a model number:
+
+```powershell
+harness provider add --interactive --config .harness/providers.json
+```
+
+Save selected models:
+
+```powershell
+harness provider add --config .harness/providers.json --name local-openai --url http://localhost:11434/v1 --key local-key --model qwen3-coder
+```
+
+Save a provider without writing the API key into the config:
+
+```powershell
+harness provider add --config .harness/providers.json --name gateway --url https://api.example.com/v1 --key-env GATEWAY_API_KEY --model gateway-model
+```
+
+Save a provider whose API expects a custom auth header:
+
+```powershell
+harness provider add --config .harness/providers.json --name header-gateway --url https://api.example.com/v1 --key-env HEADER_GATEWAY_API_KEY --auth header --auth-header x-api-key --add-all
+```
+
+Save a custom provider that exposes DeepSeek-style automatic cache metrics:
+
+```powershell
+harness provider add --config .harness/providers.json --name cache-gateway --url https://api.example.com/v1 --key-env CACHE_GATEWAY_API_KEY --cache automatic --cache-hit-field prompt_cache_hit_tokens --cache-miss-field prompt_cache_miss_tokens --model deepseek-v4-pro
+```
+
+Save a provider that should use the OpenAI Responses API instead of Chat Completions:
+
+```powershell
+harness provider add --config .harness/providers.json --name openai-responses --url https://api.openai.com/v1 --key $env:OPENAI_API_KEY --chat-api openai-responses --model gpt-5
+```
+
+Save a provider that should use the Codex-specific Responses route:
+
+```powershell
+harness provider add --config .harness/providers.json --name codex --url https://api.openai.com/v1 --key-env OPENAI_API_KEY --chat-api openai-codex-responses --model gpt-5-codex
+```
+
+Known built-in names reuse their profile metadata when saved this way, so
+`--name claude` stores Anthropic `x-api-key` auth and native Messages API routing.
+Custom providers can set `--chat-api openai-compatible`, `--chat-api openai-responses`,
+`--chat-api openai-codex-responses`, or `--chat-api anthropic-messages`.
+
+Run one cache-aware chat request through a saved provider:
+
+```powershell
+harness chat once --config .harness/providers.json --provider custom --model deepseek-v4-pro --message "write notes.txt"
+```
+
+Stream an OpenAI-compatible chat response as text deltas:
+
+```powershell
+harness chat stream --config .harness/providers.json --provider custom --model gpt-stream --message "hello"
+```
+
+Run an agent loop that executes returned tool calls and continues until the model
+returns a final answer. Add `--stream` to consume the response over SSE
+(OpenAI-compatible providers) instead of a single blocking request:
+
+```powershell
+harness agent run --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --message "write notes.txt" --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000 --stream
+```
+
+Save a full JSON trace and a separate tool-error report for an agent run:
+
+```powershell
+harness agent run --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --message "write notes.txt" --trace artifacts/agent-trace.json --tool-errors artifacts/tool-errors.json
+```
+
+Network-backed `provider models`, `provider add --add-all`,
+`provider add --interactive`, `chat once`, `chat stream`, `agent run`, and
+`repl` commands accept `--timeout-ms N` to tighten request timeouts when needed.
+
+Start the interactive REPL. On a real terminal it opens the **Ratatui chat TUI**;
+piped/non-TTY callers fall back to line mode. The chat TUI:
+
+- **Streams** responses over SSE (OpenAI-compatible providers): the model's
+  reasoning appears live as unlabeled dim/italic text, and each **tool call**
+  renders as a `●` card (marker colored gray running → green/red done) with its
+  name, compact arguments, a `⎿ summary` result line, and a `memo:` line when
+  the forgiving runtime auto-corrected the call.
+- Uses a **minimal Claude-Code-style layout**: a borderless transcript (`>` echoes
+  your turns, `●` marks answers), a single rounded input box with a `>` prompt and
+  soft-wrapped multi-line compose, a `✻ Working… (12s)` row (with elapsed time)
+  while the agent runs, and a
+  bottom status line with the active provider/model, workspace, and key hints.
+- Renders assistant answers as **Markdown**: headings, `-`/`*` bullets, fenced code
+  blocks, rules, and inline `**bold**`/`*italic*`/`` `code` ``.
+- Offers **slash-command autocomplete**: type `/` to open a filtered menu below the
+  input (`/p` → `/provider`, typed prefix highlighted, usage + description per row);
+  Up/Down select, Tab completes, Esc closes, Enter runs.
+  Commands: `/model PROVIDER MODEL`, `/provider`, `/history QUERY`, `/clear`,
+  `/new`, `/help`, `/exit`.
+- **Resumes the last chat on launch**: the conversation is persisted per
+  workspace and reloaded at startup (a `resumed session … (N messages)` notice
+  appears in the transcript). `/new` abandons it and starts a fresh session.
+- **Esc or Ctrl+C interrupts a running agent** (an `Interrupted by user` notice
+  appears; the partial trace is still saved). Streaming stops between tokens,
+  tool loops stop before the next round; the session stays open — when idle,
+  Esc/Ctrl+C exit as before. Scrolling keeps working while the agent runs.
+- Has a **multi-line prompt** (Shift/Alt+Enter inserts a newline; Left/Right/Home/
+  End move the caret) and **paste that never auto-submits** — pasted newlines stay
+  literal even on the legacy Windows console (a burst of key events is coalesced
+  into one paste).
+- Captures **Ctrl+V** from the system clipboard: text is inserted at the caret, a
+  PNG image is saved to `.harness/attachments` and referenced in the prompt.
+- Recalls prompt history with Up/Down, and scrolls the transcript with the **mouse
+  wheel** or PageUp/PageDown (new output snaps back to the bottom). The wheel
+  works because the TUI captures mouse events — to select/copy text, hold
+  **Shift while dragging** (the terminal's standard override for mouse-mode apps).
+
+```powershell
+harness repl --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --timeout-ms 60000 --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000
+```
+
+### Sessions and traces on disk
+
+Every chat and agent run is persisted automatically under a global per-user
+store (override the base directory with the `HARNESS_HOME` environment
+variable; default `~/.harness`):
+
+```
+~/.harness/projects/<workspace-slug>/
+├── sessions/
+│   ├── 2026-07-11T09-15-42Z_a1b2c3.jsonl   # one session = one append-only JSONL
+│   └── last                                 # pointer to the session resumed on launch
+└── traces/
+    └── 2026-07-11T09-15-42Z_deepseek_r3.json  # one agent run = one raw trace
+```
+
+- **Session JSONL**: first line is a `meta` header (session id, workspace,
+  starting provider/model, `parent_session` reserved for future compaction);
+  each following line is a `message` (exactly what the provider sees — filter
+  `type == "message"` to rebuild the conversation) or a `thinking` record
+  (model reasoning, kept for reading/analysis, never replayed to the provider).
+  Corrupt lines and dangling tool calls from a crash are skipped/trimmed on
+  resume.
+- **Trace files**: the raw agent trace (`ModelToolCalls` with the model's
+  original tool names/arguments, `ToolResult` with `ok`/`error`/`repaired` and
+  the repair-memo `hint`, thinking, final content) wrapped with `ts`,
+  `session_id`, and `turn` — one file per run, success or failure, including
+  one-shot `agent run`. Feed these to an LLM (or scripts) to compare models and
+  spot bad tool calls offline.
+- Persistence failures never kill the chat: they surface as warnings and the
+  conversation continues in memory.
+
+Check lightweight process/binary diagnostics:
+
+```powershell
+harness diagnostics --binary target/release/harness.exe --max-binary-bytes 5000000
+```
+
+Execute a repaired tool call directly:
+
+```powershell
+harness tool call --workspace . write_file '{"file":"notes.txt","text":"hello"}'
+```
+
+Append text without shelling out:
+
+```powershell
+harness tool call --workspace . append_file '{"file":"notes.txt","text":"\nnext line"}'
+```
+
+Execute a bounded-concurrency batch of tool calls:
+
+```powershell
+harness tool batch --workspace . --max-concurrency 4 --timeout-ms 10000 '[{"id":"one","name":"write_file","arguments":{"file":"one.txt","text":"1"}}]'
+```
+
+Capture the current system clipboard as a prompt-ready attachment:
+
+```powershell
+harness clipboard paste --workspace .
+```
+
+Capture already-pasted terminal text through the same attachment path:
+
+```powershell
+harness clipboard paste --workspace . --text "pasted text"
+```
+
+## Implemented core
+
+- Minimal system prompt under the 500-1000 token target.
+- Cache-aware request envelope with separate prefix and full request keys.
+- OpenAI-compatible chat request adapter with tool-call parsing.
+- OpenAI-compatible streaming chat adapter for data-only SSE text deltas.
+- OpenAI-compatible tool argument parsing repairs common malformed JSON and preserves
+  unrepaired raw arguments as `_raw_arguments` instead of failing the whole response.
+- Built-in provider family slots for `codex`, `xiaomi`, `glm`, `kimi`, and `claude`.
+- Built-in subscription metadata for `codex`, `xiaomi`, `glm`, `kimi`, `claude`, and `deepseek`.
+- Provider auth policy supports Bearer, custom header, env-backed subscription
+  keys, and explicit API-key override.
+- `provider list` prints saved providers, models, auth/cache/chat metadata, and
+  key source without exposing inline API keys.
+- Provider onboarding accepts `--auth bearer`, `--auth header --auth-header NAME`,
+  or `--auth subscription` for custom providers and model discovery.
+- Network-backed provider, chat, agent, and REPL commands accept
+  `--timeout-ms N` so long-running API calls can be bounded from the CLI.
+- Provider cache policy supports configurable cache-key headers, body-level
+  `cache_control` markers, and automatic cache-metric parsing.
+- Chat responses include a compact cache report with hit/miss tokens, hit ratio,
+  and saved prompt-token estimate when provider usage exposes cache metrics.
+- Provider chat routing supports OpenAI-compatible chat, OpenAI Responses API,
+  OpenAI Codex Responses API, and Anthropic Messages API format.
+- `provider add` accepts `--chat-api openai-compatible`, `openai-responses`,
+  `openai-codex-responses`, or `anthropic-messages` to save custom request routing metadata.
+- Codex profile uses the dedicated `/codex/responses` route instead of generic
+  Chat Completions.
+- Claude profile uses Anthropic `x-api-key` auth and native `/messages` requests.
+- Claude profile enables Anthropic automatic prompt caching with top-level
+  `cache_control: {"type":"ephemeral"}` in `/messages` request bodies.
+- DeepSeek profile treats context caching as automatic and parses `prompt_cache_hit_tokens`
+  / `prompt_cache_miss_tokens` from response usage.
+- OpenAI-compatible usage parser also reads nested `prompt_tokens_details.cached_tokens`.
+- OpenAI-compatible `/models` discovery with an explicit `Add all` choice.
+- Interactive provider onboarding can prompt for name, URL, and key, then save
+  `0) Add all` or a selected model number.
+- Provider onboarding accepts `--key-env ENV` so custom providers can resolve
+  subscription/API keys from the environment without storing secrets.
+- Provider onboarding accepts cache metadata flags such as `--cache automatic`,
+  `--cache-hit-field`, `--cache-miss-field`, `--cache header`,
+  `--cache body-cache-control`, and `--cache anthropic-automatic`.
+- JSON config store for custom providers, URLs, keys, and selected models.
+- Native shell profile selection for Windows and Linux.
+- Diagnostics command reports current process RSS, binary size, and optional limit checks.
+- Forgiving file-write tool that does not require a prior read and still records previous content.
+- Tool runtime for `file.read`, `file.tail`, `file.hash`, `file.stat`,
+  `file.write`, `file.append`, `file.replace`, `file.delete`, `file.move`,
+  `attachment.read`, and `shell.exec`, including common LLM alias repair.
+- Tool runtime can coerce common raw string or `_raw_arguments` mistakes into
+  structured arguments for file and shell tools.
+- Tool runtime coerces string numeric/boolean values such as `"lines": "2"`
+  or `"overwrite": "true"` for common LLM argument-shape mistakes.
+- Tool runtime drops `null`-valued arguments the model should have omitted and
+  runs the call anyway instead of failing.
+- When a tool call is tolerated after a repair, the tool result carries a `hint`
+  memo telling the model the canonical wire tool name and argument shape to use
+  next time, so it self-corrects instead of repeating the mistake. The memo only
+  fires on genuine deviations (a real alias or wrong argument), never on the
+  API-safe wire name the harness itself advertises (`file.write` is sent as
+  `file_write`), and it references the callable wire name, never a dotted name
+  the API would reject.
+- Single-file tools accept Codex/OpenAI-style `file_path` in addition to the
+  generic path aliases.
+- `file.write` also accepts Codex/OpenAI-style `contents`.
+- `file.append` supports `append_file`, Codex/OpenAI-style `file_path`, and
+  `contents` while preserving existing file content.
+- `file.replace` accepts Codex/OpenAI-style `file_path`, `old_string`, and
+  `new_string` arguments in addition to the generic aliases.
+- `file.move` accepts Codex/OpenAI-style `source_path`, `target_path`, and
+  `destination_path` arguments in addition to the generic aliases.
+- Bounded workspace file tools for truncated `file.read`, recursive `file.list`,
+  bounded suffix `file.tail`, streaming `file.hash`, metadata-only `file.stat`,
+  literal `file.search`, literal `file.replace`, safe delete, and non-shell
+  move/rename.
+- `file.list` stops traversal after `max_results + 1` visited entries, enough to
+  report truncation without collecting the whole workspace tree.
+- Attachment read tool repairs `image file: ...` references and only reads from
+  workspace `.harness/attachments` or user `.codex/attachments` roots.
+- Native shell command timeout, per-call `timeout_ms`, and bounded stdout/stderr
+  capture so tool execution does not hang on full pipes or retain unbounded
+  command output.
+- Timed-out shell commands kill the child process, join bounded stdout/stderr
+  readers, and retain captured output metadata for diagnostics.
+- Bounded tool scheduler for concurrent batch execution with order-preserving JSON results
+  and optional batch deadlines that mark unfinished calls as cancelled results.
+- Multi-turn agent runner that appends assistant tool-call messages, executes tools,
+  appends tool results, reports tool errors back to the model, and stops at a final
+  assistant answer.
+- `agent run` can write a full trace with model tool calls, tool results, and
+  final content via `--trace PATH`, plus failed tool results via
+  `--tool-errors PATH`.
+- `agent run` and `repl` accept `--max-rounds N` to bound repeated tool-call
+  loops. `agent run` defaults to 4 rounds; the interactive `repl`/chat is
+  unbounded by default (an exploring agent legitimately needs many rounds) —
+  pass `--max-rounds N` to cap it.
+- The agent's system prompt includes a one-line **environment description**
+  (OS, shell dialect, workspace root, and the fact that `cd` does not persist
+  between shell calls), so the model does not guess its surroundings and invent
+  Linux paths on Windows. The line is constant per session, keeping the prompt
+  cache prefix stable.
+- The shell tool **repairs Unix-isms before running a command** on Windows
+  PowerShell 5.1: `&&` chains are rewritten as `; if ($?) { … }` (keeping
+  stop-on-failure semantics), and a leading `cd <path>` into a directory that
+  does not exist (e.g. a hallucinated `/mnt/<project>`) is dropped because
+  commands already run in the workspace. Each rewrite sets `repaired: true`,
+  records `repair_note`/`original_command` in the result metadata, and hands
+  the model a corrective memo. On failure the command's stderr is included in
+  the model-visible content, so the model can see *why* the call failed.
+- `agent run` and `repl` accept `--max-tool-concurrency N` to cap parallel
+  tool execution when a model returns many calls at once.
+- `agent run` and `repl` accept `--tool-timeout-ms N` to cap a whole tool-call
+  batch in each agent round.
+- Clipboard capture backend for text and PNG image attachments with prompt fragments.
+- Native system clipboard reader for Windows and Linux command-line environments.
+- Interactive terminal REPL with Ctrl+V text/image paste handling, Enter submit,
+  Ctrl+C exit, in-session history search, model switching, and streaming agent
+  progress/output events.
+- Bracketed paste support in the REPL and setup TUI so multi-line text and
+  clipboard pastes arrive as one atomic event instead of submitting on the first
+  newline; pastes inside the provider wizard route into the active field (e.g. an
+  API key) with trailing clipboard newlines stripped.
+- Ratatui chat TUI for the live session on a real terminal: a scrolling
+  transcript that folds in streamed tool rounds, tool results, and assistant
+  output, plus a prompt editor and bracketed paste. Non-TTY runs (pipes, tests)
+  keep the line-mode REPL.
+- Chat TUI in-session commands and navigation: `/model PROVIDER MODEL` (live
+  provider/model switch), `/history QUERY`, `/clear`, `/help` (command palette
+  overlay), `/exit`; Up/Down recall previous prompts and PageUp/PageDown scroll
+  the transcript (new output snaps back to the bottom).
+- Ratatui/Crossterm no-provider setup TUI for the real `harness` terminal
+  launch path, with line-mode fallback for non-TTY output.
+
+## Workspace
+
+The repo is a cargo workspace. `crates/harness-tui/` is our own terminal UI
+library (line-based rendering, native-scrollback screen model) that will
+replace ratatui + crossterm for the interactive front ends. Run its tests with
+`cargo test -p harness-tui`; run everything with `cargo test --workspace`.
+
+## Verification
+
+```powershell
+cargo test --workspace
+```
+
+Linux verification was run under WSL2 Ubuntu 24.04 with a separate target dir:
+
+```bash
+CARGO_TARGET_DIR=/tmp/rust-harness-target-linux cargo test
+CARGO_TARGET_DIR=/tmp/rust-harness-target-linux cargo clippy --all-targets -- -D warnings
+CARGO_TARGET_DIR=/tmp/rust-harness-target-linux cargo build --release
+```

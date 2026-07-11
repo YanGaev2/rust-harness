@@ -6,4 +6,5 @@
 //! docs/superpowers/specs/2026-07-11-harness-tui-design.md
 
 pub mod diff;
+pub mod headless;
 pub mod text;

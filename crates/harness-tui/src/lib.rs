@@ -7,5 +7,6 @@
 
 pub mod diff;
 pub mod headless;
+pub mod input;
 pub mod terminal;
 pub mod text;

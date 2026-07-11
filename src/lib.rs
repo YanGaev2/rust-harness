@@ -1,0 +1,17 @@
+pub mod agent;
+pub mod chat;
+pub mod chat_client;
+pub mod cli;
+pub mod clipboard;
+pub mod config;
+pub mod diagnostics;
+pub mod model_client;
+pub mod platform;
+pub mod prompt;
+pub mod providers;
+pub mod repl;
+pub mod request;
+pub mod runtime;
+pub mod session;
+pub mod tools;
+pub mod tui;

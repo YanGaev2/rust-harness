@@ -589,3 +589,31 @@ fn busy_action_cancels_on_esc_and_ctrl_c_only() {
         BusyAction::Ignore
     );
 }
+
+#[test]
+fn stale_running_card_from_cancelled_run_does_not_block_next_flush() {
+    let mut app = app();
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::ToolCallStarted {
+        round: 1,
+        id: "c-stale".to_string(),
+        name: "file.read".to_string(),
+        arguments: json!({"path": "a.txt"}),
+    });
+    // Cancelled run: no ToolResult ever arrives for the card.
+    app.set_busy(false);
+    assert!(!app.take_scrollback(80).is_empty());
+
+    // Next turn: finalized entries must keep flushing while busy even
+    // though a flushed Running card exists earlier in the transcript.
+    app.push_user_message("next question");
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::FinalContentDelta("thinking...".to_string()));
+    let flushed = app.take_scrollback(80);
+    assert!(
+        flushed
+            .iter()
+            .any(|line| line.text().contains("next question")),
+        "user entry must flush during the next busy turn"
+    );
+}

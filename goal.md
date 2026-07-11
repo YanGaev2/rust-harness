@@ -450,3 +450,21 @@ paste support for text/images.
   Cargo.toml entirely; `tests/tui_screen.rs` asserts on line text instead of
   ratatui buffers and `tests/tui_stack.rs` now guards that the legacy stack
   stays out of the manifest.
+- 2026-07-12 (codex review round): adversarial correctness review
+  (`agents/codex-review-harness-tui.md`, 19 findings) with 13 fixed same-day:
+  Alt+Enter now decodes as Enter+alt (was a literal `\r`); parser `flush()`
+  keeps torn UTF-8; a stale `Running` tool card from a cancelled run no longer
+  freezes the next turn's scrollback flush (regression test); `Screen` reserves
+  the cursor row with an empty panel, tail-clips oversized panels, and uses
+  saturating origin math; Windows console gets `DISABLE_NEWLINE_AUTO_RETURN` +
+  `ENABLE_PROCESSED_OUTPUT` (exact-width status row no longer scrolls the
+  panel) and input code page forced to UTF-8 (Cyrillic input) with restore;
+  unix raw mode pins `VMIN=1/VTIME=0`; non-Linux unix targets are a
+  compile_error (the FFI layer is linux-gnu only); the stdin reader is one
+  process-wide thread (setup→chat handoff can't race stdin), EOF/read errors
+  end the TUI loops instead of idle-spinning; busy loop re-checks terminal
+  size and consumes queued Esc as cancel before the finished check. Deferred
+  (documented in the review file): resize leaves the old panel footprint on
+  width-only changes, torn escapes on >3ms read splits, legacy burst-coalesce
+  semantics, DSR robustness, guard non-composability, worker survival on draw
+  errors, char-count (not width) panel row caps for CJK.

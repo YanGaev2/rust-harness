@@ -140,3 +140,29 @@ fn width_is_exposed_for_layout() {
     assert_eq!(screen.width(), 72);
     assert_eq!(screen.height(), 20);
 }
+
+#[test]
+fn emit_with_no_panel_keeps_origin_on_screen() {
+    let (mut screen, buf) = screen(40, 5, 4);
+    // No panel painted yet; emit two lines starting at the bottom row.
+    screen.emit(&lines(&["a", "b"])).unwrap();
+    screen.render_panel(lines(&["p"])).unwrap();
+    let out = buf.contents();
+    // The panel lands on the last row (4 → escape 5), never outside.
+    assert!(out.contains("\x1b[5;1H"));
+    assert!(!out.contains("\x1b[6;1H"));
+}
+
+#[test]
+fn oversized_panel_is_tail_clipped_without_panicking() {
+    let (mut screen, buf) = screen(40, 3, 0);
+    let texts: Vec<String> = (0..6).map(|i| format!("row{i}")).collect();
+    let panel: Vec<Line> = texts.iter().map(Line::raw).collect();
+    screen.render_panel(panel).unwrap();
+    let out = buf.contents();
+    // Only the tail rows are painted; the head is dropped.
+    assert!(out.contains("row5"));
+    assert!(!out.contains("row0"));
+    // Shrinking the screen further must not panic either.
+    screen.resize(40, 2).unwrap();
+}

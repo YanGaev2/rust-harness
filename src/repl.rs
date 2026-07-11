@@ -511,10 +511,11 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                             app.push_agent_event(&event);
                         }
                         app.tick();
+                        check_resize(&mut screen)?;
                         draw_chat(&mut screen, &mut app)?;
-                        if worker.is_finished() {
-                            break worker.join().expect("agent worker panicked");
-                        }
+                        // Poll input BEFORE the finished check so a
+                        // queued Esc is consumed as a busy cancel and
+                        // can never leak into the idle loop as an exit.
                         for event in pump
                             .poll(Duration::from_millis(50))
                             .map_err(ReplError::Io)?
@@ -522,6 +523,9 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                             if matches!(busy_action(&event), BusyAction::Cancel) {
                                 cancel.store(true, Ordering::SeqCst);
                             }
+                        }
+                        if worker.is_finished() {
+                            break worker.join().expect("agent worker panicked");
                         }
                     };
                     while let Ok(event) = event_rx.try_recv() {
@@ -592,41 +596,64 @@ fn check_resize(screen: &mut Screen) -> Result<(), ReplError> {
 /// resizes, and keep draining agent events while a run is busy. Shared
 /// with the setup TUI (`crate::tui`), which runs the same poll loop.
 pub(crate) struct InputPump {
-    rx: mpsc::Receiver<Vec<u8>>,
     parser: Parser,
 }
 
+/// One process-wide stdin reader: front ends hand off within a single
+/// process (setup TUI -> chat TUI), and two blocking readers would race
+/// for stdin and drop the winner's bytes. The thread is spawned once;
+/// every InputPump polls the same channel (consumers are sequential).
+static STDIN_CHUNKS: std::sync::OnceLock<std::sync::Mutex<mpsc::Receiver<io::Result<Vec<u8>>>>> =
+    std::sync::OnceLock::new();
+
 impl InputPump {
     pub(crate) fn start() -> Self {
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut buf = [0u8; 1024];
-            loop {
-                match tui_terminal::read_input(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+        STDIN_CHUNKS.get_or_init(|| {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match tui_terminal::read_input(&mut buf) {
+                        Ok(0) => {
+                            let _ = tx.send(Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "stdin closed",
+                            )));
+                            break;
+                        }
+                        Ok(n) => {
+                            if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            let _ = tx.send(Err(err));
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
-            }
+            });
+            std::sync::Mutex::new(rx)
         });
         InputPump {
-            rx,
             parser: Parser::new(),
         }
     }
 
     /// Wait up to `timeout` for input, then drain the short burst that
-    /// follows and coalesce it into paste blocks — the classic defense
-    /// against legacy-console paste keystreams.
+    /// follows and coalesce it into paste blocks - the classic defense
+    /// against legacy-console paste keystreams. EOF and read errors
+    /// surface as Err so the caller exits instead of spinning idle.
     pub(crate) fn poll(&mut self, timeout: Duration) -> io::Result<Vec<TuiEvent>> {
-        match self.rx.recv_timeout(timeout) {
-            Ok(chunk) => {
+        let rx = STDIN_CHUNKS
+            .get()
+            .expect("InputPump::start spawns the reader")
+            .lock()
+            .expect("stdin pump lock");
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(chunk)) => {
                 let mut events = self.parser.feed(&chunk);
-                while let Ok(chunk) = self.rx.recv_timeout(Duration::from_millis(3)) {
+                while let Ok(Ok(chunk)) = rx.recv_timeout(Duration::from_millis(3)) {
                     events.extend(self.parser.feed(&chunk));
                 }
                 // The burst window doubles as the Esc disambiguation
@@ -634,8 +661,12 @@ impl InputPump {
                 events.extend(self.parser.flush());
                 Ok(coalesce_burst(events))
             }
+            Ok(Err(err)) => Err(err),
             Err(mpsc::RecvTimeoutError::Timeout) => Ok(self.parser.flush()),
-            Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "stdin reader stopped",
+            )),
         }
     }
 }

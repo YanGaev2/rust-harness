@@ -143,22 +143,18 @@ impl Parser {
         events
     }
 
-    /// Resolve pending ambiguity after a read timeout: a buffered lone
-    /// Esc becomes the Esc key; a partial non-escape sequence (torn
-    /// UTF-8) is dropped. Inside a paste we keep waiting.
+    /// Resolve the Esc ambiguity after a read timeout: a buffered lone
+    /// Esc becomes the Esc key (any tail after it is re-fed). Partial
+    /// non-escape sequences (torn UTF-8) are kept — their continuation
+    /// bytes may still arrive. Inside a paste we keep waiting.
     pub fn flush(&mut self) -> Vec<Event> {
-        if self.paste.is_some() || self.pending.is_empty() {
+        if self.paste.is_some() || self.pending.first() != Some(&ESC) {
             return Vec::new();
         }
-        let mut events = Vec::new();
-        if self.pending[0] == ESC {
-            events.push(Event::Key(KeyEvent::plain(KeyCode::Esc)));
-            let rest = self.pending.split_off(1);
-            self.pending.clear();
-            events.extend(self.feed(&rest));
-        } else {
-            self.pending.clear();
-        }
+        let mut events = vec![Event::Key(KeyEvent::plain(KeyCode::Esc))];
+        let rest = self.pending.split_off(1);
+        self.pending.clear();
+        events.extend(self.feed(&rest));
         events
     }
 
@@ -258,7 +254,11 @@ fn parse_ss3(buf: &[u8]) -> Step {
 
 /// ESC + one key: the Alt-modified version of that key.
 fn parse_alt(buf: &[u8]) -> Step {
-    match parse_utf8(&buf[1..]) {
+    // Decode the suffix with the full key decoder so Alt+Enter stays
+    // Enter (not a literal '\r') and Alt+Ctrl keeps both modifiers.
+    // parse_escape handles ESC ESC before we get here, so the suffix
+    // can never itself start an escape sequence or a paste.
+    match parse_one(&buf[1..]) {
         Step::Incomplete => Step::Incomplete,
         Step::Emit(n, Event::Key(key)) => Step::Emit(
             n + 1,
@@ -271,7 +271,7 @@ fn parse_alt(buf: &[u8]) -> Step {
             }),
         ),
         Step::Consume(n) | Step::Emit(n, _) => Step::Consume(n + 1),
-        Step::PasteStart(_) => unreachable!("utf8 never starts a paste"),
+        Step::PasteStart(n) => Step::PasteStart(n + 1),
     }
 }
 

@@ -727,10 +727,13 @@ impl ChatApp {
         let mut limit = self.transcript.len();
         if self.busy {
             limit = limit.saturating_sub(1);
-            if let Some(running) = self.transcript.iter().position(
+            // Only unflushed Running cards hold the prefix back — a
+            // stale card from a cancelled run was already emitted and
+            // must not freeze every later turn's flush.
+            if let Some(running) = self.transcript[self.emitted..].iter().position(
                 |entry| matches!(entry, ChatEntry::Tool(tool) if tool.status == ToolStatus::Running),
             ) {
-                limit = limit.min(running);
+                limit = limit.min(self.emitted + running);
             }
         }
         if limit <= self.emitted {

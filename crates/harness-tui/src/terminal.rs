@@ -57,6 +57,8 @@ pub mod esc {
     pub const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
     pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
     pub const CLEAR_LINE: &str = "\x1b[2K";
+    /// Erase from the cursor to the end of the screen.
+    pub const CLEAR_DOWN: &str = "\x1b[0J";
 
     pub fn move_to(row: u16, col: u16) -> String {
         format!("\x1b[{};{}H", row + 1, col + 1)
@@ -80,6 +82,48 @@ pub fn is_tty() -> bool {
 /// (width, height) of the stdout terminal in cells.
 pub fn size() -> Result<(u16, u16), TerminalError> {
     sys::size()
+}
+
+/// Blocking read of raw input bytes from the terminal. Returns the
+/// number of bytes read (0 = EOF). Runs on the event-pump thread.
+pub fn read_input(buf: &mut [u8]) -> io::Result<usize> {
+    sys::read_input(buf)
+}
+
+/// Ask the terminal where the cursor is (DSR): returns 0-based
+/// (row, col). Call only at startup, before the input pump owns stdin —
+/// the response arrives interleaved with any pending keystrokes.
+pub fn cursor_position() -> Result<(u16, u16), TerminalError> {
+    let mut out = io::stdout();
+    out.write_all(b"\x1b[6n")?;
+    out.flush()?;
+    let mut collected: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 32];
+    for _ in 0..16 {
+        let n = sys::read_input(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        collected.extend_from_slice(&chunk[..n]);
+        if collected.contains(&b'R') {
+            break;
+        }
+    }
+    parse_cursor_report(&collected).ok_or(TerminalError::Platform("cursor position report"))
+}
+
+/// Extract `ESC [ row ; col R` from a byte stream that may contain
+/// unrelated pending input around it.
+fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
+    let start = bytes.windows(2).position(|w| w == b"\x1b[")?;
+    let rest = &bytes[start + 2..];
+    let end = rest.iter().position(|&b| b == b'R')?;
+    let body = std::str::from_utf8(&rest[..end]).ok()?;
+    let (row, col) = body.split_once(';')?;
+    Some((
+        row.parse::<u16>().ok()?.saturating_sub(1),
+        col.parse::<u16>().ok()?.saturating_sub(1),
+    ))
 }
 
 /// The live terminal: owns the output writer, keeps raw mode for its
@@ -112,6 +156,13 @@ impl Terminal {
         let mut terminal = Terminal { out, _raw: None };
         let _ = terminal.write_setup();
         terminal
+    }
+
+    /// Write raw bytes and flush — the primitive `core::Screen` builds
+    /// its synchronized frames on.
+    pub fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.out.write_all(bytes)?;
+        self.out.flush()
     }
 
     fn write_setup(&mut self) -> Result<(), TerminalError> {
@@ -292,6 +343,18 @@ mod sys {
             }
         }
     }
+
+    pub fn read_input(buf: &mut [u8]) -> std::io::Result<usize> {
+        unsafe extern "C" {
+            fn read(fd: i32, buf: *mut core::ffi::c_void, count: usize) -> isize;
+        }
+        let n = unsafe { read(STDIN_FD, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -418,6 +481,36 @@ mod sys {
             unsafe {
                 SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved_out);
             }
+        }
+    }
+
+    /// With `ENABLE_VIRTUAL_TERMINAL_INPUT` set, `ReadFile` on the
+    /// console input handle delivers keys as a VT byte stream.
+    pub fn read_input(buf: &mut [u8]) -> std::io::Result<usize> {
+        unsafe extern "system" {
+            fn ReadFile(
+                handle: super::sys::Handle,
+                buffer: *mut core::ffi::c_void,
+                to_read: u32,
+                read: *mut u32,
+                overlapped: *mut core::ffi::c_void,
+            ) -> i32;
+        }
+        let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+        let mut read = 0u32;
+        let ok = unsafe {
+            ReadFile(
+                handle,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(read as usize)
         }
     }
 }

@@ -5,6 +5,7 @@
 //! atomically. Design spec:
 //! docs/superpowers/specs/2026-07-11-harness-tui-design.md
 
+pub mod core;
 pub mod diff;
 pub mod headless;
 pub mod input;

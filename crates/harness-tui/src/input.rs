@@ -282,7 +282,7 @@ fn parse_csi(buf: &[u8]) -> Step {
     let mut i = 2;
     while i < buf.len() {
         match buf[i] {
-            0x30..=0x3f | 0x20..=0x2f => i += 1,
+            0x20..=0x3f => i += 1,
             0x40..=0x7e => break,
             // Malformed: drop the introducer and re-parse from there.
             _ => return Step::Consume(i),

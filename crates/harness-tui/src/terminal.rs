@@ -1,7 +1,11 @@
 //! Platform layer: escape sequences, raw mode, and guaranteed restore.
 
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
+use std::sync::Once;
+
+use crate::diff::RowUpdate;
+use crate::text::render_ansi;
 
 /// Errors from the terminal layer. Hand-rolled per repo convention.
 #[derive(Debug)]
@@ -78,6 +82,106 @@ pub fn size() -> Result<(u16, u16), TerminalError> {
     sys::size()
 }
 
+/// The live terminal: owns the output writer, keeps raw mode for its
+/// lifetime, restores everything on drop.
+pub struct Terminal {
+    out: Box<dyn Write + Send>,
+    _raw: Option<sys::RawModeGuard>,
+}
+
+impl Terminal {
+    /// Attach to the real terminal. Errors with `NotATty` when stdio is
+    /// piped — callers fall back to line mode.
+    pub fn stdout() -> Result<Terminal, TerminalError> {
+        if !sys::is_tty() {
+            return Err(TerminalError::NotATty);
+        }
+        sys::enable_vt()?;
+        let raw = sys::RawModeGuard::enable()?;
+        let mut terminal = Terminal {
+            out: Box::new(io::stdout()),
+            _raw: Some(raw),
+        };
+        terminal.write_setup()?;
+        Ok(terminal)
+    }
+
+    /// Same escape behavior against an injected writer; no tty or raw
+    /// mode. This is how tests observe exact bytes.
+    pub fn with_backend(out: Box<dyn Write + Send>) -> Terminal {
+        let mut terminal = Terminal { out, _raw: None };
+        let _ = terminal.write_setup();
+        terminal
+    }
+
+    fn write_setup(&mut self) -> Result<(), TerminalError> {
+        self.out.write_all(esc::HIDE_CURSOR.as_bytes())?;
+        self.out.write_all(esc::BRACKETED_PASTE_ON.as_bytes())?;
+        self.out.flush()?;
+        Ok(())
+    }
+
+    /// Write one frame of row updates atomically: the whole batch is
+    /// wrapped in synchronized-output markers so the terminal applies
+    /// it without intermediate states. `origin_row` is the terminal row
+    /// (0-based) where the pinned panel starts; update rows are
+    /// relative to it.
+    pub fn present(&mut self, updates: &[RowUpdate], origin_row: u16) -> io::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        for update in updates {
+            match update {
+                RowUpdate::Write { row, line } => {
+                    frame.push_str(&esc::move_to(origin_row + *row as u16, 0));
+                    frame.push_str(esc::CLEAR_LINE);
+                    frame.push_str(&render_ansi(line));
+                }
+                RowUpdate::Clear { row } => {
+                    frame.push_str(&esc::move_to(origin_row + *row as u16, 0));
+                    frame.push_str(esc::CLEAR_LINE);
+                }
+            }
+        }
+        frame.push_str(esc::SYNC_END);
+        self.out.write_all(frame.as_bytes())?;
+        self.out.flush()
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        let _ = self.out.write_all(restore_sequence().as_bytes());
+        let _ = self.out.flush();
+        // `_raw` drops after this, restoring console modes.
+    }
+}
+
+static PANIC_RESTORE: Once = Once::new();
+
+/// Install a panic hook that restores the terminal before the default
+/// hook prints the panic. Idempotent; chains the previous hook.
+pub fn install_panic_restore() {
+    PANIC_RESTORE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore_now();
+            previous(info);
+        }));
+    });
+}
+
+/// Best-effort immediate restore: escapes to stderr (stdout may be the
+/// panicking writer) plus console-mode restore. Safe to call anytime.
+pub fn restore_now() {
+    let mut err = io::stderr();
+    let _ = err.write_all(restore_sequence().as_bytes());
+    let _ = err.flush();
+    sys::restore_console();
+}
+
 #[cfg(unix)]
 mod sys {
     use super::TerminalError;
@@ -131,7 +235,6 @@ mod sys {
     }
 
     /// Unix terminals speak VT natively; nothing to enable.
-    #[allow(dead_code)] // used by Terminal (next commit)
     pub fn enable_vt() -> Result<(), TerminalError> {
         Ok(())
     }
@@ -152,13 +255,11 @@ mod sys {
 
     /// Raw input mode; restores the saved termios on drop. OPOST stays
     /// on so `\n` keeps working for scrollback printing.
-    #[allow(dead_code)] // used by Terminal (next commit)
     pub struct RawModeGuard {
         _private: (),
     }
 
     impl RawModeGuard {
-        #[allow(dead_code)] // used by Terminal (next commit)
         pub fn enable() -> Result<Self, TerminalError> {
             let mut original: Termios = unsafe { std::mem::zeroed() };
             if unsafe { tcgetattr(STDIN_FD, &mut original) } != 0 {
@@ -252,7 +353,6 @@ mod sys {
     }
 
     /// Turn on VT escape processing for stdout (Windows 10+).
-    #[allow(dead_code)] // used by Terminal (next commit)
     pub fn enable_vt() -> Result<(), TerminalError> {
         let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
         let mut mode = 0u32;
@@ -278,13 +378,11 @@ mod sys {
     }
 
     /// Raw input mode; restores saved console modes on drop.
-    #[allow(dead_code)] // used by Terminal (next commit)
     pub struct RawModeGuard {
         _private: (),
     }
 
     impl RawModeGuard {
-        #[allow(dead_code)] // used by Terminal (next commit)
         pub fn enable() -> Result<Self, TerminalError> {
             let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
             let mut mode = 0u32;

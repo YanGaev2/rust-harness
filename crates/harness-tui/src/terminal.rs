@@ -66,3 +66,260 @@ pub mod esc {
 pub fn restore_sequence() -> &'static str {
     "\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?25h"
 }
+
+/// True only when both stdin and stdout are terminals — the TUI needs
+/// raw key input *and* a screen to draw on.
+pub fn is_tty() -> bool {
+    sys::is_tty()
+}
+
+/// (width, height) of the stdout terminal in cells.
+pub fn size() -> Result<(u16, u16), TerminalError> {
+    sys::size()
+}
+
+#[cfg(unix)]
+mod sys {
+    use super::TerminalError;
+    use std::sync::Mutex;
+
+    // linux-gnu (glibc) layout; our supported Linux is WSL2.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct Termios {
+        c_iflag: u32,
+        c_oflag: u32,
+        c_cflag: u32,
+        c_lflag: u32,
+        c_line: u8,
+        c_cc: [u8; 32],
+        c_ispeed: u32,
+        c_ospeed: u32,
+    }
+
+    #[repr(C)]
+    struct WinSize {
+        row: u16,
+        col: u16,
+        xpixel: u16,
+        ypixel: u16,
+    }
+
+    unsafe extern "C" {
+        fn isatty(fd: i32) -> i32;
+        fn tcgetattr(fd: i32, termios: *mut Termios) -> i32;
+        fn tcsetattr(fd: i32, optional_actions: i32, termios: *const Termios) -> i32;
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+
+    const STDIN_FD: i32 = 0;
+    const STDOUT_FD: i32 = 1;
+    const TCSANOW: i32 = 0;
+    const TIOCGWINSZ: u64 = 0x5413;
+    const ISIG: u32 = 0o1;
+    const ICANON: u32 = 0o2;
+    const ECHO: u32 = 0o10;
+    const IEXTEN: u32 = 0o100000;
+    const ICRNL: u32 = 0o400;
+    const IXON: u32 = 0o2000;
+
+    static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
+
+    pub fn is_tty() -> bool {
+        unsafe { isatty(STDIN_FD) == 1 && isatty(STDOUT_FD) == 1 }
+    }
+
+    /// Unix terminals speak VT natively; nothing to enable.
+    #[allow(dead_code)] // used by Terminal (next commit)
+    pub fn enable_vt() -> Result<(), TerminalError> {
+        Ok(())
+    }
+
+    pub fn size() -> Result<(u16, u16), TerminalError> {
+        let mut ws = WinSize {
+            row: 0,
+            col: 0,
+            xpixel: 0,
+            ypixel: 0,
+        };
+        let rc = unsafe { ioctl(STDOUT_FD, TIOCGWINSZ, &mut ws as *mut WinSize) };
+        if rc != 0 || ws.col == 0 {
+            return Err(TerminalError::Platform("ioctl(TIOCGWINSZ)"));
+        }
+        Ok((ws.col, ws.row))
+    }
+
+    /// Raw input mode; restores the saved termios on drop. OPOST stays
+    /// on so `\n` keeps working for scrollback printing.
+    #[allow(dead_code)] // used by Terminal (next commit)
+    pub struct RawModeGuard {
+        _private: (),
+    }
+
+    impl RawModeGuard {
+        #[allow(dead_code)] // used by Terminal (next commit)
+        pub fn enable() -> Result<Self, TerminalError> {
+            let mut original: Termios = unsafe { std::mem::zeroed() };
+            if unsafe { tcgetattr(STDIN_FD, &mut original) } != 0 {
+                return Err(TerminalError::Platform("tcgetattr"));
+            }
+            *SAVED.lock().unwrap() = Some(original);
+            let mut raw = original;
+            raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
+            raw.c_iflag &= !(IXON | ICRNL);
+            if unsafe { tcsetattr(STDIN_FD, TCSANOW, &raw) } != 0 {
+                return Err(TerminalError::Platform("tcsetattr"));
+            }
+            Ok(RawModeGuard { _private: () })
+        }
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            restore_console();
+        }
+    }
+
+    /// Idempotent: restores the saved termios once, then becomes a no-op.
+    pub fn restore_console() {
+        if let Ok(mut saved) = SAVED.lock() {
+            if let Some(original) = saved.take() {
+                unsafe {
+                    tcsetattr(STDIN_FD, TCSANOW, &original);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+mod sys {
+    use super::TerminalError;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    type Handle = *mut core::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct ConsoleScreenBufferInfo {
+        size: Coord,
+        cursor_position: Coord,
+        attributes: u16,
+        window: SmallRect,
+        maximum_window_size: Coord,
+    }
+
+    unsafe extern "system" {
+        fn GetStdHandle(std_handle: u32) -> Handle;
+        fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
+        fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut ConsoleScreenBufferInfo) -> i32;
+    }
+
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+
+    /// u32::MAX = "nothing saved" sentinel.
+    static SAVED_IN: AtomicU32 = AtomicU32::new(u32::MAX);
+    static SAVED_OUT: AtomicU32 = AtomicU32::new(u32::MAX);
+
+    pub fn is_tty() -> bool {
+        let mut mode = 0u32;
+        let stdin_ok = unsafe { GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mut mode) } != 0;
+        let stdout_ok = unsafe { GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mut mode) } != 0;
+        stdin_ok && stdout_ok
+    }
+
+    /// Turn on VT escape processing for stdout (Windows 10+).
+    #[allow(dead_code)] // used by Terminal (next commit)
+    pub fn enable_vt() -> Result<(), TerminalError> {
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let mut mode = 0u32;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+            return Err(TerminalError::Platform("GetConsoleMode(stdout)"));
+        }
+        SAVED_OUT.store(mode, Ordering::SeqCst);
+        if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } == 0 {
+            return Err(TerminalError::Platform("SetConsoleMode(stdout, VT)"));
+        }
+        Ok(())
+    }
+
+    pub fn size() -> Result<(u16, u16), TerminalError> {
+        let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+        let mut info: ConsoleScreenBufferInfo = unsafe { std::mem::zeroed() };
+        if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) } == 0 {
+            return Err(TerminalError::Platform("GetConsoleScreenBufferInfo"));
+        }
+        let width = (info.window.right - info.window.left + 1) as u16;
+        let height = (info.window.bottom - info.window.top + 1) as u16;
+        Ok((width, height))
+    }
+
+    /// Raw input mode; restores saved console modes on drop.
+    #[allow(dead_code)] // used by Terminal (next commit)
+    pub struct RawModeGuard {
+        _private: (),
+    }
+
+    impl RawModeGuard {
+        #[allow(dead_code)] // used by Terminal (next commit)
+        pub fn enable() -> Result<Self, TerminalError> {
+            let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+            let mut mode = 0u32;
+            if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+                return Err(TerminalError::Platform("GetConsoleMode(stdin)"));
+            }
+            SAVED_IN.store(mode, Ordering::SeqCst);
+            let raw = (mode & !(ENABLE_ECHO_INPUT | ENABLE_LINE_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            if unsafe { SetConsoleMode(handle, raw) } == 0 {
+                return Err(TerminalError::Platform("SetConsoleMode(stdin, raw)"));
+            }
+            Ok(RawModeGuard { _private: () })
+        }
+    }
+
+    impl Drop for RawModeGuard {
+        fn drop(&mut self) {
+            restore_console();
+        }
+    }
+
+    /// Idempotent: swaps the sentinel back in, so a second call is a no-op.
+    pub fn restore_console() {
+        let saved_in = SAVED_IN.swap(u32::MAX, Ordering::SeqCst);
+        if saved_in != u32::MAX {
+            unsafe {
+                SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), saved_in);
+            }
+        }
+        let saved_out = SAVED_OUT.swap(u32::MAX, Ordering::SeqCst);
+        if saved_out != u32::MAX {
+            unsafe {
+                SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved_out);
+            }
+        }
+    }
+}

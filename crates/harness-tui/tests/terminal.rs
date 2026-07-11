@@ -28,6 +28,21 @@ fn restore_sequence_undoes_every_mode_we_set() {
     assert!(seq.contains(esc::SHOW_CURSOR));
 }
 
+// Platform queries must be safe to call in any environment. Under the
+// test harness stdio may or may not be a real console, so assert
+// consistency, not a fixed answer.
+#[test]
+fn size_is_consistent_with_tty_state() {
+    let tty = harness_tui::terminal::is_tty();
+    let size = harness_tui::terminal::size();
+    if tty {
+        let (width, height) = size.expect("a tty must report its size");
+        assert!(width > 0 && height > 0);
+    }
+    // Not a tty: size may fail — the important part is it returns an
+    // error instead of panicking, which reaching this line proves.
+}
+
 #[test]
 fn terminal_error_displays_human_messages() {
     assert_eq!(

@@ -1,6 +1,6 @@
 //! Tests for the pure chat state machine (`harness_cli::chat::ChatApp`) built
-//! on the in-repo `harness-tui` library. Ports the spirit of
-//! `tests/chat_tui.rs` onto the new pure line-based API.
+//! on the in-repo `harness-tui` library. Ports the spirit of the removed
+//! `tests/chat_tui.rs` suite onto the new pure line-based API.
 
 use harness_cli::agent::AgentEvent;
 use harness_cli::chat::{BusyAction, ChatAction, ChatApp, busy_action};

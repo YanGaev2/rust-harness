@@ -1,0 +1,949 @@
+use harness_cli::runtime::{ToolCall, ToolRuntime};
+use serde_json::json;
+use std::time::{Duration, Instant};
+
+#[test]
+fn runtime_repairs_common_file_write_alias_and_argument_names() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-1",
+            "write_file",
+            json!({"file": "notes\\todo.txt", "text": "ship runtime"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.write");
+    assert!(result.repaired);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
+        "ship runtime"
+    );
+}
+
+#[test]
+fn runtime_strips_unnecessary_null_argument_and_runs_anyway() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // The model passed `null` for an optional parameter it should have omitted.
+    // The harness must still execute and flag the call as repaired.
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-null",
+            "file.write",
+            json!({"path": "kept.txt", "content": "stays", "mode": null}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.write");
+    assert!(result.repaired);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("kept.txt")).unwrap(),
+        "stays"
+    );
+}
+
+#[test]
+fn runtime_does_not_flag_api_wire_tool_name_as_repaired() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // `file_write` is exactly the API-safe name the harness advertises to the
+    // model for the canonical `file.write` tool (dots are illegal in OpenAI
+    // tool names). Calling it is correct, not a mistake, so it must NOT be
+    // flagged as repaired and must not generate a corrective memo.
+    let result = runtime
+        .execute(ToolCall::new(
+            "wire",
+            "file_write",
+            json!({"path": "wire.txt", "content": "ok"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.write");
+    assert!(
+        !result.repaired,
+        "the advertised API wire name must not count as a repair"
+    );
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_write_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-write",
+            "write_file",
+            json!({
+                "file_path": "notes/todo.txt",
+                "contents": "ship codex-style write"
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.write");
+    assert!(result.repaired);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
+        "ship codex-style write"
+    );
+}
+
+#[test]
+fn runtime_can_append_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(root.path().join("notes").join("todo.txt"), "first\n").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-append",
+            "append_file",
+            json!({"file": "notes/todo.txt", "text": "second\n"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.append");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["created"], false);
+    assert_eq!(result.metadata["previous_len"], 6);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
+        "first\nsecond\n"
+    );
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_append_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(root.path().join("notes").join("todo.txt"), "first").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-append",
+            "file.append",
+            json!({
+                "file_path": "notes/todo.txt",
+                "contents": "\nsecond"
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.append");
+    assert!(result.repaired);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
+        "first\nsecond"
+    );
+}
+
+#[test]
+fn runtime_repairs_raw_string_file_write_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-raw-write",
+            "write_file",
+            json!({"_raw_arguments": "file: notes/raw.txt\ntext: repaired from raw"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.write");
+    assert!(result.repaired);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("raw.txt")).unwrap(),
+        "repaired from raw"
+    );
+}
+
+#[test]
+fn runtime_can_read_file_after_repaired_write() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    runtime
+        .execute(ToolCall::new(
+            "call-1",
+            "write_file",
+            json!({"filename": "notes/todo.txt", "content": "read me"}),
+        ))
+        .unwrap();
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-2",
+            "read_file",
+            json!({"file": "notes/todo.txt"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.read");
+    assert_eq!(result.content, "read me");
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_read_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(
+        root.path().join("notes").join("todo.txt"),
+        "read codex path",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-read",
+            "read_file",
+            json!({"file_path": "notes/todo.txt"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired);
+    assert_eq!(result.content, "read codex path");
+    assert_eq!(result.metadata["path"], "notes/todo.txt");
+}
+
+#[test]
+fn runtime_treats_raw_string_shell_arguments_as_command() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-raw-shell",
+            "run_command",
+            json!(native_echo_command()),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "shell.exec");
+    assert!(result.repaired);
+    assert_eq!(result.content.trim(), "harness-shell");
+}
+
+#[test]
+fn runtime_file_read_accepts_max_bytes_and_reports_truncation() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("logs")).unwrap();
+    std::fs::write(root.path().join("logs").join("big.txt"), "abcdefghij").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-read-limit",
+            "read_file",
+            json!({"filename": "logs/big.txt", "max_bytes": 4}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired);
+    assert_eq!(result.content, "abcd");
+    assert_eq!(result.metadata["path"], "logs/big.txt");
+    assert_eq!(result.metadata["bytes_read"], 4);
+    assert_eq!(result.metadata["total_bytes"], 10);
+    assert_eq!(result.metadata["truncated"], true);
+}
+
+#[test]
+fn runtime_can_tail_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("logs")).unwrap();
+    std::fs::write(
+        root.path().join("logs").join("app.log"),
+        "ignore\nline1\nline2\nline3\nline4\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-tail",
+            "tail_file",
+            json!({"file": "logs/app.log", "lines": 2, "max_bytes": 1024}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.tail");
+    assert!(result.repaired);
+    assert_eq!(result.content, "line3\nline4\n");
+    assert_eq!(result.metadata["path"], "logs/app.log");
+    assert_eq!(result.metadata["bytes_read"], 12);
+    assert_eq!(result.metadata["truncated_prefix"], true);
+    assert_eq!(result.metadata["max_lines"], 2);
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_path_for_tail_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("logs")).unwrap();
+    std::fs::write(
+        root.path().join("logs").join("app.log"),
+        "one\ntwo\nthree\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-tail",
+            "tail_file",
+            json!({"file_path": "logs/app.log", "lines": 2}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.tail");
+    assert!(result.repaired);
+    assert_eq!(result.content, "two\nthree\n");
+    assert_eq!(result.metadata["path"], "logs/app.log");
+    assert_eq!(result.metadata["max_lines"], 2);
+}
+
+#[test]
+fn runtime_coerces_string_numeric_limits_for_file_tail() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("logs")).unwrap();
+    std::fs::write(
+        root.path().join("logs").join("app.log"),
+        "ignore\nline1\nline2\nline3\nline4\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-tail-string-limits",
+            "tail_file",
+            json!({"file": "logs/app.log", "lines": "2", "max_bytes": "1024"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.tail");
+    assert!(result.repaired);
+    assert_eq!(result.content, "line3\nline4\n");
+    assert_eq!(result.metadata["max_bytes"], 1024);
+    assert_eq!(result.metadata["max_lines"], 2);
+}
+
+#[test]
+fn runtime_can_hash_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+    std::fs::write(root.path().join("artifacts").join("data.bin"), b"hash me").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-hash",
+            "hash_file",
+            json!({"file": "artifacts/data.bin"}),
+        ))
+        .unwrap();
+
+    let expected = blake3::hash(b"hash me").to_hex().to_string();
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.hash");
+    assert!(result.repaired);
+    assert_eq!(result.content, expected);
+    assert_eq!(result.metadata["path"], "artifacts/data.bin");
+    assert_eq!(result.metadata["bytes"], 7);
+    assert_eq!(result.metadata["algorithm"], "blake3");
+    assert_eq!(result.metadata["hash"], expected);
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_path_for_hash_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+    std::fs::write(root.path().join("artifacts").join("data.bin"), b"hash me").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-hash",
+            "hash_file",
+            json!({"file_path": "artifacts/data.bin"}),
+        ))
+        .unwrap();
+
+    let expected = blake3::hash(b"hash me").to_hex().to_string();
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.hash");
+    assert!(result.repaired);
+    assert_eq!(result.content, expected);
+    assert_eq!(result.metadata["path"], "artifacts/data.bin");
+}
+
+#[test]
+fn runtime_can_stat_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+    std::fs::write(root.path().join("artifacts").join("data.bin"), b"metadata").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-stat",
+            "stat_file",
+            json!({"file": "artifacts/data.bin"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.stat");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "artifacts/data.bin");
+    assert_eq!(result.metadata["is_file"], true);
+    assert_eq!(result.metadata["is_dir"], false);
+    assert_eq!(result.metadata["len"], 8);
+    assert!(result.metadata["modified_unix_seconds"].as_u64().is_some());
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_path_for_stat_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("artifacts")).unwrap();
+    std::fs::write(root.path().join("artifacts").join("data.bin"), b"metadata").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-stat",
+            "stat_file",
+            json!({"file_path": "artifacts/data.bin"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.stat");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "artifacts/data.bin");
+    assert_eq!(result.metadata["is_file"], true);
+    assert_eq!(result.metadata["len"], 8);
+}
+
+#[test]
+fn runtime_can_read_clipboard_image_prompt_fragment_as_attachment() {
+    let root = tempfile::tempdir().unwrap();
+    let attachment_dir = root.path().join(".harness").join("attachments");
+    std::fs::create_dir_all(&attachment_dir).unwrap();
+    let image_path = attachment_dir.join("paste-image.png");
+    let png = vec![137, 80, 78, 71, 13, 10, 26, 10, 1, 2, 3, 4];
+    std::fs::write(&image_path, &png).unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-image",
+            "read_attachment",
+            json!({"image": format!("image file: {}", image_path.display())}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "attachment.read");
+    assert!(result.repaired);
+    assert_eq!(result.content, "");
+    assert_eq!(result.metadata["kind"], "image");
+    assert_eq!(result.metadata["mime_type"], "image/png");
+    assert_eq!(
+        result.metadata["path"],
+        ".harness/attachments/paste-image.png"
+    );
+    assert_eq!(result.metadata["bytes"], png.len());
+}
+
+#[test]
+fn runtime_rejects_attachment_path_outside_allowed_roots() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "secret").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let err = runtime
+        .execute(ToolCall::new(
+            "call-outside",
+            "attachment.read",
+            json!({"path": outside.path().display().to_string()}),
+        ))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("outside allowed attachment roots"));
+}
+
+#[test]
+fn runtime_can_list_files_with_alias_and_result_limit() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("a.txt"), "alpha").unwrap();
+    std::fs::write(root.path().join("src").join("b.txt"), "bravo").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-list",
+            "list_files",
+            json!({"dir": "src", "max_results": 1}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.list");
+    assert!(result.repaired);
+    assert!(result.content.contains("src/a.txt"));
+    assert_eq!(result.metadata["truncated"], true);
+}
+
+#[test]
+fn runtime_can_list_workspace_root_with_dot_path() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("seed-target.txt"), "seed marker").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-list-root",
+            "file_list",
+            json!({"path": "."}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.list");
+    assert!(result.content.contains("seed-target.txt"));
+}
+
+#[test]
+fn runtime_can_search_workspace_root_when_path_is_omitted() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("seed-target.txt"), "seed marker").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-search-root",
+            "file_search",
+            json!({"pattern": "seed"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.search");
+    assert!(result.content.contains("seed-target.txt:1:seed marker"));
+}
+
+#[test]
+fn runtime_can_search_text_with_grep_alias() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("a.txt"), "alpha\nneedle one\n").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-search",
+            "grep",
+            json!({"path": "src", "pattern": "needle"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.search");
+    assert!(result.repaired);
+    assert!(result.content.contains("src/a.txt:2:needle one"));
+    assert_eq!(result.metadata["matches"], 1);
+}
+
+#[test]
+fn runtime_shell_exec_accepts_max_output_bytes_and_reports_truncation() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-shell-limit",
+            "run_command",
+            json!({
+                "cmd": native_large_stdout_command(70_000),
+                "max_output_bytes": 1024
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "shell.exec");
+    assert!(result.repaired);
+    assert_eq!(result.content.len(), 1024);
+    assert!(result.content.chars().all(|ch| ch == 'x'));
+    assert_eq!(result.metadata["stdout_truncated"], true);
+    assert_eq!(result.metadata["stderr_truncated"], false);
+    assert_eq!(result.metadata["max_output_bytes"], 1024);
+}
+
+#[test]
+fn runtime_shell_exec_accepts_per_call_timeout_ms() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path()).with_shell_timeout(Duration::from_secs(2));
+    let started = Instant::now();
+
+    let err = runtime
+        .execute(ToolCall::new(
+            "call-shell-timeout",
+            "run_command",
+            json!({
+                "cmd": native_sleep_command(),
+                "timeout_ms": 50
+            }),
+        ))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("timed out"));
+    assert!(
+        started.elapsed() < Duration::from_millis(1000),
+        "per-call timeout should override longer runtime timeout"
+    );
+}
+
+#[test]
+fn runtime_can_replace_text_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("notes.txt"), "alpha beta beta").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-replace",
+            "edit_file",
+            json!({
+                "file": "src/notes.txt",
+                "find": "beta",
+                "with": "done",
+                "limit": 1
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.replace");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "src/notes.txt");
+    assert_eq!(result.metadata["replacements"], 1);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src").join("notes.txt")).unwrap(),
+        "alpha done beta"
+    );
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_replace_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("notes.txt"), "alpha beta beta").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-replace",
+            "replace_text",
+            json!({
+                "file_path": "src/notes.txt",
+                "old_string": "beta",
+                "new_string": "done"
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.replace");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "src/notes.txt");
+    assert_eq!(result.metadata["replacements"], 1);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("src").join("notes.txt")).unwrap(),
+        "alpha done beta"
+    );
+}
+
+#[cfg(windows)]
+fn native_large_stdout_command(bytes: usize) -> String {
+    format!("[Console]::Out.Write(('x' * {bytes}))")
+}
+
+#[cfg(target_os = "linux")]
+fn native_large_stdout_command(bytes: usize) -> String {
+    format!("printf '%*s' {bytes} '' | tr ' ' x")
+}
+
+#[cfg(windows)]
+fn native_echo_command() -> &'static str {
+    "Write-Output harness-shell"
+}
+
+#[cfg(target_os = "linux")]
+fn native_echo_command() -> &'static str {
+    "printf harness-shell"
+}
+
+#[cfg(windows)]
+fn native_sleep_command() -> &'static str {
+    "Start-Sleep -Milliseconds 500"
+}
+
+#[cfg(target_os = "linux")]
+fn native_sleep_command() -> &'static str {
+    "sleep 1"
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_shell_exec_rewrites_double_ampersand_for_powershell() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-and-chain",
+            "shell.exec",
+            json!({"command": "Write-Output one && Write-Output two"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok, "repaired chain must run: {:?}", result.metadata);
+    assert!(result.repaired);
+    assert!(result.content.contains("one"));
+    assert!(result.content.contains("two"));
+    let note = result.metadata["repair_note"].as_str().unwrap();
+    assert!(note.contains("&&"), "the memo must explain the rewrite");
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_shell_exec_double_ampersand_keeps_stop_on_failure_semantics() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-and-fail",
+            "shell.exec",
+            json!({"command": "cmd /c \"exit 5\" && Write-Output should-not-run"}),
+        ))
+        .unwrap();
+
+    assert!(
+        !result.content.contains("should-not-run"),
+        "the second command must not run after the first fails"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn runtime_shell_exec_drops_cd_into_missing_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-cd-ghost",
+            "shell.exec",
+            json!({"command": "cd /mnt/harness-cli && Write-Output alive"}),
+        ))
+        .unwrap();
+
+    assert!(
+        result.ok,
+        "the ghost cd must be dropped: {:?}",
+        result.metadata
+    );
+    assert!(result.repaired);
+    assert!(result.content.contains("alive"));
+    let note = result.metadata["repair_note"].as_str().unwrap();
+    assert!(note.contains("cd"), "the memo must mention the dropped cd");
+}
+
+#[test]
+fn runtime_shell_exec_failure_surfaces_stderr_in_content() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    #[cfg(windows)]
+    let command = "cmd /c \"echo boom 1>&2 & exit 3\"";
+    #[cfg(target_os = "linux")]
+    let command = "echo boom 1>&2; exit 3";
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-stderr",
+            "shell.exec",
+            json!({"command": command}),
+        ))
+        .unwrap();
+
+    assert!(!result.ok);
+    assert!(
+        result.content.contains("boom"),
+        "stderr must reach the model-visible content on failure, got: {:?}",
+        result.content
+    );
+}
+
+#[test]
+fn runtime_can_delete_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(root.path().join("notes").join("old.txt"), "old").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-delete",
+            "remove_file",
+            json!({"file": "notes/old.txt"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.delete");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "notes/old.txt");
+    assert_eq!(result.metadata["was_dir"], false);
+    assert!(!root.path().join("notes").join("old.txt").exists());
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_path_for_delete_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(root.path().join("notes").join("old.txt"), "old").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-delete",
+            "remove_file",
+            json!({"file_path": "notes/old.txt"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.delete");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["path"], "notes/old.txt");
+    assert!(!root.path().join("notes").join("old.txt").exists());
+}
+
+#[test]
+fn runtime_can_move_file_with_alias_and_argument_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("draft.txt"), "draft").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-move",
+            "rename_file",
+            json!({"from": "src/draft.txt", "to": "notes/final.txt"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.move");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["source_path"], "src/draft.txt");
+    assert_eq!(result.metadata["target_path"], "notes/final.txt");
+    assert!(!root.path().join("src").join("draft.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("final.txt")).unwrap(),
+        "draft"
+    );
+}
+
+#[test]
+fn runtime_repairs_codex_style_file_move_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join("draft.txt"), "draft").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-codex-move",
+            "move_file",
+            json!({
+                "source_path": "src/draft.txt",
+                "target_path": "notes/final.txt"
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.move");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["source_path"], "src/draft.txt");
+    assert_eq!(result.metadata["target_path"], "notes/final.txt");
+    assert!(!root.path().join("src").join("draft.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("final.txt")).unwrap(),
+        "draft"
+    );
+}
+
+#[test]
+fn runtime_coerces_string_boolean_for_file_move_overwrite() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::create_dir_all(root.path().join("notes")).unwrap();
+    std::fs::write(root.path().join("src").join("draft.txt"), "new").unwrap();
+    std::fs::write(root.path().join("notes").join("final.txt"), "old").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-move-overwrite-string",
+            "rename_file",
+            json!({
+                "from": "src/draft.txt",
+                "to": "notes/final.txt",
+                "overwrite": "true"
+            }),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.move");
+    assert!(result.repaired);
+    assert_eq!(result.metadata["overwritten"], true);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("notes").join("final.txt")).unwrap(),
+        "new"
+    );
+}

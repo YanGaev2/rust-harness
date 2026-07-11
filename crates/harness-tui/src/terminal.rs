@@ -90,6 +90,30 @@ pub fn read_input(buf: &mut [u8]) -> io::Result<usize> {
     sys::read_input(buf)
 }
 
+/// Raw input mode + bracketed paste WITHOUT the full TUI setup — the
+/// cursor stays visible. For line-mode front ends that print their own
+/// output. Everything restores on drop.
+pub struct RawModeHandle {
+    _raw: sys::RawModeGuard,
+}
+
+impl Drop for RawModeHandle {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = out.write_all(esc::BRACKETED_PASTE_OFF.as_bytes());
+        let _ = out.flush();
+    }
+}
+
+pub fn raw_mode() -> Result<RawModeHandle, TerminalError> {
+    sys::enable_vt()?;
+    let raw = sys::RawModeGuard::enable()?;
+    let mut out = io::stdout();
+    out.write_all(esc::BRACKETED_PASTE_ON.as_bytes())?;
+    out.flush()?;
+    Ok(RawModeHandle { _raw: raw })
+}
+
 /// Ask the terminal where the cursor is (DSR): returns 0-based
 /// (row, col). Call only at startup, before the input pump owns stdin —
 /// the response arrives interleaved with any pending keystrokes.

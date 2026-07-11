@@ -1,14 +1,13 @@
 //! Pure chat-session state machine on the `harness-tui` library.
 //!
-//! A faithful port of the Ratatui `ChatTuiApp` (`src/tui.rs`) onto
+//! A faithful port of the (now removed) Ratatui `ChatTuiApp` onto
 //! `harness_tui` primitives: crossterm key events become
 //! `harness_tui::input` events, styled Ratatui lines become
 //! `harness_tui::text::Line`s, and the hand-rolled transcript scrolling is
 //! gone entirely — finished entries are flushed to native terminal
 //! scrollback via [`ChatApp::take_scrollback`] while the pinned panel
 //! ([`ChatApp::panel_lines`]) shows only the live tail, the editor, and the
-//! status row. Old and new implementations coexist until the REPL is wired
-//! over.
+//! status row.
 
 use std::path::PathBuf;
 use std::time::Instant;

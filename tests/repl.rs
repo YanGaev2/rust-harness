@@ -1,0 +1,304 @@
+// Burst/paste coalescing is covered by crates/harness-tui/tests/input.rs
+// (coalesce_burst); the busy-input policy lives in tests/chat_app.rs
+// (busy_action). This file tests the terminal-agnostic ReplSession state
+// machine and the line-mode agent-event renderer.
+use harness_cli::agent::AgentEvent;
+use harness_cli::clipboard::{AttachmentStore, ClipboardItem, StaticClipboard};
+use harness_cli::providers::ProviderConfig;
+use harness_cli::repl::{
+    ReplAction, ReplEvent, ReplModelSelection, ReplSession, render_agent_event,
+    resolve_model_selection,
+};
+use harness_cli::runtime::ToolBatchResult;
+use serde_json::json;
+
+#[test]
+fn ctrl_v_text_inserts_text_and_keeps_attachment_for_submit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(Some(ClipboardItem::Text("clipboard text".to_string())));
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    assert_eq!(
+        session
+            .handle_event(ReplEvent::Text("ask: ".to_string()), &source)
+            .unwrap(),
+        ReplAction::Continue
+    );
+    assert_eq!(
+        session.handle_event(ReplEvent::CtrlV, &source).unwrap(),
+        ReplAction::Continue
+    );
+    assert_eq!(session.input(), "ask: clipboard text");
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    let ReplAction::Submit(submission) = action else {
+        panic!("expected submit action");
+    };
+
+    assert_eq!(submission.message, "ask: clipboard text");
+    assert_eq!(submission.attachments.len(), 1);
+    assert_eq!(submission.attachments[0].kind, "text");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(&submission.attachments[0].relative_path))
+            .unwrap(),
+        "clipboard text"
+    );
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn ctrl_v_image_appends_prompt_fragment_and_saves_png_attachment() {
+    let root = tempfile::tempdir().unwrap();
+    let png = vec![137, 80, 78, 71, 13, 10, 26, 10, 9, 8, 7, 6];
+    let source = StaticClipboard::new(Some(ClipboardItem::ImagePng(png.clone())));
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("describe ".to_string()), &source)
+        .unwrap();
+    session.handle_event(ReplEvent::CtrlV, &source).unwrap();
+
+    assert!(session.input().starts_with("describe "));
+    assert!(session.input().contains("image file:"));
+
+    let ReplAction::Submit(submission) = session.handle_event(ReplEvent::Submit, &source).unwrap()
+    else {
+        panic!("expected submit action");
+    };
+
+    assert_eq!(submission.attachments.len(), 1);
+    assert_eq!(submission.attachments[0].kind, "image");
+    assert_eq!(
+        std::fs::read(root.path().join(&submission.attachments[0].relative_path)).unwrap(),
+        png
+    );
+}
+
+#[test]
+fn bracketed_paste_inserts_multiline_text_without_submitting() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("note: ".to_string()), &source)
+        .unwrap();
+
+    // A real terminal in bracketed-paste mode delivers a whole multi-line paste
+    // as a single Paste event. It must NOT be treated as Enter/submit, and the
+    // embedded newlines must survive intact.
+    let action = session
+        .handle_event(ReplEvent::Paste("line one\nline two".to_string()), &source)
+        .unwrap();
+    assert_eq!(
+        action,
+        ReplAction::Continue,
+        "a paste must never submit the prompt"
+    );
+    assert_eq!(session.input(), "note: line one\nline two");
+
+    // The explicit Submit afterwards sends the whole multi-line message at once.
+    let ReplAction::Submit(submission) = session.handle_event(ReplEvent::Submit, &source).unwrap()
+    else {
+        panic!("expected submit action");
+    };
+    assert_eq!(submission.message, "note: line one\nline two");
+}
+
+#[test]
+fn ctrl_c_exits_repl_without_submit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    assert_eq!(
+        session.handle_event(ReplEvent::CtrlC, &source).unwrap(),
+        ReplAction::Exit
+    );
+}
+
+#[test]
+fn slash_model_command_switches_provider_and_model_without_llm_submit() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(
+            ReplEvent::Text("/model claude claude-sonnet-4.5".to_string()),
+            &source,
+        )
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    let ReplAction::SwitchModel(selection) = action else {
+        panic!("expected model switch action");
+    };
+
+    assert_eq!(selection.provider_name, "claude");
+    assert_eq!(selection.model, "claude-sonnet-4.5");
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn slash_model_command_reports_usage_error_for_missing_arguments() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("/model claude".to_string()), &source)
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    let ReplAction::CommandError(error) = action else {
+        panic!("expected command error action");
+    };
+
+    assert!(error.contains("/model PROVIDER MODEL"));
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn model_selection_resolver_uses_provider_catalog_and_model_allowlist() {
+    let catalog = vec![
+        ProviderConfig::new("local", "http://localhost:11434/v1", "local-key")
+            .with_model("qwen3-coder"),
+        ProviderConfig::new("claude", "https://api.anthropic.com/v1", "sk-anthropic")
+            .with_model("claude-sonnet-4.5"),
+    ];
+
+    let resolved = resolve_model_selection(
+        &catalog,
+        &ReplModelSelection {
+            provider_name: "claude".to_string(),
+            model: "claude-sonnet-4.5".to_string(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(resolved.name(), "claude");
+
+    let err = resolve_model_selection(
+        &catalog,
+        &ReplModelSelection {
+            provider_name: "claude".to_string(),
+            model: "missing-model".to_string(),
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.contains("model missing-model is not configured for provider claude"));
+}
+
+#[test]
+fn slash_history_command_searches_submitted_prompts_most_recent_first() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    for message in [
+        "write cache notes",
+        "summarize routing logs",
+        "inspect cache metrics",
+    ] {
+        session
+            .handle_event(ReplEvent::Text(message.to_string()), &source)
+            .unwrap();
+        assert!(matches!(
+            session.handle_event(ReplEvent::Submit, &source).unwrap(),
+            ReplAction::Submit(_)
+        ));
+    }
+
+    session
+        .handle_event(ReplEvent::Text("/history CACHE".to_string()), &source)
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    let ReplAction::HistorySearch(matches) = action else {
+        panic!("expected history search action");
+    };
+
+    assert_eq!(
+        matches
+            .iter()
+            .map(|history_match| history_match.message.as_str())
+            .collect::<Vec<_>>(),
+        vec!["inspect cache metrics", "write cache notes"]
+    );
+    assert_eq!(matches[0].index, 3);
+    assert_eq!(matches[1].index, 1);
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn slash_new_command_requests_a_fresh_session() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("/new".to_string()), &source)
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    assert_eq!(action, ReplAction::NewSession);
+    assert_eq!(session.input(), "");
+}
+
+#[test]
+fn slash_history_command_reports_usage_error_for_missing_query() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("/history".to_string()), &source)
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    let ReplAction::CommandError(error) = action else {
+        panic!("expected command error action");
+    };
+
+    assert!(error.contains("/history QUERY"));
+}
+
+#[test]
+fn repl_renders_agent_events_for_streaming_terminal_output() {
+    let mut output = Vec::new();
+
+    render_agent_event(
+        &AgentEvent::ToolRoundStarted {
+            round: 2,
+            tool_calls: 3,
+        },
+        &mut output,
+    )
+    .unwrap();
+    render_agent_event(
+        &AgentEvent::ToolResult(ToolBatchResult {
+            id: "call-1".to_string(),
+            tool_name: "file.write".to_string(),
+            ok: true,
+            repaired: false,
+            content: String::new(),
+            metadata: json!({}),
+            error: None,
+            hint: None,
+        }),
+        &mut output,
+    )
+    .unwrap();
+    render_agent_event(
+        &AgentEvent::FinalContentDelta("streamed answer".to_string()),
+        &mut output,
+    )
+    .unwrap();
+
+    let output = String::from_utf8(output).unwrap();
+    assert!(output.contains("tool round 2: running 3 call(s)"));
+    assert!(output.contains("tool call-1 file.write ok"));
+    assert!(output.ends_with("streamed answer"));
+}

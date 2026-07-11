@@ -4,3 +4,5 @@
 //! computes minimal row updates, and the terminal layer writes them
 //! atomically. Design spec:
 //! docs/superpowers/specs/2026-07-11-harness-tui-design.md
+
+pub mod text;

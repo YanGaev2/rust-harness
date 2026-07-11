@@ -4,8 +4,11 @@ Our own terminal UI library for the harness front end — built from scratch
 (output **and** input), line-based like Pi, lightweight, zero runtime
 dependencies beyond `unicode-width`/`unicode-segmentation`.
 
-Status: **phase 1 (foundation) implemented** — `text`, `diff`, `headless`,
-`terminal` with tests; input parser, core loop, and components are next.
+Status: **complete and in production** — all five migration phases landed.
+`harness` runs entirely on this library (chat TUI, setup TUI, line REPL
+input); `ratatui` and `crossterm` are removed from the workspace. Modules:
+`text`, `diff`, `headless`, `input`, `core` (Screen), `components`,
+`terminal`. Known deferred issues: `agents/codex-review-harness-tui.md`.
 Design spec: [`docs/superpowers/specs/2026-07-11-harness-tui-design.md`](../../docs/superpowers/specs/2026-07-11-harness-tui-design.md)
 
 Core decisions:

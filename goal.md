@@ -439,3 +439,14 @@ paste support for text/images.
   (`crates/harness-tui/tests/{text,diff,headless,terminal}.rs`); only deps are
   `unicode-width` + `unicode-segmentation`. Next phases: input parser, core
   loop, components, chat/setup migration.
+- 2026-07-12 (harness-tui phase 5, setup TUI + stack removal): the setup TUI
+  (`src/tui.rs`) now runs on `harness-tui` — state machines take
+  `harness_tui::input::KeyEvent`s, rendering is pure `setup_lines` /
+  `setup_tui_lines` (`Vec<Line>` with a reverse-cell caret, wizard steps
+  replacing the command list while the dialog is open), and the terminal loops
+  reuse the REPL `InputPump` (now `pub(crate)`) over `Screen::stdout` with
+  400ms polling, per-tick resize checks, and `release()` on exit.
+  `SetupTerminal` is gone, and `ratatui` + `crossterm` are removed from
+  Cargo.toml entirely; `tests/tui_screen.rs` asserts on line text instead of
+  ratatui buffers and `tests/tui_stack.rs` now guards that the legacy stack
+  stays out of the manifest.

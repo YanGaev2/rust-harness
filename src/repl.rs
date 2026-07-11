@@ -589,14 +589,15 @@ fn check_resize(screen: &mut Screen) -> Result<(), ReplError> {
 
 /// Reads raw stdin bytes on a background thread; the UI thread polls
 /// decoded events with a timeout so it can animate the spinner, notice
-/// resizes, and keep draining agent events while a run is busy.
-struct InputPump {
+/// resizes, and keep draining agent events while a run is busy. Shared
+/// with the setup TUI (`crate::tui`), which runs the same poll loop.
+pub(crate) struct InputPump {
     rx: mpsc::Receiver<Vec<u8>>,
     parser: Parser,
 }
 
 impl InputPump {
-    fn start() -> Self {
+    pub(crate) fn start() -> Self {
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
             let mut buf = [0u8; 1024];
@@ -619,9 +620,9 @@ impl InputPump {
     }
 
     /// Wait up to `timeout` for input, then drain the short burst that
-    /// follows and coalesce it into paste blocks — the same defense the
-    /// crossterm reader used against legacy-console paste keystreams.
-    fn poll(&mut self, timeout: Duration) -> io::Result<Vec<TuiEvent>> {
+    /// follows and coalesce it into paste blocks — the classic defense
+    /// against legacy-console paste keystreams.
+    pub(crate) fn poll(&mut self, timeout: Duration) -> io::Result<Vec<TuiEvent>> {
         match self.rx.recv_timeout(timeout) {
             Ok(chunk) => {
                 let mut events = self.parser.feed(&chunk);

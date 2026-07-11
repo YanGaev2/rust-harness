@@ -1,8 +1,8 @@
 //! Pure chat-session state machine on the `harness-tui` library.
 //!
-//! A faithful port of the (now removed) Ratatui `ChatTuiApp` onto
-//! `harness_tui` primitives: crossterm key events become
-//! `harness_tui::input` events, styled Ratatui lines become
+//! A faithful port of the previous chat TUI state machine onto
+//! `harness_tui` primitives: terminal key events become
+//! `harness_tui::input` events, styled lines become
 //! `harness_tui::text::Line`s, and the hand-rolled transcript scrolling is
 //! gone entirely — finished entries are flushed to native terminal
 //! scrollback via [`ChatApp::take_scrollback`] while the pinned panel

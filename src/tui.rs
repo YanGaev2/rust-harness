@@ -1,22 +1,23 @@
+//! Setup TUI on the `harness-tui` library: the no-provider onboarding
+//! screen. The pure state machines (`TuiApp`, `SetupTuiApp`, the provider
+//! wizard) consume `harness_tui::input` key events, rendering produces
+//! `harness_tui::text::Line`s, and the terminal loop repaints a pinned
+//! bottom panel via `harness_tui::core::Screen`.
+
 use std::error::Error;
 use std::fmt;
-use std::io::{self, Stdout};
+use std::io;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
-use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::{Frame, Terminal};
+use harness_tui::components::select::select_lines;
+use harness_tui::components::status::status_line;
+use harness_tui::core::Screen;
+use harness_tui::input::{Event, KeyCode, KeyEvent};
+use harness_tui::terminal::{self as tui_terminal, TerminalError};
+use harness_tui::text::{Color, Line, Span, Style};
+
+use crate::repl::InputPump;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TuiAction {
@@ -82,10 +83,6 @@ impl TuiApp {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TuiAction {
-        if key.kind != KeyEventKind::Press {
-            return TuiAction::Continue;
-        }
-
         if let Some(dialog) = &mut self.dialog {
             let action = dialog.handle_key(key);
             if matches!(action, TuiAction::SaveProvider(_) | TuiAction::Exit) {
@@ -94,21 +91,21 @@ impl TuiApp {
             return action;
         }
 
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+        match key.code {
+            KeyCode::Char('c') if key.mods.ctrl => {
                 self.status_message = "Setup cancelled.".to_string();
                 TuiAction::Exit
             }
-            (KeyCode::Esc, _) => {
+            KeyCode::Esc => {
                 self.status_message = "Setup cancelled.".to_string();
                 TuiAction::Exit
             }
-            (KeyCode::Enter, _) => self.submit_command(),
-            (KeyCode::Backspace, _) => {
+            KeyCode::Enter => self.submit_command(),
+            KeyCode::Backspace => {
                 self.input.pop();
                 TuiAction::Continue
             }
-            (KeyCode::Char(ch), modifiers) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch) if !key.mods.ctrl => {
                 self.input.push(ch);
                 TuiAction::Continue
             }
@@ -279,7 +276,7 @@ impl ProviderWizard {
                 self.active_text_mut(target).pop();
                 TuiAction::Continue
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch) if !key.mods.ctrl => {
                 if !self.text_edited(target) {
                     self.active_text_mut(target).clear();
                     self.mark_text_edited(target);
@@ -299,7 +296,7 @@ impl ProviderWizard {
                 self.model.pop();
                 TuiAction::Continue
             }
-            KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch) if !key.mods.ctrl => {
                 if !self.model_edited {
                     self.model.clear();
                     self.model_edited = true;
@@ -512,25 +509,21 @@ impl SetupTuiApp {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SetupTuiAction {
-        if key.kind != KeyEventKind::Press {
-            return SetupTuiAction::Continue;
-        }
-
-        match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+        match key.code {
+            KeyCode::Char('c') if key.mods.ctrl => {
                 self.status_message = "Setup cancelled.".to_string();
                 SetupTuiAction::Exit
             }
-            (KeyCode::Esc, _) => {
+            KeyCode::Esc => {
                 self.status_message = "Setup cancelled.".to_string();
                 SetupTuiAction::Exit
             }
-            (KeyCode::Enter, _) => self.submit_command(),
-            (KeyCode::Backspace, _) => {
+            KeyCode::Enter => self.submit_command(),
+            KeyCode::Backspace => {
                 self.input.pop();
                 SetupTuiAction::Continue
             }
-            (KeyCode::Char(ch), modifiers) if !modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char(ch) if !key.mods.ctrl => {
                 self.input.push(ch);
                 SetupTuiAction::Continue
             }
@@ -581,23 +574,28 @@ pub fn run_setup_tui(
     config_path: impl Into<PathBuf>,
     workspace: impl Into<PathBuf>,
 ) -> Result<SetupTuiAction, TuiError> {
-    let mut terminal = SetupTerminal::enter()?;
+    tui_terminal::install_panic_restore();
+    let mut screen = Screen::stdout().map_err(terminal_error)?;
     let mut app = SetupTuiApp::new(command_name, config_path, workspace);
+    let mut pump = InputPump::start();
 
     loop {
-        terminal.draw(&app)?;
-        match event::read().map_err(TuiError::Io)? {
-            Event::Key(key) => {
-                let action = app.handle_key(key);
-                if action != SetupTuiAction::Continue {
-                    terminal.draw(&app)?;
-                    return Ok(action);
-                }
+        let panel = setup_tui_lines(&app, screen.width() as usize);
+        draw_panel(&mut screen, panel)?;
+        let events = pump
+            .poll(Duration::from_millis(400))
+            .map_err(TuiError::Io)?;
+        check_resize(&mut screen)?;
+        for event in events {
+            let action = match event {
+                Event::Key(key) => app.handle_key(key),
+                Event::Paste(text) => app.handle_paste(&text),
+                _ => SetupTuiAction::Continue,
+            };
+            if action != SetupTuiAction::Continue {
+                let _ = screen.release();
+                return Ok(action);
             }
-            Event::Paste(text) => {
-                app.handle_paste(&text);
-            }
-            _ => {}
         }
     }
 }
@@ -607,342 +605,266 @@ pub fn run_tui(
     config_path: impl Into<PathBuf>,
     workspace: impl Into<PathBuf>,
 ) -> Result<TuiAction, TuiError> {
-    let mut terminal = SetupTerminal::enter()?;
+    tui_terminal::install_panic_restore();
+    let mut screen = Screen::stdout().map_err(terminal_error)?;
     let mut app = TuiApp::new(command_name, config_path, workspace);
+    let mut pump = InputPump::start();
 
     loop {
-        terminal.draw_tui(&app)?;
-        match event::read().map_err(TuiError::Io)? {
-            Event::Key(key) => match app.handle_key(key) {
+        let panel = setup_lines(&app, screen.width() as usize);
+        draw_panel(&mut screen, panel)?;
+        let events = pump
+            .poll(Duration::from_millis(400))
+            .map_err(TuiError::Io)?;
+        check_resize(&mut screen)?;
+        for event in events {
+            let action = match event {
+                Event::Key(key) => app.handle_key(key),
+                Event::Paste(text) => app.handle_paste(&text),
+                _ => TuiAction::Continue,
+            };
+            match action {
                 TuiAction::Continue | TuiAction::Command(_) => {}
                 action => {
-                    terminal.draw_tui(&app)?;
+                    let _ = screen.release();
                     return Ok(action);
                 }
-            },
-            Event::Paste(text) => {
-                app.handle_paste(&text);
             }
-            _ => {}
         }
     }
 }
 
-pub fn render_tui(frame: &mut Frame<'_>, app: &TuiApp) {
-    let area = frame.area();
-    let root = Block::default().style(Style::default().bg(Color::Black));
-    frame.render_widget(root, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_tui_header(frame, chunks[0], app);
-    render_tui_body(frame, chunks[1], app);
-    render_tui_input(frame, chunks[2], app);
-    render_footer(frame, chunks[3]);
-
-    if let Some(dialog) = &app.dialog {
-        render_dialog(frame, area, dialog);
+/// Repaint the pinned panel, capped to the screen height so the panel
+/// can never scroll its own top row out of the buffer.
+fn draw_panel(screen: &mut Screen, lines: Vec<Line>) -> Result<(), TuiError> {
+    let max_panel = (screen.height() as usize).saturating_sub(1).max(1);
+    let mut panel = lines;
+    if panel.len() > max_panel {
+        panel = panel.split_off(panel.len() - max_panel);
     }
+    screen.render_panel(panel).map_err(TuiError::Io)
 }
 
-pub fn render_setup_tui(frame: &mut Frame<'_>, app: &SetupTuiApp) {
-    let area = frame.area();
-    let root = Block::default().style(Style::default().bg(Color::Black));
-    frame.render_widget(root, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(5),
-            Constraint::Length(1),
-        ])
-        .split(area);
-
-    render_header(frame, chunks[0], app);
-    render_body(frame, chunks[1], app);
-    render_input(frame, chunks[2], app);
-    render_footer(frame, chunks[3]);
+/// The terminal delivers no resize signal we listen for — the idle loop
+/// polls the size once per tick, which is cheap and cross-platform.
+fn check_resize(screen: &mut Screen) -> Result<(), TuiError> {
+    if let Ok((width, height)) = tui_terminal::size()
+        && (width != screen.width() || height != screen.height())
+    {
+        screen.resize(width, height).map_err(TuiError::Io)?;
+    }
+    Ok(())
 }
 
-fn render_tui_header(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let title = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.command_name),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            "no provider configured",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let header = Paragraph::new(title)
-        .block(Block::default().borders(Borders::BOTTOM))
-        .alignment(Alignment::Left);
-    frame.render_widget(header, area);
+fn terminal_error(err: TerminalError) -> TuiError {
+    TuiError::Io(io::Error::other(err.to_string()))
 }
 
-fn render_header(frame: &mut Frame<'_>, area: Rect, app: &SetupTuiApp) {
-    let title = Line::from(vec![
-        Span::styled(
-            format!(" {} ", app.command_name),
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            "no provider configured",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-    let header = Paragraph::new(title)
-        .block(Block::default().borders(Borders::BOTTOM))
-        .alignment(Alignment::Left);
-    frame.render_widget(header, area);
+/// Full panel for the `TuiApp` screen. When the provider wizard is open
+/// its step content replaces the command list.
+pub fn setup_lines(app: &TuiApp, width: usize) -> Vec<Line> {
+    let mut lines = header_lines(&app.command_name);
+    lines.extend(overview_lines(
+        &app.workspace,
+        &app.config_path,
+        &app.status_message,
+    ));
+    lines.push(Line::raw(""));
+    match &app.dialog {
+        Some(TuiDialog::ProviderWizard(wizard)) => lines.extend(wizard_lines(wizard)),
+        None => lines.extend(command_lines()),
+    }
+    lines.push(Line::raw(""));
+    lines.push(input_line(&app.input, app.dialog.is_none()));
+    lines.push(footer_line(width));
+    lines
 }
 
-fn render_tui_body(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(area);
+/// Full panel for the simpler `SetupTuiApp` screen (no dialog).
+pub fn setup_tui_lines(app: &SetupTuiApp, width: usize) -> Vec<Line> {
+    let mut lines = header_lines(&app.command_name);
+    lines.extend(overview_lines(
+        &app.workspace,
+        &app.config_path,
+        &app.status_message,
+    ));
+    lines.push(Line::raw(""));
+    lines.extend(command_lines());
+    lines.push(Line::raw(""));
+    lines.push(input_line(&app.input, true));
+    lines.push(footer_line(width));
+    lines
+}
 
-    let overview = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("workspace ", label_style()),
-            Span::raw(display_path(&app.workspace)),
-        ]),
-        Line::from(vec![
-            Span::styled("config    ", label_style()),
-            Span::raw(display_path(&app.config_path)),
-        ]),
+fn header_lines(command_name: &str) -> Vec<Line> {
+    vec![
+        Line {
+            spans: vec![
+                Span::styled(format!(" {command_name} "), title_style()),
+                Span::raw(" "),
+                Span::styled("no provider configured", warn_style()),
+            ],
+        },
         Line::raw(""),
-        Line::styled("No provider is configured yet.", emphasis_style()),
+    ]
+}
+
+fn overview_lines(workspace: &Path, config_path: &Path, status_message: &str) -> Vec<Line> {
+    vec![
+        Line {
+            spans: vec![
+                Span::styled("workspace ", label_style()),
+                Span::raw(display_path(workspace)),
+            ],
+        },
+        Line {
+            spans: vec![
+                Span::styled("config    ", label_style()),
+                Span::raw(display_path(config_path)),
+            ],
+        },
+        Line::raw(""),
+        styled_line("No provider is configured yet.", emphasis_style()),
         Line::raw("Configure one here, then this launch continues into the REPL."),
         Line::raw(""),
-        Line::styled(app.status_message.clone(), Style::default().fg(Color::Cyan)),
-    ])
-    .block(Block::default().title(" Session ").borders(Borders::ALL))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(overview, columns[0]);
-
-    let commands = Paragraph::new(
-        command_registry()
-            .iter()
-            .map(|entry| {
-                Line::from(vec![
-                    Span::styled(entry.names[0], command_style()),
-                    Span::raw(format!("   {}", command_description(entry.command))),
-                ])
-            })
-            .collect::<Vec<_>>(),
-    )
-    .block(Block::default().title(" Commands ").borders(Borders::ALL))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(commands, columns[1]);
+        styled_line(status_message, status_style()),
+    ]
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, app: &SetupTuiApp) {
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
-        .split(area);
-
-    let overview = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("workspace ", label_style()),
-            Span::raw(display_path(&app.workspace)),
-        ]),
-        Line::from(vec![
-            Span::styled("config    ", label_style()),
-            Span::raw(display_path(&app.config_path)),
-        ]),
-        Line::raw(""),
-        Line::styled("No provider is configured yet.", emphasis_style()),
-        Line::raw("Configure one here, then this launch continues into the REPL."),
-        Line::raw(""),
-        Line::styled(app.status_message.clone(), Style::default().fg(Color::Cyan)),
-    ])
-    .block(Block::default().title(" Session ").borders(Borders::ALL))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(overview, columns[0]);
-
-    let commands = Paragraph::new(vec![
-        Line::from(vec![
-            Span::styled("/provider add", command_style()),
-            Span::raw("   configure a provider"),
-        ]),
-        Line::from(vec![
-            Span::styled("/providers", command_style()),
-            Span::raw("      list built-in profiles"),
-        ]),
-        Line::from(vec![
-            Span::styled("/help", command_style()),
-            Span::raw("           show commands"),
-        ]),
-        Line::from(vec![
-            Span::styled("/exit", command_style()),
-            Span::raw("           quit"),
-        ]),
-    ])
-    .block(Block::default().title(" Commands ").borders(Borders::ALL))
-    .wrap(Wrap { trim: false });
-    frame.render_widget(commands, columns[1]);
+fn command_lines() -> Vec<Line> {
+    command_registry()
+        .iter()
+        .map(|entry| Line {
+            spans: vec![
+                Span::styled(format!("{:<15}", entry.names[0]), command_style()),
+                Span::raw(command_description(entry.command)),
+            ],
+        })
+        .collect()
 }
 
-fn render_tui_input(frame: &mut Frame<'_>, area: Rect, app: &TuiApp) {
-    let prompt = format!("[no provider] > {}", app.input);
-    let input = Paragraph::new(prompt)
-        .block(Block::default().title(" Input ").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(input, area);
-
-    if app.dialog.is_none() {
-        let prompt_width = "[no provider] > ".chars().count() as u16;
-        let input_width = app.input.chars().count() as u16;
-        let cursor_x = area
-            .x
-            .saturating_add(1)
-            .saturating_add(prompt_width)
-            .saturating_add(input_width)
-            .min(area.x.saturating_add(area.width.saturating_sub(2)));
-        let cursor_y = area.y.saturating_add(1);
-        frame.set_cursor_position(Position::new(cursor_x, cursor_y));
-    }
-}
-
-fn render_input(frame: &mut Frame<'_>, area: Rect, app: &SetupTuiApp) {
-    let prompt = format!("[no provider] > {}", app.input);
-    let input = Paragraph::new(prompt)
-        .block(Block::default().title(" Input ").borders(Borders::ALL))
-        .style(Style::default().fg(Color::White));
-    frame.render_widget(input, area);
-
-    let prompt_width = "[no provider] > ".chars().count() as u16;
-    let input_width = app.input.chars().count() as u16;
-    let cursor_x = area
-        .x
-        .saturating_add(1)
-        .saturating_add(prompt_width)
-        .saturating_add(input_width)
-        .min(area.x.saturating_add(area.width.saturating_sub(2)));
-    let cursor_y = area.y.saturating_add(1);
-    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
-}
-
-fn render_footer(frame: &mut Frame<'_>, area: Rect) {
-    let footer = Paragraph::new("Esc/Ctrl+C exit")
-        .alignment(Alignment::Right)
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, area);
-}
-
-fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &TuiDialog) {
-    let dialog_area = centered_rect(area, 72, 16);
-    frame.render_widget(Clear, dialog_area);
-    match dialog {
-        TuiDialog::ProviderWizard(wizard) => render_provider_wizard(frame, dialog_area, wizard),
-    }
-}
-
-fn render_provider_wizard(frame: &mut Frame<'_>, area: Rect, wizard: &ProviderWizard) {
-    let lines = match wizard.step {
+fn wizard_lines(wizard: &ProviderWizard) -> Vec<Line> {
+    let mut lines = vec![styled_line(wizard.title(), emphasis_style()), Line::raw("")];
+    match wizard.step {
         ProviderWizardStep::Provider => {
-            let mut lines = vec![
-                Line::styled("Select provider", emphasis_style()),
-                Line::raw(""),
-            ];
-            for (index, name) in BUILTIN_PROVIDER_NAMES.iter().enumerate() {
-                let marker = if index == wizard.selected_provider {
-                    "> "
-                } else {
-                    "  "
-                };
-                let style = if index == wizard.selected_provider {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(Color::White)
-                };
-                lines.push(Line::styled(format!("{marker}{name}"), style));
-            }
+            lines.push(styled_line("Select provider", emphasis_style()));
             lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Up/Down move  Enter accept  Esc close",
-                Style::default().fg(Color::DarkGray),
+            lines.extend(select_lines(
+                BUILTIN_PROVIDER_NAMES,
+                wizard.selected_provider,
             ));
-            lines
+            lines.push(Line::raw(""));
+            lines.push(styled_line(
+                "Up/Down move  Enter accept  Esc close",
+                hint_style(),
+            ));
         }
-        ProviderWizardStep::BaseUrl => vec![
-            Line::styled("Base URL", emphasis_style()),
-            Line::raw(""),
-            Line::raw(wizard.base_url.clone()),
-            Line::raw(""),
-            Line::styled(
-                "Enter accept  Esc close",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ],
-        ProviderWizardStep::ApiKey => vec![
-            Line::styled("API key", emphasis_style()),
-            Line::raw(""),
-            Line::raw(mask_secret(&wizard.api_key)),
-            Line::raw(""),
-            Line::styled(
-                "Enter accept  Esc close",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ],
-        ProviderWizardStep::Model => vec![
-            Line::styled("Model", emphasis_style()),
-            Line::raw(""),
-            Line::raw(wizard.model.clone()),
-            Line::raw(""),
-            Line::styled(
-                "Enter save  Esc close",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ],
-    };
-
-    let paragraph = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(format!(" {} ", wizard.title()))
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: false });
-    frame.render_widget(paragraph, area);
+        ProviderWizardStep::BaseUrl => {
+            lines.push(styled_line("Base URL", emphasis_style()));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(wizard.base_url.clone()));
+            lines.push(Line::raw(""));
+            lines.push(styled_line("Enter accept  Esc close", hint_style()));
+        }
+        ProviderWizardStep::ApiKey => {
+            lines.push(styled_line("API key", emphasis_style()));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(mask_secret(&wizard.api_key)));
+            lines.push(Line::raw(""));
+            lines.push(styled_line("Enter accept  Esc close", hint_style()));
+        }
+        ProviderWizardStep::Model => {
+            lines.push(styled_line("Model", emphasis_style()));
+            lines.push(Line::raw(""));
+            lines.push(Line::raw(wizard.model.clone()));
+            lines.push(Line::raw(""));
+            lines.push(styled_line("Enter save  Esc close", hint_style()));
+        }
+    }
+    lines
 }
 
-fn centered_rect(area: Rect, max_width: u16, height: u16) -> Rect {
-    let width = max_width.min(area.width.saturating_sub(4)).max(1);
-    let height = height.min(area.height.saturating_sub(2)).max(1);
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
+/// The command prompt row. The caret is a reverse-styled cell at the end
+/// of the input; it is hidden while a dialog owns the keyboard.
+fn input_line(input: &str, show_caret: bool) -> Line {
+    let mut spans = vec![Span::raw(format!("[no provider] > {input}"))];
+    if show_caret {
+        spans.push(Span::styled(
+            " ",
+            Style {
+                reverse: true,
+                ..Style::default()
+            },
+        ));
+    }
+    Line { spans }
+}
+
+fn footer_line(width: usize) -> Line {
+    status_line(
         width,
-        height,
+        Line::default(),
+        styled_line("Esc/Ctrl+C exit", hint_style()),
+    )
+}
+
+fn styled_line(text: impl Into<String>, style: Style) -> Line {
+    Line {
+        spans: vec![Span::styled(text, style)],
+    }
+}
+
+fn title_style() -> Style {
+    Style {
+        fg: Color::Ansi(0),
+        bg: Color::Ansi(6),
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn warn_style() -> Style {
+    Style {
+        fg: Color::Ansi(3),
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn label_style() -> Style {
+    Style {
+        fg: Color::Ansi(7),
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn emphasis_style() -> Style {
+    Style {
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn command_style() -> Style {
+    Style {
+        fg: Color::Ansi(2),
+        bold: true,
+        ..Style::default()
+    }
+}
+
+fn status_style() -> Style {
+    Style {
+        fg: Color::Ansi(6),
+        ..Style::default()
+    }
+}
+
+fn hint_style() -> Style {
+    Style {
+        dim: true,
+        ..Style::default()
     }
 }
 
@@ -971,74 +893,8 @@ fn mask_secret(value: &str) -> String {
     "*".repeat(value.chars().count().min(12))
 }
 
-fn label_style() -> Style {
-    Style::default()
-        .fg(Color::Gray)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn emphasis_style() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
-}
-
-fn command_style() -> Style {
-    Style::default()
-        .fg(Color::Green)
-        .add_modifier(Modifier::BOLD)
-}
-
 fn display_path(path: &Path) -> String {
     path.display().to_string()
-}
-
-struct SetupTerminal {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl SetupTerminal {
-    fn enter() -> Result<Self, TuiError> {
-        enable_raw_mode().map_err(TuiError::Io)?;
-        let mut stdout = io::stdout();
-        // Enable bracketed paste alongside the alternate screen so multi-line and
-        // image-clipboard pastes arrive as a single Event::Paste instead of a run
-        // of key presses that would corrupt the prompt or terminal state.
-        if let Err(err) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
-            let _ = disable_raw_mode();
-            return Err(TuiError::Io(err));
-        }
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend).map_err(TuiError::Io)?;
-        terminal.clear().map_err(TuiError::Io)?;
-        Ok(Self { terminal })
-    }
-
-    fn draw(&mut self, app: &SetupTuiApp) -> Result<(), TuiError> {
-        self.terminal
-            .draw(|frame| render_setup_tui(frame, app))
-            .map(|_| ())
-            .map_err(TuiError::Io)
-    }
-
-    fn draw_tui(&mut self, app: &TuiApp) -> Result<(), TuiError> {
-        self.terminal
-            .draw(|frame| render_tui(frame, app))
-            .map(|_| ())
-            .map_err(TuiError::Io)
-    }
-}
-
-impl Drop for SetupTerminal {
-    fn drop(&mut self) {
-        let _ = self.terminal.show_cursor();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-        let _ = disable_raw_mode();
-    }
 }
 
 #[derive(Debug)]

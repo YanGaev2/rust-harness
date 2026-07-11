@@ -399,7 +399,7 @@ fn parse_utf8(buf: &[u8]) -> Step {
 }
 
 /// Coalesce a burst of events read in one poll window into paste blocks —
-/// the same defense the ratatui REPL used: on the legacy Windows console a
+/// the same defense the previous REPL used: on the legacy Windows console a
 /// paste arrives as a rapid stream of key events, so a pasted newline would
 /// submit mid-paste. A lone event is always genuine; in a burst, plain text
 /// keys (chars and Enter, no ctrl) merge into a single [`Event::Paste`].

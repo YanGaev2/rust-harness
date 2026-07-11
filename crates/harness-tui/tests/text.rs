@@ -1,4 +1,4 @@
-use harness_tui::text::{Line, Span, Style, visible_width, wrap};
+use harness_tui::text::{Color, Line, Span, Style, render_ansi, visible_width, wrap};
 
 #[test]
 fn width_of_ascii() {
@@ -151,4 +151,83 @@ fn wrap_preserves_styles_across_break() {
 #[test]
 fn wrap_zero_width_returns_line_unchanged() {
     assert_eq!(wrap(&Line::raw("abc"), 0), vec![Line::raw("abc")]);
+}
+
+#[test]
+fn sgr_of_plain_style_is_empty() {
+    assert_eq!(Style::default().sgr(), "");
+}
+
+#[test]
+fn sgr_bold() {
+    let style = Style {
+        bold: true,
+        ..Style::default()
+    };
+    assert_eq!(style.sgr(), "\x1b[1m");
+}
+
+#[test]
+fn sgr_reverse() {
+    let style = Style {
+        reverse: true,
+        ..Style::default()
+    };
+    assert_eq!(style.sgr(), "\x1b[7m");
+}
+
+#[test]
+fn sgr_ansi_foreground_normal_and_bright() {
+    let normal = Style {
+        fg: Color::Ansi(1),
+        ..Style::default()
+    };
+    assert_eq!(normal.sgr(), "\x1b[31m");
+    let bright = Style {
+        fg: Color::Ansi(9),
+        ..Style::default()
+    };
+    assert_eq!(bright.sgr(), "\x1b[91m");
+}
+
+#[test]
+fn sgr_indexed_foreground_and_rgb_background() {
+    let indexed = Style {
+        fg: Color::Indexed(196),
+        ..Style::default()
+    };
+    assert_eq!(indexed.sgr(), "\x1b[38;5;196m");
+    let rgb_bg = Style {
+        bg: Color::Rgb(1, 2, 3),
+        ..Style::default()
+    };
+    assert_eq!(rgb_bg.sgr(), "\x1b[48;2;1;2;3m");
+}
+
+#[test]
+fn sgr_combines_codes_in_fixed_order() {
+    let style = Style {
+        bold: true,
+        underline: true,
+        fg: Color::Ansi(2),
+        ..Style::default()
+    };
+    assert_eq!(style.sgr(), "\x1b[1;4;32m");
+}
+
+#[test]
+fn render_ansi_plain_line_is_passthrough() {
+    assert_eq!(render_ansi(&Line::raw("hi")), "hi");
+}
+
+#[test]
+fn render_ansi_wraps_styled_span_with_reset() {
+    let bold = Style {
+        bold: true,
+        ..Style::default()
+    };
+    let line = Line {
+        spans: vec![Span::raw("a"), Span::styled("b", bold), Span::raw("c")],
+    };
+    assert_eq!(render_ansi(&line), "a\x1b[1mb\x1b[0mc");
 }

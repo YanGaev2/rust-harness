@@ -159,6 +159,64 @@ pub fn wrap(line: &Line, width: usize) -> Vec<Line> {
     lines.into_iter().map(cells_to_line).collect()
 }
 
+impl Style {
+    /// Full SGR escape sequence for this style, or an empty string for
+    /// plain text. Attribute order: bold, dim, italic, underline,
+    /// reverse, fg, bg.
+    pub fn sgr(&self) -> String {
+        if self.is_plain() {
+            return String::new();
+        }
+        let mut codes: Vec<String> = Vec::new();
+        if self.bold {
+            codes.push("1".to_string());
+        }
+        if self.dim {
+            codes.push("2".to_string());
+        }
+        if self.italic {
+            codes.push("3".to_string());
+        }
+        if self.underline {
+            codes.push("4".to_string());
+        }
+        if self.reverse {
+            codes.push("7".to_string());
+        }
+        push_color_codes(&mut codes, self.fg, 30, 38);
+        push_color_codes(&mut codes, self.bg, 40, 48);
+        format!("\x1b[{}m", codes.join(";"))
+    }
+}
+
+/// `base` is 30 for foreground / 40 for background; `extended` is the
+/// 38/48 introducer for indexed and RGB colors.
+fn push_color_codes(codes: &mut Vec<String>, color: Color, base: u8, extended: u8) {
+    match color {
+        Color::Default => {}
+        Color::Ansi(n) if n < 8 => codes.push((base + n).to_string()),
+        Color::Ansi(n) => codes.push((base + 60 + (n - 8)).to_string()),
+        Color::Indexed(n) => codes.push(format!("{extended};5;{n}")),
+        Color::Rgb(r, g, b) => codes.push(format!("{extended};2;{r};{g};{b}")),
+    }
+}
+
+/// Render a line to a string with ANSI styling. Each styled span is
+/// wrapped `SGR .. text .. reset`; plain spans pass through untouched.
+pub fn render_ansi(line: &Line) -> String {
+    let mut out = String::new();
+    for span in &line.spans {
+        if span.style.is_plain() {
+            out.push_str(&span.text);
+        } else {
+            out.push_str(&span.style.sgr());
+            out.push_str(&span.text);
+            out.push_str("\x1b[0m");
+        }
+    }
+    out
+}
+
 /// Rebuild a line from cells, merging adjacent cells with equal style.
 fn cells_to_line(cells: Vec<Cell<'_>>) -> Line {
     let mut spans: Vec<Span> = Vec::new();

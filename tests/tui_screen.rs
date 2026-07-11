@@ -1,15 +1,13 @@
 use std::path::PathBuf;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use harness_cli::cli;
 use harness_cli::providers::{CachePolicy, ChatApiFormat};
 use harness_cli::tui::{
-    SetupTuiAction, SetupTuiApp, TuiAction, TuiApp, TuiCommand, TuiProviderDraft, render_setup_tui,
-    render_tui,
+    SetupTuiAction, SetupTuiApp, TuiAction, TuiApp, TuiCommand, TuiProviderDraft, setup_lines,
+    setup_tui_lines,
 };
-use ratatui::Terminal;
-use ratatui::backend::TestBackend;
-use ratatui::buffer::Buffer;
+use harness_tui::input::{KeyCode, KeyEvent};
+use harness_tui::text::Line;
 
 #[test]
 fn setup_tui_accepts_provider_add_command() {
@@ -28,13 +26,7 @@ fn setup_tui_renders_status_paths_commands_and_prompt() {
     let mut app = setup_app();
     type_text(&mut app, "/providers");
 
-    let backend = TestBackend::new(96, 24);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal
-        .draw(|frame| render_setup_tui(frame, &app))
-        .unwrap();
-
-    let screen = buffer_text(terminal.backend().buffer());
+    let screen = lines_text(&setup_tui_lines(&app, 96));
     assert!(screen.contains("harness"));
     assert!(screen.contains("no provider configured"));
     assert!(screen.contains("workspace"));
@@ -136,12 +128,12 @@ fn terminal_setup_enables_bracketed_paste_to_protect_the_terminal() {
         "src/repl.rs must handle paste events"
     );
 
-    // The setup TUI still runs on crossterm and must enable bracketed paste
-    // itself so multi-line pastes do not break the terminal.
+    // The setup TUI also runs on harness-tui: `Screen::stdout` opens the
+    // terminal with bracketed paste enabled as part of its setup sequence.
     let tui = read("src/tui.rs");
     assert!(
-        tui.contains("EnableBracketedPaste"),
-        "src/tui.rs (setup TUI) must enable bracketed paste"
+        tui.contains("Screen::stdout"),
+        "src/tui.rs (setup TUI) must open the terminal via harness-tui, which enables bracketed paste"
     );
 
     // harness-tui owns the escape sequence that turns bracketed paste on.
@@ -163,11 +155,7 @@ fn tui_renders_provider_wizard_dialog_inside_interface() {
     type_text_tui(&mut app, "/provider add");
     app.handle_key(key(KeyCode::Enter));
 
-    let backend = TestBackend::new(100, 28);
-    let mut terminal = Terminal::new(backend).unwrap();
-    terminal.draw(|frame| render_tui(frame, &app)).unwrap();
-
-    let screen = buffer_text(terminal.backend().buffer());
+    let screen = lines_text(&setup_lines(&app, 100));
     assert!(screen.contains("Provider setup"));
     assert!(screen.contains("Select provider"));
     assert!(screen.contains("codex"));
@@ -255,16 +243,13 @@ fn type_text(app: &mut SetupTuiApp, text: &str) {
 }
 
 fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
+    KeyEvent::plain(code)
 }
 
-fn buffer_text(buffer: &Buffer) -> String {
-    let mut text = String::new();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            text.push_str(buffer[(x, y)].symbol());
-        }
-        text.push('\n');
-    }
-    text
+fn lines_text(lines: &[Line]) -> String {
+    lines
+        .iter()
+        .map(|line| line.text())
+        .collect::<Vec<_>>()
+        .join("\n")
 }

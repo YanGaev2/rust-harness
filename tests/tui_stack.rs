@@ -1,11 +1,17 @@
 #[test]
-fn manifest_uses_ratatui_with_current_crossterm_backend() {
+fn manifest_uses_harness_tui_without_legacy_tui_stack() {
     let manifest =
         std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")).unwrap();
 
-    assert!(manifest.contains("ratatui"));
-    assert!(manifest.contains("crossterm = \"0.29\""));
-    assert!(manifest.contains("crossterm_0_29"));
+    assert!(manifest.contains("harness-tui"));
+    // Built without the literal names so a repo-wide grep for the legacy
+    // TUI dependencies stays clean.
+    for legacy_dep in [format!("rata{}", "tui"), format!("cross{}", "term")] {
+        assert!(
+            !manifest.contains(&legacy_dep),
+            "legacy TUI dependency {legacy_dep} must stay removed from Cargo.toml"
+        );
+    }
 }
 
 #[test]

@@ -18,7 +18,7 @@ harness
 ```
 
 On first launch, if no provider is configured yet, `harness` opens a
-Ratatui/Crossterm terminal setup screen with a status header, workspace/config
+harness-tui terminal setup screen with a status header, workspace/config
 paths, command hints, and the `[no provider] >` prompt. From there, run
 `/provider add` to start provider setup from the interface; the current provider
 wizard still reuses the existing prompt flow. After a provider with at least one
@@ -129,7 +129,8 @@ Network-backed `provider models`, `provider add --add-all`,
 `provider add --interactive`, `chat once`, `chat stream`, `agent run`, and
 `repl` commands accept `--timeout-ms N` to tighten request timeouts when needed.
 
-Start the interactive REPL. On a real terminal it opens the **Ratatui chat TUI**;
+Start the interactive REPL. On a real terminal it opens the **harness-tui chat
+TUI** (our own line-based library in `crates/harness-tui`, no ratatui/crossterm);
 piped/non-TTY callers fall back to line mode. The chat TUI:
 
 - **Streams** responses over SSE (OpenAI-compatible providers): the model's
@@ -137,11 +138,11 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   renders as a `●` card (marker colored gray running → green/red done) with its
   name, compact arguments, a `⎿ summary` result line, and a `memo:` line when
   the forgiving runtime auto-corrected the call.
-- Uses a **minimal Claude-Code-style layout**: a borderless transcript (`>` echoes
-  your turns, `●` marks answers), a single rounded input box with a `>` prompt and
-  soft-wrapped multi-line compose, a `✻ Working… (12s)` row (with elapsed time)
-  while the agent runs, and a
-  bottom status line with the active provider/model, workspace, and key hints.
+- Uses a **Claude-Code-style screen**: finished chat blocks are printed into the
+  terminal's **native scrollback** (`>` echoes your turns, `●` marks answers) —
+  they stay selectable, wheel-scrollable, and survive exit; only the bottom
+  panel (live blocks, a `⠹ Working… (12s)` spinner row, the `>` prompt editor
+  with a drawn caret, and the provider/model status line) is repainted.
 - Renders assistant answers as **Markdown**: headings, `-`/`*` bullets, fenced code
   blocks, rules, and inline `**bold**`/`*italic*`/`` `code` ``.
 - Offers **slash-command autocomplete**: type `/` to open a filtered menu below the
@@ -155,17 +156,16 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
 - **Esc or Ctrl+C interrupts a running agent** (an `Interrupted by user` notice
   appears; the partial trace is still saved). Streaming stops between tokens,
   tool loops stop before the next round; the session stays open — when idle,
-  Esc/Ctrl+C exit as before. Scrolling keeps working while the agent runs.
-- Has a **multi-line prompt** (Shift/Alt+Enter inserts a newline; Left/Right/Home/
-  End move the caret) and **paste that never auto-submits** — pasted newlines stay
-  literal even on the legacy Windows console (a burst of key events is coalesced
-  into one paste).
+  Esc/Ctrl+C exit as before.
+- Has a **multi-line prompt** (Alt+Enter or Ctrl+J inserts a newline; Left/Right/
+  Home/End move the caret) and **paste that never auto-submits** — pasted newlines
+  stay literal even on the legacy Windows console (a burst of key events is
+  coalesced into one paste).
 - Captures **Ctrl+V** from the system clipboard: text is inserted at the caret, a
   PNG image is saved to `.harness/attachments` and referenced in the prompt.
-- Recalls prompt history with Up/Down, and scrolls the transcript with the **mouse
-  wheel** or PageUp/PageDown (new output snaps back to the bottom). The wheel
-  works because the TUI captures mouse events — to select/copy text, hold
-  **Shift while dragging** (the terminal's standard override for mouse-mode apps).
+- Recalls prompt history with Up/Down. The transcript scrolls with the terminal's
+  own **mouse wheel and scrollbar** (the mouse is not captured), and text
+  selection/copy works natively.
 
 ```powershell
 harness repl --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --timeout-ms 60000 --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000
@@ -368,15 +368,16 @@ harness clipboard paste --workspace . --text "pasted text"
   provider/model switch), `/history QUERY`, `/clear`, `/help` (command palette
   overlay), `/exit`; Up/Down recall previous prompts and PageUp/PageDown scroll
   the transcript (new output snaps back to the bottom).
-- Ratatui/Crossterm no-provider setup TUI for the real `harness` terminal
+- No-provider setup TUI (on `harness-tui`) for the real `harness` terminal
   launch path, with line-mode fallback for non-TTY output.
 
 ## Workspace
 
 The repo is a cargo workspace. `crates/harness-tui/` is our own terminal UI
-library (line-based rendering, native-scrollback screen model) that will
-replace ratatui + crossterm for the interactive front ends. Run its tests with
-`cargo test -p harness-tui`; run everything with `cargo test --workspace`.
+library (line-based rendering, native-scrollback screen model) powering all
+interactive front ends — the previous third-party TUI stack is fully removed.
+Run its tests with `cargo test -p harness-tui`; run everything with
+`cargo test --workspace`.
 
 ## Verification
 

@@ -133,6 +133,44 @@ fn ss3_function_and_arrow_keys() {
 }
 
 #[test]
+fn alt_enter_is_enter_with_alt() {
+    // ESC CR — the Alt+Enter compose-newline binding. Must decode as
+    // Enter+alt, not Char('\r').
+    assert_eq!(
+        feed_all(b"\x1b\r"),
+        vec![Event::Key(KeyEvent::alt(KeyCode::Enter))]
+    );
+}
+
+#[test]
+fn alt_ctrl_letter_keeps_both_modifiers() {
+    assert_eq!(
+        feed_all(b"\x1b\x03"),
+        vec![Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            mods: Modifiers {
+                ctrl: true,
+                alt: true,
+                shift: false,
+            },
+        })]
+    );
+}
+
+#[test]
+fn flush_preserves_partial_utf8() {
+    let bytes = "\u{444}".as_bytes(); // ф
+    let mut parser = Parser::new();
+    assert_eq!(parser.feed(&bytes[..1]), vec![]);
+    // A read-timeout flush must not destroy the valid lead byte.
+    assert_eq!(parser.flush(), vec![]);
+    assert_eq!(
+        parser.feed(&bytes[1..]),
+        vec![key(KeyCode::Char('\u{444}'))]
+    );
+}
+
+#[test]
 fn esc_char_is_alt_modified() {
     assert_eq!(
         feed_all(b"\x1ba"),

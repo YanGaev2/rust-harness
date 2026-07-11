@@ -257,6 +257,12 @@ pub fn restore_now() {
     sys::restore_console();
 }
 
+#[cfg(all(unix, not(target_os = "linux")))]
+compile_error!(
+    "harness-tui supports Windows and Linux (WSL2) only: the unix FFI layer \
+     hard-codes the linux-gnu termios layout and ioctl numbers"
+);
+
 #[cfg(unix)]
 mod sys {
     use super::TerminalError;
@@ -302,6 +308,9 @@ mod sys {
     const IEXTEN: u32 = 0o100000;
     const ICRNL: u32 = 0o400;
     const IXON: u32 = 0o2000;
+    /// linux-gnu `c_cc` indices.
+    const VTIME_INDEX: usize = 5;
+    const VMIN_INDEX: usize = 6;
 
     static SAVED: Mutex<Option<Termios>> = Mutex::new(None);
 
@@ -344,6 +353,10 @@ mod sys {
             let mut raw = original;
             raw.c_lflag &= !(ECHO | ICANON | ISIG | IEXTEN);
             raw.c_iflag &= !(IXON | ICRNL);
+            // Inherited VMIN=0 would turn reads into polling EOFs and
+            // VMIN>1 would block single keys — pin byte-at-a-time reads.
+            raw.c_cc[VTIME_INDEX] = 0;
+            raw.c_cc[VMIN_INDEX] = 1;
             if unsafe { tcsetattr(STDIN_FD, TCSANOW, &raw) } != 0 {
                 return Err(TerminalError::Platform("tcsetattr"));
             }
@@ -359,11 +372,11 @@ mod sys {
 
     /// Idempotent: restores the saved termios once, then becomes a no-op.
     pub fn restore_console() {
-        if let Ok(mut saved) = SAVED.lock() {
-            if let Some(original) = saved.take() {
-                unsafe {
-                    tcsetattr(STDIN_FD, TCSANOW, &original);
-                }
+        if let Ok(mut saved) = SAVED.lock()
+            && let Some(original) = saved.take()
+        {
+            unsafe {
+                tcsetattr(STDIN_FD, TCSANOW, &original);
             }
         }
     }
@@ -418,6 +431,8 @@ mod sys {
         fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
         fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
         fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut ConsoleScreenBufferInfo) -> i32;
+        fn GetConsoleCP() -> u32;
+        fn SetConsoleCP(code_page: u32) -> i32;
     }
 
     const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
@@ -426,11 +441,15 @@ mod sys {
     const ENABLE_LINE_INPUT: u32 = 0x0002;
     const ENABLE_ECHO_INPUT: u32 = 0x0004;
     const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const DISABLE_NEWLINE_AUTO_RETURN: u32 = 0x0008;
+    const CP_UTF8: u32 = 65001;
 
     /// u32::MAX = "nothing saved" sentinel.
     static SAVED_IN: AtomicU32 = AtomicU32::new(u32::MAX);
     static SAVED_OUT: AtomicU32 = AtomicU32::new(u32::MAX);
+    static SAVED_CP: AtomicU32 = AtomicU32::new(u32::MAX);
 
     pub fn is_tty() -> bool {
         let mut mode = 0u32;
@@ -447,8 +466,18 @@ mod sys {
             return Err(TerminalError::Platform("GetConsoleMode(stdout)"));
         }
         SAVED_OUT.store(mode, Ordering::SeqCst);
-        if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } == 0 {
-            return Err(TerminalError::Platform("SetConsoleMode(stdout, VT)"));
+        // DISABLE_NEWLINE_AUTO_RETURN keeps an exact-width bottom row
+        // from scrolling the console the moment its last column is
+        // written (which would silently shift the pinned panel).
+        let desired = mode
+            | ENABLE_PROCESSED_OUTPUT
+            | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            | DISABLE_NEWLINE_AUTO_RETURN;
+        if unsafe { SetConsoleMode(handle, desired) } == 0 {
+            // Older conhost may reject DISABLE_NEWLINE_AUTO_RETURN.
+            if unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) } == 0 {
+                return Err(TerminalError::Platform("SetConsoleMode(stdout, VT)"));
+            }
         }
         Ok(())
     }
@@ -482,6 +511,13 @@ mod sys {
             if unsafe { SetConsoleMode(handle, raw) } == 0 {
                 return Err(TerminalError::Platform("SetConsoleMode(stdin, raw)"));
             }
+            // ReadFile decodes keys via the console INPUT code page,
+            // which is often an OEM page — force UTF-8 so non-ASCII
+            // input (e.g. Cyrillic) survives the byte parser.
+            SAVED_CP.store(unsafe { GetConsoleCP() }, Ordering::SeqCst);
+            unsafe {
+                SetConsoleCP(CP_UTF8);
+            }
             Ok(RawModeGuard { _private: () })
         }
     }
@@ -504,6 +540,12 @@ mod sys {
         if saved_out != u32::MAX {
             unsafe {
                 SetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), saved_out);
+            }
+        }
+        let saved_cp = SAVED_CP.swap(u32::MAX, Ordering::SeqCst);
+        if saved_cp != u32::MAX {
+            unsafe {
+                SetConsoleCP(saved_cp);
             }
         }
     }

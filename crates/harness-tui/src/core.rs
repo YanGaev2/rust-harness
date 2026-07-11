@@ -88,7 +88,9 @@ impl Screen {
                 frame.push_str("\r\n");
             }
         }
-        self.origin = (row0 + k).min(height.saturating_sub(panel_len));
+        // Reserve at least the cursor row even with no panel painted,
+        // so origin can never land outside the viewport.
+        self.origin = (row0 + k).min(height.saturating_sub(panel_len.max(1)));
         push_panel_rows(&mut frame, &self.panel, self.origin);
         frame.push_str(esc::SYNC_END);
         self.terminal.write_all(frame.as_bytes())
@@ -96,7 +98,14 @@ impl Screen {
 
     /// Repaint the pinned panel. Same height → only changed rows are
     /// rewritten; height changes force a clear + full redraw.
-    pub fn render_panel(&mut self, lines: Vec<Line>) -> io::Result<()> {
+    pub fn render_panel(&mut self, mut lines: Vec<Line>) -> io::Result<()> {
+        // A panel taller than the screen is tail-clipped: the bottom
+        // rows (editor, status) matter most, and unclipped input would
+        // underflow the origin arithmetic below.
+        let max_rows = self.height.max(1) as usize;
+        if lines.len() > max_rows {
+            lines = lines.split_off(lines.len() - max_rows);
+        }
         if lines.len() == self.panel.len() {
             let updates = diff_frames(&self.panel, &lines);
             self.panel = lines;
@@ -113,7 +122,7 @@ impl Screen {
             for _ in 0..overflow {
                 frame.push_str("\r\n");
             }
-            self.origin -= overflow;
+            self.origin = self.origin.saturating_sub(overflow);
         }
         frame.push_str(&esc::move_to(self.origin, 0));
         frame.push_str(esc::CLEAR_DOWN);

@@ -121,7 +121,7 @@ impl FileTool {
         content: &str,
         mode: WriteMode,
     ) -> Result<WriteResult, ToolError> {
-        let relative = normalize_relative_path(requested_path)?;
+        let relative = normalize_relative_path(&self.root, requested_path)?;
         let target = self.root.join(relative);
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
 
@@ -157,7 +157,7 @@ impl FileTool {
     }
 
     pub fn read_text(&self, requested_path: &str) -> Result<String, ToolError> {
-        let relative = normalize_relative_path(requested_path)?;
+        let relative = normalize_relative_path(&self.root, requested_path)?;
         let target = self.root.join(relative);
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
         let target = target.canonicalize().map_err(ToolError::Io)?;
@@ -372,13 +372,22 @@ impl FileTool {
         &self,
         requested_path: &str,
         max_results: usize,
+        max_depth: Option<usize>,
+        show_hidden: bool,
     ) -> Result<FileListResult, ToolError> {
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
         let target = resolve_existing_workspace_path_or_root(&root, requested_path)?;
         let limit = max_results.max(1);
         let scan_limit = limit.saturating_add(1);
         let mut entries = Vec::new();
-        collect_files_bounded(&root, &target, &mut entries, scan_limit)?;
+        collect_files_bounded(
+            &root,
+            &target,
+            &mut entries,
+            scan_limit,
+            max_depth,
+            show_hidden,
+        )?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         let scanned = entries.len();
@@ -467,7 +476,10 @@ impl fmt::Display for ToolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::OutsideWorkspace { path } => {
-                write!(f, "path is outside workspace: {path}")
+                write!(
+                    f,
+                    "path points outside the workspace: {path} (use paths relative to the workspace root)"
+                )
             }
             Self::DestinationExists { path } => {
                 write!(f, "destination already exists: {path}")
@@ -505,7 +517,58 @@ impl Write for HasherWriter<'_> {
     }
 }
 
-fn normalize_relative_path(input: &str) -> Result<PathBuf, ToolError> {
+/// Turn an absolute path that points inside the workspace into its
+/// workspace-relative form. The system prompt tells the model the
+/// workspace root, and models trained on absolute-path harnesses
+/// legitimately send `<root>/file` — that path IS inside the workspace.
+/// Returns `None` for relative inputs and for paths truly outside.
+fn strip_workspace_root(root: &Path, input: &str) -> Option<String> {
+    let target = input.replace('\\', "/");
+    if !Path::new(&target).is_absolute() {
+        return None;
+    }
+    let target = target.trim_start_matches("//?/");
+    let mut bases = vec![root.to_path_buf()];
+    if let Ok(canonical) = root.canonicalize() {
+        bases.push(canonical);
+    }
+    for base in bases {
+        let base = base.display().to_string().replace('\\', "/");
+        let base = base.trim_start_matches("//?/").trim_end_matches('/');
+        let matches = if cfg!(windows) {
+            target
+                .to_ascii_lowercase()
+                .starts_with(&base.to_ascii_lowercase())
+        } else {
+            target.starts_with(base)
+        };
+        if !matches {
+            continue;
+        }
+        let rest = &target[base.len()..];
+        // Require a component boundary: `<root>-other/...` is outside.
+        if !(rest.is_empty() || rest.starts_with('/')) {
+            continue;
+        }
+        let rest = rest.trim_start_matches('/');
+        return Some(if rest.is_empty() {
+            ".".to_string()
+        } else {
+            rest.to_string()
+        });
+    }
+    None
+}
+
+fn normalize_relative_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {
+    let stripped;
+    let input = match strip_workspace_root(root, input) {
+        Some(relative) => {
+            stripped = relative;
+            stripped.as_str()
+        }
+        None => input,
+    };
     let normalized = input.replace('\\', "/");
     let path = Path::new(&normalized);
     if path.is_absolute() {
@@ -538,7 +601,7 @@ fn resolve_existing_workspace_path(
     root: &Path,
     requested_path: &str,
 ) -> Result<PathBuf, ToolError> {
-    let relative = normalize_relative_path(requested_path)?;
+    let relative = normalize_relative_path(root, requested_path)?;
     let target = root.join(relative).canonicalize().map_err(ToolError::Io)?;
     if !target.starts_with(root) {
         return Err(ToolError::OutsideWorkspace {
@@ -552,7 +615,11 @@ fn resolve_existing_workspace_path_or_root(
     root: &Path,
     requested_path: &str,
 ) -> Result<PathBuf, ToolError> {
-    if requested_path.trim().is_empty() || requested_path.trim() == "." {
+    let trimmed = requested_path.trim();
+    if trimmed.is_empty()
+        || trimmed == "."
+        || strip_workspace_root(root, trimmed).as_deref() == Some(".")
+    {
         return Ok(root.to_path_buf());
     }
 
@@ -560,7 +627,7 @@ fn resolve_existing_workspace_path_or_root(
 }
 
 fn resolve_new_workspace_path(root: &Path, requested_path: &str) -> Result<PathBuf, ToolError> {
-    let relative = normalize_relative_path(requested_path)?;
+    let relative = normalize_relative_path(root, requested_path)?;
     let target = root.join(relative);
     let parent = target.parent().ok_or(ToolError::EmptyPath)?;
     fs::create_dir_all(parent).map_err(ToolError::Io)?;
@@ -578,6 +645,8 @@ fn collect_files_bounded(
     target: &Path,
     entries: &mut Vec<FileListEntry>,
     scan_limit: usize,
+    max_depth: Option<usize>,
+    show_hidden: bool,
 ) -> Result<(), ToolError> {
     if entries.len() >= scan_limit {
         return Ok(());
@@ -593,12 +662,21 @@ fn collect_files_bounded(
         return Ok(());
     }
 
+    if max_depth == Some(0) {
+        return Ok(());
+    }
+
     for entry in fs::read_dir(target).map_err(ToolError::Io)? {
         if entries.len() >= scan_limit {
             break;
         }
         let entry = entry.map_err(ToolError::Io)?;
         let path = entry.path();
+        // Dot entries (.git, .claude, …) are noise for the model unless it
+        // asks for them explicitly.
+        if !show_hidden && entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         let metadata = entry.metadata().map_err(ToolError::Io)?;
         entries.push(FileListEntry {
             path: workspace_relative_display(root, &path)?,
@@ -606,7 +684,14 @@ fn collect_files_bounded(
             len: metadata.is_file().then_some(metadata.len()),
         });
         if metadata.is_dir() {
-            collect_files_bounded(root, &path, entries, scan_limit)?;
+            collect_files_bounded(
+                root,
+                &path,
+                entries,
+                scan_limit,
+                max_depth.map(|depth| depth.saturating_sub(1)),
+                show_hidden,
+            )?;
         }
     }
 

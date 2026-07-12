@@ -578,7 +578,17 @@ impl ToolRuntime {
             .unwrap_or_else(|| ".".to_string());
         let max_results =
             optional_usize_arg(&call.arguments, &["max_results", "limit"]).unwrap_or(200);
-        let result = FileTool::new(&self.workspace).list_files(&path, max_results)?;
+        // `depth` is the model's own vocabulary (seen live): 1 = top level.
+        let max_depth = optional_usize_arg(&call.arguments, &["depth", "max_depth"]);
+        let show_hidden =
+            optional_bool_arg(&call.arguments, &["show_hidden", "include_hidden", "all"])
+                .unwrap_or(false);
+        let result = FileTool::new(&self.workspace).list_files(
+            &path,
+            max_results,
+            max_depth,
+            show_hidden,
+        )?;
         let content = result
             .entries
             .iter()

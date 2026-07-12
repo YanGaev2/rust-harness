@@ -576,7 +576,7 @@ pub fn run_setup_tui(
 ) -> Result<SetupTuiAction, TuiError> {
     tui_terminal::install_panic_restore();
     let mut screen = Screen::stdout().map_err(terminal_error)?;
-    screen.takeover().map_err(TuiError::Io)?;
+    screen.clear_screen().map_err(TuiError::Io)?;
     let mut app = SetupTuiApp::new(command_name, config_path, workspace);
     let mut pump = InputPump::start();
 
@@ -608,7 +608,7 @@ pub fn run_tui(
 ) -> Result<TuiAction, TuiError> {
     tui_terminal::install_panic_restore();
     let mut screen = Screen::stdout().map_err(terminal_error)?;
-    screen.takeover().map_err(TuiError::Io)?;
+    screen.clear_screen().map_err(TuiError::Io)?;
     let mut app = TuiApp::new(command_name, config_path, workspace);
     let mut pump = InputPump::start();
 

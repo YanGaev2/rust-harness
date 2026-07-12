@@ -524,6 +524,90 @@ fn panel_caps_live_rows_to_the_tail() {
 // --- scrollback flushing ---
 
 #[test]
+fn long_streaming_answer_freezes_prefix_into_scrollback() {
+    let mut app = app();
+    app.push_user_message("вопрос");
+    app.set_busy(true);
+    app.take_scrollback(80);
+
+    let mut delta = String::new();
+    for i in 0..30 {
+        delta.push_str(&format!("параграф {i}\n\n"));
+    }
+    app.push_agent_event(&AgentEvent::FinalContentDelta(delta));
+    app.freeze_streaming_overflow(80, 10);
+
+    // The frozen prefix flushes to scrollback while STILL busy…
+    let (frozen, limit) = app.peek_scrollback(80);
+    let frozen_text = lines_text(&frozen);
+    assert!(
+        frozen_text.contains("параграф 0"),
+        "frozen prefix must flush: {frozen_text}"
+    );
+    app.acknowledge_emitted(limit);
+
+    // …the live tail stays within budget and keeps the newest text…
+    let live = lines_text(&app.panel_lines(80, 10));
+    assert!(
+        live.contains("параграф 29"),
+        "newest text stays live: {live}"
+    );
+    assert!(
+        !live.contains("параграф 0"),
+        "head must not be live: {live}"
+    );
+
+    // …and further deltas keep appending to the live tail.
+    app.push_agent_event(&AgentEvent::FinalContentDelta("хвост".to_string()));
+    let live = lines_text(&app.panel_lines(80, 10));
+    assert!(live.contains("хвост"));
+
+    // The continuation renders without a second "● " bullet.
+    app.set_busy(false);
+    let (tail, _) = app.peek_scrollback(80);
+    assert!(
+        !lines_text(&tail).contains('●'),
+        "continuation must not repeat the marker: {}",
+        lines_text(&tail)
+    );
+}
+
+#[test]
+fn freeze_never_splits_inside_a_code_fence() {
+    let mut app = app();
+    app.set_busy(true);
+    let mut text = String::from("intro\n\n```rust\n");
+    for i in 0..30 {
+        text.push_str(&format!("let x{i} = {i};\n\n"));
+    }
+    app.push_agent_event(&AgentEvent::FinalContentDelta(text));
+    app.freeze_streaming_overflow(80, 10);
+
+    let (frozen, _) = app.peek_scrollback(80);
+    let flushed = lines_text(&frozen);
+    // The only safe boundary is right after "intro" — blank lines inside
+    // the unclosed fence must not be used.
+    assert!(flushed.contains("intro"), "{flushed}");
+    assert!(
+        !flushed.contains("let x0"),
+        "split landed inside the fence: {flushed}"
+    );
+}
+
+#[test]
+fn freeze_without_safe_boundary_leaves_the_entry_alone() {
+    let mut app = app();
+    app.set_busy(true);
+    // One giant paragraph: no blank lines at all.
+    let text = "слово ".repeat(2000);
+    app.push_agent_event(&AgentEvent::FinalContentDelta(text));
+    app.freeze_streaming_overflow(80, 10);
+    // Nothing to flush — the entry stays live (head-clip is the backstop).
+    let (frozen, _) = app.peek_scrollback(80);
+    assert!(frozen.is_empty());
+}
+
+#[test]
 fn peek_scrollback_is_side_effect_free_until_acknowledged() {
     let mut app = app();
     app.push_user_message("hi");

@@ -36,6 +36,20 @@ impl ShellTool {
     }
 
     pub fn run(&self, command: &str) -> Result<ShellOutput, ShellError> {
+        // PowerShell 5.1 encodes its piped streams with the OEM code page
+        // (CP866 on Russian Windows) — the model would receive mojibake
+        // error text and retry blindly. Switching the console to UTF-8
+        // first also covers nested processes the command spawns.
+        let command_buf;
+        let command = if self.profile.program().contains("powershell") {
+            command_buf = format!(
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
+                 $OutputEncoding=[System.Text.Encoding]::UTF8; {command}"
+            );
+            &command_buf
+        } else {
+            command
+        };
         let mut child = Command::new(self.profile.program())
             .args(self.profile.args())
             .arg(command)
@@ -195,7 +209,62 @@ fn read_pipe_bounded(
     }
 
     Ok(BoundedPipeOutput {
-        content: String::from_utf8_lossy(&captured).to_string(),
+        content: decode_console_bytes(&captured),
         truncated,
     })
+}
+
+/// Decode captured pipe bytes: UTF-8 first, then (Windows) the console's
+/// OEM code page — PowerShell parse errors are emitted before our UTF-8
+/// prologue can run, so they arrive OEM-encoded.
+pub fn decode_console_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            #[cfg(windows)]
+            if let Some(text) = oem::decode(bytes) {
+                return text;
+            }
+            String::from_utf8_lossy(bytes).to_string()
+        }
+    }
+}
+
+#[cfg(windows)]
+mod oem {
+    unsafe extern "system" {
+        fn GetOEMCP() -> u32;
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            bytes: *const u8,
+            byte_len: i32,
+            out: *mut u16,
+            out_len: i32,
+        ) -> i32;
+    }
+
+    /// Decode with the active OEM code page via kernel32; `None` on any
+    /// conversion failure so the caller can fall back to lossy UTF-8.
+    pub fn decode(bytes: &[u8]) -> Option<String> {
+        if bytes.is_empty() || bytes.len() > i32::MAX as usize {
+            return None;
+        }
+        let code_page = unsafe { GetOEMCP() };
+        let len = bytes.len() as i32;
+        let needed = unsafe {
+            MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0)
+        };
+        if needed <= 0 {
+            return None;
+        }
+        let mut wide = vec![0_u16; needed as usize];
+        let written = unsafe {
+            MultiByteToWideChar(code_page, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), needed)
+        };
+        if written != needed {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&wide))
+    }
 }

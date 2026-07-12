@@ -249,7 +249,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: tool_name.to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path", "content"]),
+            repaired: repaired_name,
             content: format!("wrote {}", result.path.display()),
             metadata: json!({
                 "created": result.created,
@@ -294,8 +294,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.replace".to_string(),
             ok: true,
-            repaired: repaired_name
-                || !has_all_keys(&call.arguments, &["path", "old_text", "new_text"]),
+            repaired: repaired_name,
             content: format!(
                 "replaced {} occurrence(s) in {}",
                 result.replacements, result.path
@@ -323,7 +322,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "attachment.read".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: result.content,
             metadata: json!({
                 "path": result.path,
@@ -350,7 +349,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.read".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: result.content,
             metadata: json!({
                 "path": result.path,
@@ -373,7 +372,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.hash".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: result.hash.clone(),
             metadata: json!({
                 "path": result.path,
@@ -395,7 +394,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.stat".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: format!(
                 "{} {}",
                 if result.is_dir { "dir" } else { "file" },
@@ -426,7 +425,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.tail".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: result.content,
             metadata: json!({
                 "path": result.path,
@@ -480,9 +479,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "shell.exec".to_string(),
             ok,
-            repaired: repaired_name
-                || repair.note.is_some()
-                || !has_all_keys(&call.arguments, &["command"]),
+            repaired: repaired_name || repair.note.is_some(),
             content,
             metadata,
         })
@@ -556,8 +553,10 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.search".to_string(),
             ok: true,
-            // `query` is the only required argument; `path` defaults to root.
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["query"]),
+            // Accepted argument aliases (`pattern`, `text`) are first-class:
+            // flagging them as repairs only generates memo noise the model
+            // never learns from (seen in the bench traces).
+            repaired: repaired_name,
             content,
             metadata: json!({
                 "matches": result.matches.len(),
@@ -579,7 +578,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.delete".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["path"]),
+            repaired: repaired_name,
             content: format!("deleted {}", result.path),
             metadata: json!({
                 "path": result.path,
@@ -615,7 +614,7 @@ impl ToolRuntime {
             id: call.id,
             tool_name: "file.move".to_string(),
             ok: true,
-            repaired: repaired_name || !has_all_keys(&call.arguments, &["source", "target"]),
+            repaired: repaired_name,
             content: format!("moved {} to {}", result.source_path, result.target_path),
             metadata: json!({
                 "source_path": result.source_path,
@@ -1163,10 +1162,6 @@ fn coerce_bool(value: &Value) -> Option<bool> {
         },
         _ => None,
     }
-}
-
-fn has_all_keys(value: &Value, names: &[&str]) -> bool {
-    names.iter().all(|name| value.get(*name).is_some())
 }
 
 fn default_max_concurrency() -> usize {

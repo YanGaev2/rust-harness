@@ -20,6 +20,70 @@ fn shell_tool_runs_command_with_native_profile() {
     assert_eq!(output.program, "bash");
 }
 
+#[cfg(windows)]
+#[test]
+fn powershell_error_stream_reaches_the_model_as_valid_utf8() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(10));
+
+    // PowerShell 5.1 encodes its piped error stream with the OEM code
+    // page by default (CP866 on Russian Windows), which our UTF-8 pipe
+    // reader turns into mojibake — the model then retries blindly
+    // because the error text is unreadable (seen live in bench traces).
+    let output = tool.run("Write-Error \"кириллица-в-ошибке\"").unwrap();
+
+    assert!(
+        !output.stderr.contains('\u{FFFD}'),
+        "stderr is mojibake: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("кириллица-в-ошибке"),
+        "stderr lost the message: {}",
+        output.stderr
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn nested_powershell_error_stream_is_valid_utf8_too() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(20));
+
+    // The bench traces showed models spawning a second `powershell
+    // -Command` inside ours; the inner process picks its encoding from
+    // the console code page, which our UTF-8 prologue must have set.
+    let output = tool
+        .run("powershell -NoProfile -Command \"Write-Error 'кириллица-вложенно'\"")
+        .unwrap();
+
+    assert!(
+        !output.stderr.contains('\u{FFFD}'),
+        "nested stderr is mojibake: {}",
+        output.stderr
+    );
+    assert!(
+        output.stderr.contains("кириллица-вложенно"),
+        "nested stderr lost the message: {}",
+        output.stderr
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn oem_bytes_decode_without_replacement_characters() {
+    use harness_cli::tools::shell::decode_console_bytes;
+
+    // "кириллица" in CP866 — what PowerShell parse errors look like when
+    // they are emitted before any prologue can switch the encoding. The
+    // exact decoded text depends on the machine's OEM code page; the
+    // guarantee is a clean single-byte decode instead of U+FFFD noise.
+    let cp866 = [0xAAu8, 0xA8, 0xE0, 0xA8, 0xAB, 0xAB, 0xA8, 0xE6, 0xA0];
+    let decoded = decode_console_bytes(&cp866);
+    assert!(!decoded.contains('\u{FFFD}'), "mojibake: {decoded}");
+    assert!(!decoded.is_empty());
+}
+
 #[test]
 fn shell_tool_times_out_instead_of_hanging() {
     let root = tempfile::tempdir().unwrap();

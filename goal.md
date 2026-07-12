@@ -530,3 +530,14 @@ paste support for text/images.
   Bench: pass-rate 9/10 -> 10/10 stable, repairs 8 -> 0, unit-mistake errors
   eliminated; the model now emits the advertised names unprompted (read_file
   x71 in the final run). Probe data: scratchpad bench-10/probe_all_tools.json.
+- 2026-07-13 (live-trace fixes: absolute paths, list ergonomics): a real chat
+  trace showed the model sending `F:ust-harness\README.md` - the absolute
+  form of an in-workspace path (the system prompt itself names the root) -
+  and getting a false "outside workspace" rejection. Absolute paths that
+  canonicalize inside the workspace are now normalized to relative and
+  accepted (case-insensitive on Windows, component-boundary safe); only
+  truly external paths are rejected, with an honest message that teaches
+  the relative form. `list_files` gains `depth` (model vocabulary seen
+  live) and `show_hidden`; dot entries (.git/.claude) are hidden by
+  default. Verified live: the failing trace scenario now passes on the
+  first call with zero failed rounds.

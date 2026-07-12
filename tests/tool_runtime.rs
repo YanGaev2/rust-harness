@@ -153,6 +153,59 @@ fn model_prior_tool_names_resolve_without_repair() {
 }
 
 #[test]
+fn bare_timeout_argument_means_seconds_not_milliseconds() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Bench run3: the model sent {"timeout": 10} meaning ten SECONDS
+    // (the subprocess convention) and we read ten milliseconds — four
+    // failed rounds in a row. `timeout_ms` stays milliseconds.
+    let sleep = if cfg!(windows) {
+        "Start-Sleep -Milliseconds 300; Write-Output done"
+    } else {
+        "sleep 0.3; echo done"
+    };
+    let result = runtime
+        .execute(ToolCall::new(
+            "t-sec",
+            "run_shell_command",
+            json!({"command": sleep, "timeout": 5}),
+        ))
+        .unwrap();
+    assert!(
+        result.ok,
+        "5 must be seconds, not ms: {:?}",
+        result.metadata
+    );
+    assert!(result.content.contains("done"));
+}
+
+#[test]
+fn edit_file_accepts_text_to_replace_argument() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("app.py"), "DEBUG = True\n").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Seen live in bench run3 — the model's own vocabulary for edit_file.
+    let result = runtime
+        .execute(ToolCall::new(
+            "t-ttr",
+            "edit_file",
+            json!({
+                "path": "app.py",
+                "text_to_replace": "DEBUG = True",
+                "new_text": "DEBUG = False"
+            }),
+        ))
+        .unwrap();
+    assert!(result.ok, "{:?}", result.metadata);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("app.py")).unwrap(),
+        "DEBUG = False\n"
+    );
+}
+
+#[test]
 fn accepted_argument_aliases_are_not_flagged_as_repaired() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("data.txt"), "needle here").unwrap();

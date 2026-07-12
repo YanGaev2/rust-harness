@@ -293,7 +293,15 @@ impl ToolRuntime {
         )?;
         let old_text = string_arg(
             &call.arguments,
-            &["old_text", "old", "find", "search", "old_string", "old_str"],
+            &[
+                "old_text",
+                "old",
+                "find",
+                "search",
+                "old_string",
+                "old_str",
+                "text_to_replace",
+            ],
         )?;
         let new_text = string_arg(
             &call.arguments,
@@ -514,8 +522,17 @@ impl ToolRuntime {
         let max_output_bytes =
             optional_usize_arg(&call.arguments, &["max_output_bytes", "max_bytes", "limit"])
                 .unwrap_or(DEFAULT_MAX_OUTPUT_BYTES);
-        let shell_timeout = optional_u64_arg(&call.arguments, &["timeout_ms", "timeout"])
+        // `timeout` without a unit means SECONDS to models (the subprocess
+        // convention); only the explicit `timeout_ms` is milliseconds.
+        let shell_timeout = optional_u64_arg(&call.arguments, &["timeout_ms"])
             .map(|millis| Duration::from_millis(millis.max(1)))
+            .or_else(|| {
+                optional_u64_arg(
+                    &call.arguments,
+                    &["timeout", "timeout_seconds", "timeout_sec"],
+                )
+                .map(|seconds| Duration::from_secs(seconds.max(1)))
+            })
             .unwrap_or(self.shell_timeout);
         let is_powershell = crate::platform::ShellProfile::native()
             .program()

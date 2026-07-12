@@ -156,6 +156,26 @@ fn emit_with_no_panel_keeps_origin_on_screen() {
 }
 
 #[test]
+fn takeover_scrolls_shell_content_away_and_starts_at_the_top() {
+    // The shell left its banner on screen; the cursor sits on row 3.
+    let (mut screen, buf) = screen(40, 6, 3);
+    screen.takeover().unwrap();
+    let out = buf.contents();
+    // Newlines from the bottom row push the shell text into native
+    // scrollback (still reachable by scrolling up, unlike CLEAR_ALL).
+    assert!(out.contains("\x1b[6;1H"), "must scroll from the bottom row");
+    assert!(out.contains(&"\r\n".repeat(6)), "one newline per row");
+    // The app now owns the window: content starts at the very top.
+    let before = buf.contents().len();
+    screen.emit(&lines(&["hello"])).unwrap();
+    let emitted = buf.contents()[before..].to_string();
+    assert!(
+        emitted.contains("\x1b[1;1H"),
+        "content not at top: {emitted:?}"
+    );
+}
+
+#[test]
 fn clear_wipes_screen_and_scrollback_and_resets_origin() {
     let (mut screen, buf) = screen(40, 10, 5);
     screen.render_panel(lines(&["input", "status"])).unwrap();

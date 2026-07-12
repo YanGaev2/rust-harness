@@ -167,6 +167,25 @@ impl Screen {
         self.terminal.write_all(frame.as_bytes())
     }
 
+    /// Claim the whole window at startup: scroll whatever the shell left
+    /// on screen into native scrollback (still reachable by scrolling up,
+    /// unlike `clear`) and start with a blank viewport — content will
+    /// begin at the top row, the panel pins to the bottom.
+    pub fn takeover(&mut self) -> io::Result<()> {
+        let height = self.height.max(1);
+        self.panel.clear();
+        self.cursor = 0;
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        frame.push_str(&esc::move_to(height - 1, 0));
+        for _ in 0..height {
+            frame.push_str("\r\n");
+        }
+        frame.push_str(&esc::move_to(0, 0));
+        frame.push_str(esc::SYNC_END);
+        self.terminal.write_all(frame.as_bytes())
+    }
+
     /// Wipe the visible screen and the terminal's scrollback and forget
     /// the painted panel — the `/new`-style full reset. The next
     /// emission starts from the top row and the next panel paint pins

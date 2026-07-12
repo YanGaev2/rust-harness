@@ -71,8 +71,19 @@ impl SessionStore {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let created = format_utc_timestamp(now.as_secs());
-        let id = session_id(workspace, now.as_millis(), std::process::id());
-        let path = sessions.join(format!("{created}_{id}.jsonl"));
+        // Two sessions created within the same millisecond (same process,
+        // same workspace — e.g. `/new` right after startup on a fast fs)
+        // would hash to the same id and silently share a file; bump the
+        // seed until the path is fresh.
+        let mut millis = now.as_millis();
+        let (id, path) = loop {
+            let id = session_id(workspace, millis, std::process::id());
+            let path = sessions.join(format!("{created}_{id}.jsonl"));
+            if !path.exists() {
+                break (id, path);
+            }
+            millis += 1;
+        };
 
         let meta = SessionRecord::Meta {
             session_id: id.clone(),

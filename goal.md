@@ -489,3 +489,17 @@ paste support for text/images.
   blank viewport — chat and setup claim the whole window on launch (content
   from the top row, panel pinned to the bottom) instead of attaching below
   the shell prompt. The shell banner stays reachable by scrolling up.
+- 2026-07-12 (reference screen model, codex round 2): after live feedback,
+  the bottom-pinned panel and newline takeover were replaced with the model
+  the references actually use (verified against pi, opencode and qwen-code;
+  full analysis in `agents/codex-screen-flow-report.md`): startup claims the
+  viewport with CSI 2J + H (no 3J - user scrollback survives), the whole UI
+  is one contiguous top-down flow (content, then the input frame directly
+  below - never `height - panel_len`), and `Screen::present(committed,
+  live)` commits finalized rows and paints the next live frame in one
+  synchronized write with the reserve computed from the new frame.
+  `ChatApp::peek_scrollback`/`acknowledge_emitted` move the commit boundary
+  only after the terminal write succeeds; resize keeps the content-following
+  origin. Deferred from the report: progressive commit of streaming
+  responses taller than the live budget (Qwen Static/pending model),
+  debounced full-replay resize.

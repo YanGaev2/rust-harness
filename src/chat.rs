@@ -669,10 +669,17 @@ impl ChatApp {
     /// transcript tail, the busy spinner, the command palette, the editor,
     /// the completion menu, and the status row.
     pub fn panel_lines(&self, width: usize, max_live_rows: usize) -> Vec<Line> {
+        self.panel_lines_after(width, max_live_rows, self.emitted)
+    }
+
+    /// `panel_lines` with an explicit commit boundary — the draw loop
+    /// passes the boundary from `peek_scrollback` so the rows being
+    /// committed in the same frame are not also rendered as live.
+    pub fn panel_lines_after(&self, width: usize, max_live_rows: usize, from: usize) -> Vec<Line> {
         let mut lines = Vec::new();
 
         let mut live: Vec<Line> = Vec::new();
-        for entry in &self.transcript[self.emitted..] {
+        for entry in &self.transcript[from.min(self.transcript.len())..] {
             if !live.is_empty() {
                 live.push(Line::default());
             }
@@ -728,6 +735,17 @@ impl ChatApp {
     /// the last entry (it may still be streaming) and the first Running tool
     /// card are final; once the run ends everything flushes.
     pub fn take_scrollback(&mut self, width: usize) -> Vec<Line> {
+        let (lines, limit) = self.peek_scrollback(width);
+        self.acknowledge_emitted(limit);
+        lines
+    }
+
+    /// Side-effect-free flush plan: the finalized rows ready for native
+    /// scrollback and the transcript index they cover. `emitted` moves
+    /// only in `acknowledge_emitted` — AFTER the terminal write succeeds
+    /// — so a failed write offers the same rows again instead of losing
+    /// them.
+    pub fn peek_scrollback(&self, width: usize) -> (Vec<Line>, usize) {
         let mut limit = self.transcript.len();
         if self.busy {
             limit = limit.saturating_sub(1);
@@ -741,15 +759,20 @@ impl ChatApp {
             }
         }
         if limit <= self.emitted {
-            return Vec::new();
+            return (Vec::new(), self.emitted);
         }
         let mut lines = Vec::new();
         for entry in &self.transcript[self.emitted..limit] {
             lines.extend(entry_lines(entry, width));
             lines.push(Line::default());
         }
-        self.emitted = limit;
-        lines
+        (lines, limit)
+    }
+
+    /// Advance the commit boundary after the rows from `peek_scrollback`
+    /// actually reached the terminal.
+    pub fn acknowledge_emitted(&mut self, through: usize) {
+        self.emitted = self.emitted.max(through.min(self.transcript.len()));
     }
 
     /// Bottom status row: provider/workspace on the left, key hints on the

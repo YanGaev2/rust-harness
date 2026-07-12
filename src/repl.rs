@@ -569,25 +569,21 @@ fn tui_io_error(err: tui_terminal::TerminalError) -> ReplError {
     ReplError::Io(io::Error::other(err.to_string()))
 }
 
-/// Flush finalized transcript blocks into native scrollback, then
-/// repaint the pinned panel, capped to the screen height.
+/// One frame: commit finalized transcript rows into native scrollback
+/// and paint the next live frame directly below them, atomically. The
+/// commit boundary is acknowledged only after the write succeeds.
 fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
     let width = screen.width() as usize;
     let height = screen.height() as usize;
-    let scrollback = app.take_scrollback(width);
-    if !scrollback.is_empty() {
-        screen.emit(&scrollback).map_err(ReplError::Io)?;
-    }
+    let (scrollback, commit_through) = app.peek_scrollback(width);
     // Reserve rows for the framed editor (≤6 + 2 border rows) + menu/
     // palette + spinner + status; the live block area gets the rest and
     // shows its tail when over budget.
     let max_live_rows = height.saturating_sub(14).max(3);
-    let mut panel = app.panel_lines(width, max_live_rows);
-    let max_panel = height.saturating_sub(1).max(1);
-    if panel.len() > max_panel {
-        panel = panel.split_off(panel.len() - max_panel);
-    }
-    screen.render_panel(panel).map_err(ReplError::Io)
+    let live = app.panel_lines_after(width, max_live_rows, commit_through);
+    screen.present(&scrollback, live).map_err(ReplError::Io)?;
+    app.acknowledge_emitted(commit_through);
+    Ok(())
 }
 
 /// The terminal delivers no resize signal we listen for — the idle loop

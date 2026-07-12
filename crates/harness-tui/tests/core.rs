@@ -121,17 +121,85 @@ fn growing_panel_is_fully_redrawn() {
 }
 
 #[test]
-fn resize_pins_panel_to_bottom_and_redraws() {
+fn resize_keeps_the_flow_origin_instead_of_bottom_pinning() {
     let (mut screen, buf) = screen(40, 10, 0);
     screen.render_panel(lines(&["input", "status"])).unwrap();
+    screen.emit(&lines(&["one", "two"])).unwrap();
+    // Panel now follows content at row 2. Growing the window must NOT
+    // teleport it to the bottom (codex finding: resize reinstated the
+    // bottom-pinned layout).
     let before = buf.contents().len();
-    screen.resize(40, 5).unwrap();
+    screen.resize(40, 20).unwrap();
     let out = buf.contents()[before..].to_string();
-    // Height 5, panel 2 → origin row 3 (escape row 4).
-    assert!(out.contains("\x1b[4;1H"));
-    assert!(out.contains("input"));
-    assert!(out.contains("status"));
+    assert!(
+        out.contains("\x1b[3;1H"),
+        "panel must stay at row 2: {out:?}"
+    );
+    assert!(
+        !out.contains("\x1b[19;1H"),
+        "panel must not be bottom-pinned: {out:?}"
+    );
     assert_eq!(screen.width(), 40);
+
+    // Shrinking below the flow clamps the origin so the panel still fits.
+    let before = buf.contents().len();
+    screen.resize(40, 3).unwrap();
+    let out = buf.contents()[before..].to_string();
+    assert!(out.contains("\x1b[2;1H"), "clamped to fit: {out:?}");
+}
+
+#[test]
+fn present_commits_and_paints_live_in_one_synchronized_frame() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen
+        .render_panel(lines(&["old spinner", "old editor", "old status"]))
+        .unwrap();
+    let before = buf.contents().len();
+    screen
+        .present(
+            &lines(&["> user message"]),
+            lines(&["spinner", "editor", "status"]),
+        )
+        .unwrap();
+    let out = buf.contents()[before..].to_string();
+    // One synchronized frame — commit and repaint are atomic.
+    assert_eq!(out.matches("\x1b[?2026h").count(), 1, "{out:?}");
+    assert_eq!(out.matches("\x1b[?2026l").count(), 1);
+    // The committed row lands at the old flow origin (row 0)…
+    assert!(out.contains("> user message"));
+    assert!(out.contains("\x1b[1;1H"));
+    // …the NEW live frame starts directly below it (row 1)…
+    assert!(out.contains("\x1b[2;1H"));
+    assert!(out.contains("spinner"));
+    // …and the stale panel snapshot is never repainted.
+    assert!(
+        !out.contains("old spinner"),
+        "stale frame repainted: {out:?}"
+    );
+}
+
+#[test]
+fn present_reserves_rows_for_the_new_live_frame_not_the_old() {
+    // Height 6; flow at row 4 after some content.
+    let (mut screen, buf) = screen(40, 6, 0);
+    screen.emit(&lines(&["a", "b", "c", "d"])).unwrap();
+    // Old live frame is tall (4 rows), the next one is short (1 row).
+    screen
+        .render_panel(lines(&["s1", "s2", "s3", "s4"]))
+        .unwrap();
+    let before = buf.contents().len();
+    // Committing one row with a 1-row next frame must scroll by the NEW
+    // frame's need only (codex finding: reserve came from the old panel).
+    screen
+        .present(&lines(&["done"]), lines(&["editor"]))
+        .unwrap();
+    let out = buf.contents()[before..].to_string();
+    // Flow sat at row 2; the commit ends at row 3 and the 1-row live
+    // frame fits there — no scroll burst from the bottom row (which
+    // would show up as a move to the last row followed by newlines).
+    assert!(!out.contains("\x1b[6;1H"), "over-scrolled: {out:?}");
+    assert!(out.contains("done"));
+    assert!(out.contains("editor"));
 }
 
 #[test]

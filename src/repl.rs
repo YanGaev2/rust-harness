@@ -575,11 +575,14 @@ fn tui_io_error(err: tui_terminal::TerminalError) -> ReplError {
 fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
     let width = screen.width() as usize;
     let height = screen.height() as usize;
-    let (scrollback, commit_through) = app.peek_scrollback(width);
     // Reserve rows for the framed editor (≤6 + 2 border rows) + menu/
     // palette + spinner + status; the live block area gets the rest and
     // shows its tail when over budget.
     let max_live_rows = height.saturating_sub(14).max(3);
+    // Long streams freeze their stable prefix into scrollback instead of
+    // head-clipping it out of view.
+    app.freeze_streaming_overflow(width, max_live_rows);
+    let (scrollback, commit_through) = app.peek_scrollback(width);
     let live = app.panel_lines_after(width, max_live_rows, commit_through);
     screen.present(&scrollback, live).map_err(ReplError::Io)?;
     app.acknowledge_emitted(commit_through);

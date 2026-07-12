@@ -159,6 +159,10 @@ struct ToolEntry {
 enum ChatEntry {
     User(String),
     Assistant(String),
+    /// A frozen-off continuation of a streaming assistant answer — same
+    /// hanging indent, no second `● ` marker (Qwen-style progressive
+    /// commit of long streams).
+    AssistantContinuation(String),
     Thinking(String),
     Tool(ToolEntry),
     System(String),
@@ -611,13 +615,15 @@ impl ChatApp {
             }
             AgentEvent::FinalContentDelta(delta) => {
                 self.streaming_thinking = false;
-                if self.streaming_assistant
-                    && let Some(ChatEntry::Assistant(text)) = self.transcript.last_mut()
-                {
-                    text.push_str(delta);
-                } else {
-                    self.transcript.push(ChatEntry::Assistant(delta.clone()));
-                    self.streaming_assistant = true;
+                match (self.streaming_assistant, self.transcript.last_mut()) {
+                    (true, Some(ChatEntry::Assistant(text)))
+                    | (true, Some(ChatEntry::AssistantContinuation(text))) => {
+                        text.push_str(delta);
+                    }
+                    _ => {
+                        self.transcript.push(ChatEntry::Assistant(delta.clone()));
+                        self.streaming_assistant = true;
+                    }
                 }
             }
         }
@@ -775,6 +781,55 @@ impl ChatApp {
         self.emitted = self.emitted.max(through.min(self.transcript.len()));
     }
 
+    /// Qwen-style progressive commit for long streams: when the live
+    /// streaming entry renders taller than the live budget, freeze its
+    /// stable prefix (up to the last blank line outside any code fence)
+    /// into a final entry so it can flush to native scrollback, keeping
+    /// only the fresh tail live. Without a safe boundary the entry is
+    /// left alone and the head-clip cap remains the backstop.
+    pub fn freeze_streaming_overflow(&mut self, width: usize, max_live_rows: usize) {
+        if !self.busy {
+            return;
+        }
+        let Some(last) = self.transcript.last() else {
+            return;
+        };
+        let streaming_text = match last {
+            ChatEntry::Assistant(text) | ChatEntry::AssistantContinuation(text)
+                if self.streaming_assistant =>
+            {
+                text
+            }
+            ChatEntry::Thinking(text) if self.streaming_thinking => text,
+            _ => return,
+        };
+        if entry_lines(last, width).len() <= max_live_rows {
+            return;
+        }
+        let Some(split) = safe_split_point(streaming_text) else {
+            return;
+        };
+        let entry = self.transcript.pop().expect("checked above");
+        match entry {
+            ChatEntry::Assistant(text) => {
+                let (head, tail) = split_at_boundary(&text, split);
+                self.transcript.push(ChatEntry::Assistant(head));
+                self.transcript.push(ChatEntry::AssistantContinuation(tail));
+            }
+            ChatEntry::AssistantContinuation(text) => {
+                let (head, tail) = split_at_boundary(&text, split);
+                self.transcript.push(ChatEntry::AssistantContinuation(head));
+                self.transcript.push(ChatEntry::AssistantContinuation(tail));
+            }
+            ChatEntry::Thinking(text) => {
+                let (head, tail) = split_at_boundary(&text, split);
+                self.transcript.push(ChatEntry::Thinking(head));
+                self.transcript.push(ChatEntry::Thinking(tail));
+            }
+            _ => unreachable!("only streaming text entries are split"),
+        }
+    }
+
     /// Bottom status row: provider/workspace on the left, key hints on the
     /// right; the hints are dropped whole on narrow terminals.
     fn status_row(&self, width: usize) -> Line {
@@ -794,6 +849,38 @@ impl ChatApp {
         };
         status_line(width, left, right)
     }
+}
+
+/// Last byte offset right after a blank line that sits outside any
+/// fenced code block, such that both halves are non-empty — the safe
+/// place to freeze a streaming markdown prefix.
+fn safe_split_point(text: &str) -> Option<usize> {
+    let mut best = None;
+    let mut fences = 0usize;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        if segment.trim_start().starts_with("```") {
+            fences += 1;
+        }
+        offset += segment.len();
+        if fences.is_multiple_of(2)
+            && segment.trim().is_empty()
+            && !text[..offset].trim().is_empty()
+            && !text[offset..].trim().is_empty()
+        {
+            best = Some(offset);
+        }
+    }
+    best
+}
+
+/// Split raw streaming text at a `safe_split_point`, trimming the blank
+/// seam — the flush blank line between entries restores the paragraph
+/// gap visually.
+fn split_at_boundary(text: &str, split: usize) -> (String, String) {
+    let head = text[..split].trim_end_matches('\n').to_string();
+    let tail = text[split..].trim_start_matches('\n').to_string();
+    (head, tail)
 }
 
 /// Wrap rows in a rounded full-width frame: `╭─╮` / `│ … │` / `╰─╯`.
@@ -928,6 +1015,14 @@ fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
                 }
             }
             lines
+        }
+        ChatEntry::AssistantContinuation(text) => {
+            // No marker — this is the tail of an answer whose head already
+            // flushed; every line keeps the assistant hanging indent.
+            markdown_lines(text)
+                .into_iter()
+                .map(|line| indent_line(line, "  "))
+                .collect()
         }
         ChatEntry::Thinking(text) => {
             // Reasoning renders as plain dim italic text with no badge — the
@@ -1403,6 +1498,7 @@ fn entry_plain_lines(entry: &ChatEntry) -> Vec<String> {
     match entry {
         ChatEntry::User(text) => vec![format!("you: {text}")],
         ChatEntry::Assistant(text) => vec![text.clone()],
+        ChatEntry::AssistantContinuation(text) => vec![text.clone()],
         ChatEntry::Thinking(text) => vec![format!("thinking: {text}")],
         ChatEntry::System(text) => vec![text.clone()],
         ChatEntry::Tool(tool) => {

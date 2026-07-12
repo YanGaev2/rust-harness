@@ -407,6 +407,9 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
 
     tui_terminal::install_panic_restore();
     let mut screen = Screen::stdout().map_err(tui_io_error)?;
+    // Own the whole window: the shell's banner scrolls away into native
+    // scrollback, content starts at the top, the panel pins to the bottom.
+    screen.takeover().map_err(ReplError::Io)?;
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
     // Key hints live in the persistent status line, so no welcome banner is

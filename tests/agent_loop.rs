@@ -23,7 +23,7 @@ fn agent_runner_executes_tool_calls_and_continues_until_final_answer() {
             serde_json::from_str(first.split("\r\n\r\n").nth(1).unwrap()).unwrap();
         assert_eq!(first_body["messages"][0]["role"], "system");
         assert_eq!(first_body["messages"][1]["role"], "user");
-        assert_eq!(first_body["tools"][1]["function"]["name"], "file_write");
+        assert_eq!(first_body["tools"][1]["function"]["name"], "write_file");
         respond(
             &mut first_stream,
             r#"{
@@ -60,19 +60,13 @@ fn agent_runner_executes_tool_calls_and_continues_until_final_answer() {
         let tool_result: Value =
             serde_json::from_str(second_body["messages"][3]["content"].as_str().unwrap()).unwrap();
         assert_eq!(tool_result["ok"], true);
-        assert_eq!(tool_result["repaired"], true);
-        // The repaired call must hand the model a memo on the canonical form.
-        let memo = tool_result["hint"]
-            .as_str()
-            .expect("repaired tool result must include a hint memo for the model");
-        // The memo must reference the API-callable wire name, not a dotted name.
+        // `write_file` with `file`/`text` aliases is exactly the advertised
+        // wire name plus accepted aliases — a clean call, not a repair,
+        // so no corrective memo is attached.
+        assert_eq!(tool_result["repaired"], false);
         assert!(
-            memo.contains("file_write"),
-            "memo should name the callable wire tool: {memo}"
-        );
-        assert!(
-            !memo.contains("file.write"),
-            "memo must not advise the dotted name the API rejects: {memo}"
+            tool_result["hint"].is_null(),
+            "clean call must not carry a memo: {tool_result}"
         );
 
         respond(

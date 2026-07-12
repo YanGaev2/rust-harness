@@ -10,13 +10,15 @@ fn runtime_repairs_common_file_write_alias_and_argument_names() {
     let result = runtime
         .execute(ToolCall::new(
             "call-1",
-            "write_file",
+            "file_write",
             json!({"file": "notes\\todo.txt", "text": "ship runtime"}),
         ))
         .unwrap();
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.write");
+    // `file_write` is a legacy alias now (the advertised name is
+    // `write_file`), so the name itself is the repair.
     assert!(result.repaired);
     assert_eq!(
         std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
@@ -53,14 +55,14 @@ fn runtime_does_not_flag_api_wire_tool_name_as_repaired() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new(root.path());
 
-    // `file_write` is exactly the API-safe name the harness advertises to the
-    // model for the canonical `file.write` tool (dots are illegal in OpenAI
-    // tool names). Calling it is correct, not a mistake, so it must NOT be
-    // flagged as repaired and must not generate a corrective memo.
+    // `write_file` is exactly the prior-aligned wire name the harness
+    // advertises for the canonical `file.write` tool. Calling it is
+    // correct, not a mistake, so it must NOT be flagged as repaired and
+    // must not generate a corrective memo.
     let result = runtime
         .execute(ToolCall::new(
             "wire",
-            "file_write",
+            "write_file",
             json!({"path": "wire.txt", "content": "ok"}),
         ))
         .unwrap();
@@ -74,6 +76,83 @@ fn runtime_does_not_flag_api_wire_tool_name_as_repaired() {
 }
 
 #[test]
+fn tools_are_advertised_under_model_prior_names() {
+    // Probe of DeepSeek priors (probe_all_tools, 2026-07-12): the model
+    // thinks in verb_noun names — advertise the names it already knows
+    // instead of making it translate ours.
+    let names: Vec<String> = ToolRuntime::tool_specs()
+        .iter()
+        .map(|spec| spec.name().to_string())
+        .collect();
+    for expected in [
+        "read_file",
+        "write_file",
+        "append_file",
+        "edit_file",
+        "list_files",
+        "grep_search",
+        "tail_file",
+        "checksum_file",
+        "stat_file",
+        "delete_file",
+        "move_file",
+        "get_image",
+        "run_shell_command",
+    ] {
+        assert!(
+            names.contains(&expected.to_string()),
+            "missing {expected}: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn model_prior_tool_names_resolve_without_repair() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "needle").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // The advertised names round-trip clean.
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "grep_search",
+            json!({"query": "needle", "path": "."}),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.search");
+    assert!(!result.repaired, "advertised name must not be a repair");
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "c2",
+            "run_shell_command",
+            json!({"command": "echo ok"}),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "shell.exec");
+    assert!(!result.repaired);
+
+    // Extra vocabulary from the probe resolves as aliases (repaired,
+    // with a memo teaching the advertised name).
+    for (name, args, canonical) in [
+        (
+            "edit_and_apply",
+            json!({"file_path": "a.txt", "old_string": "needle", "new_string": "thread"}),
+            "file.replace",
+        ),
+        ("get_file_info", json!({"path": "a.txt"}), "file.stat"),
+    ] {
+        let result = runtime.execute(ToolCall::new("c3", name, args)).unwrap();
+        assert_eq!(result.tool_name, canonical, "{name}");
+        assert!(
+            result.repaired,
+            "{name} is an alias, not the advertised name"
+        );
+    }
+}
+
+#[test]
 fn accepted_argument_aliases_are_not_flagged_as_repaired() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("data.txt"), "needle here").unwrap();
@@ -84,7 +163,7 @@ fn accepted_argument_aliases_are_not_flagged_as_repaired() {
     let result = runtime
         .execute(ToolCall::new(
             "call-search-pattern",
-            "file_search",
+            "grep_search",
             json!({"path": ".", "pattern": "needle"}),
         ))
         .unwrap();
@@ -96,7 +175,7 @@ fn accepted_argument_aliases_are_not_flagged_as_repaired() {
     let result = runtime
         .execute(ToolCall::new(
             "call-write-alias",
-            "file_write",
+            "write_file",
             json!({"file": "out.txt", "text": "ok"}),
         ))
         .unwrap();
@@ -122,7 +201,8 @@ fn runtime_repairs_codex_style_file_write_arguments() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.write");
-    assert!(result.repaired);
+    // Advertised name + accepted codex-style aliases — a clean call.
+    assert!(!result.repaired);
     assert_eq!(
         std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
         "ship codex-style write"
@@ -139,7 +219,7 @@ fn runtime_can_append_file_with_alias_and_argument_repair() {
     let result = runtime
         .execute(ToolCall::new(
             "call-append",
-            "append_file",
+            "file_append",
             json!({"file": "notes/todo.txt", "text": "second\n"}),
         ))
         .unwrap();
@@ -254,7 +334,8 @@ fn runtime_repairs_codex_style_file_read_arguments() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.read");
-    assert!(result.repaired);
+    // Advertised name + accepted argument alias — a clean call.
+    assert!(!result.repaired);
     assert_eq!(result.content, "read codex path");
     assert_eq!(result.metadata["path"], "notes/todo.txt");
 }
@@ -295,7 +376,7 @@ fn runtime_file_read_accepts_max_bytes_and_reports_truncation() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.read");
-    assert!(result.repaired);
+    assert!(!result.repaired);
     assert_eq!(result.content, "abcd");
     assert_eq!(result.metadata["path"], "logs/big.txt");
     assert_eq!(result.metadata["bytes_read"], 4);
@@ -317,7 +398,7 @@ fn runtime_can_tail_file_with_alias_and_argument_repair() {
     let result = runtime
         .execute(ToolCall::new(
             "call-tail",
-            "tail_file",
+            "file_tail",
             json!({"file": "logs/app.log", "lines": 2, "max_bytes": 1024}),
         ))
         .unwrap();
@@ -353,7 +434,7 @@ fn runtime_repairs_codex_style_file_path_for_tail_file() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.tail");
-    assert!(result.repaired);
+    assert!(!result.repaired);
     assert_eq!(result.content, "two\nthree\n");
     assert_eq!(result.metadata["path"], "logs/app.log");
     assert_eq!(result.metadata["max_lines"], 2);
@@ -380,7 +461,7 @@ fn runtime_coerces_string_numeric_limits_for_file_tail() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.tail");
-    assert!(result.repaired);
+    assert!(!result.repaired);
     assert_eq!(result.content, "line3\nline4\n");
     assert_eq!(result.metadata["max_bytes"], 1024);
     assert_eq!(result.metadata["max_lines"], 2);
@@ -445,7 +526,7 @@ fn runtime_can_stat_file_with_alias_and_argument_repair() {
     let result = runtime
         .execute(ToolCall::new(
             "call-stat",
-            "stat_file",
+            "file_stat",
             json!({"file": "artifacts/data.bin"}),
         ))
         .unwrap();
@@ -477,7 +558,7 @@ fn runtime_repairs_codex_style_file_path_for_stat_file() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.stat");
-    assert!(result.repaired);
+    assert!(!result.repaired);
     assert_eq!(result.metadata["path"], "artifacts/data.bin");
     assert_eq!(result.metadata["is_file"], true);
     assert_eq!(result.metadata["len"], 8);
@@ -543,7 +624,7 @@ fn runtime_can_list_files_with_alias_and_result_limit() {
     let result = runtime
         .execute(ToolCall::new(
             "call-list",
-            "list_files",
+            "file_list",
             json!({"dir": "src", "max_results": 1}),
         ))
         .unwrap();
@@ -675,7 +756,7 @@ fn runtime_can_replace_text_with_alias_and_argument_repair() {
     let result = runtime
         .execute(ToolCall::new(
             "call-replace",
-            "edit_file",
+            "replace_file",
             json!({
                 "file": "src/notes.txt",
                 "find": "beta",
@@ -941,7 +1022,7 @@ fn runtime_repairs_codex_style_file_move_arguments() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.move");
-    assert!(result.repaired);
+    assert!(!result.repaired);
     assert_eq!(result.metadata["source_path"], "src/draft.txt");
     assert_eq!(result.metadata["target_path"], "notes/final.txt");
     assert!(!root.path().join("src").join("draft.txt").exists());

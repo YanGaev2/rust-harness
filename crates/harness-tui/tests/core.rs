@@ -154,6 +154,25 @@ fn emit_with_no_panel_keeps_origin_on_screen() {
 }
 
 #[test]
+fn clear_wipes_screen_and_scrollback_and_resets_origin() {
+    let (mut screen, buf) = screen(40, 10, 5);
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    screen.emit(&lines(&["old chat"])).unwrap();
+    let before = buf.contents().len();
+    screen.clear().unwrap();
+    let out = buf.contents()[before..].to_string();
+    assert!(out.contains("\x1b[2J"), "missing screen wipe: {out:?}");
+    assert!(out.contains("\x1b[3J"), "missing scrollback wipe: {out:?}");
+    // The panel is forgotten: the next paint is a full redraw at row 0.
+    let after_clear = buf.contents().len();
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    let repaint = buf.contents()[after_clear..].to_string();
+    assert!(repaint.contains("\x1b[1;1H"), "panel not at top: {repaint:?}");
+    assert!(repaint.contains("input"));
+    assert!(repaint.contains("status"));
+}
+
+#[test]
 fn oversized_panel_is_tail_clipped_without_panicking() {
     let (mut screen, buf) = screen(40, 3, 0);
     let texts: Vec<String> = (0..6).map(|i| format!("row{i}")).collect();

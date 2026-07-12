@@ -131,57 +131,63 @@ impl ToolRuntime {
         self
     }
 
+    /// Tools as advertised to the model: wire names follow the model's own
+    /// priors (see [`wire_tool_name`]); the runtime keeps dotted canonical
+    /// names internally.
     pub fn tool_specs() -> Vec<ToolSpec> {
+        let spec = |canonical: &str, description: &str| {
+            ToolSpec::new(wire_tool_name(canonical), description)
+        };
         vec![
-            ToolSpec::new(
+            spec(
                 "file.read",
                 "Read bounded UTF-8 text from a workspace-relative path.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.write",
                 "Write UTF-8 text to a workspace-relative path without requiring a prior read.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.append",
                 "Append UTF-8 text to a workspace-relative path without requiring a prior read.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.hash",
                 "Compute a streaming BLAKE3 hash for a workspace file without reading it into context.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.stat",
                 "Read file or directory metadata without loading file content.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.tail",
                 "Read a bounded UTF-8 suffix from a workspace file for logs and large outputs.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.replace",
                 "Replace literal UTF-8 text in a workspace file without shelling out.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.list",
                 "List workspace files recursively with bounded result count.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.search",
-                "Search UTF-8 workspace files for a literal string with bounded result count.",
+                "Search UTF-8 workspace files for a text pattern with bounded result count.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.delete",
                 "Delete a workspace-relative file or directory without shelling out.",
             ),
-            ToolSpec::new(
+            spec(
                 "file.move",
                 "Move or rename a workspace-relative file or directory without shelling out.",
             ),
-            ToolSpec::new(
+            spec(
                 "attachment.read",
                 "Read bounded clipboard/Codex attachment metadata and text content.",
             ),
-            ToolSpec::new(
+            spec(
                 "shell.exec",
                 "Run a native shell command in the workspace with timeout and bounded stdout/stderr.",
             ),
@@ -242,7 +248,17 @@ impl ToolRuntime {
         tool_name: &str,
         mode: WriteMode,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let content = string_arg(&call.arguments, &["content", "text", "body", "contents"])?;
         let result = FileTool::new(&self.workspace).write_text(&path, &content, mode)?;
         Ok(ToolCallResult {
@@ -264,10 +280,20 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let old_text = string_arg(
             &call.arguments,
-            &["old_text", "old", "find", "search", "old_string"],
+            &["old_text", "old", "find", "search", "old_string", "old_str"],
         )?;
         let new_text = string_arg(
             &call.arguments,
@@ -278,6 +304,7 @@ impl ToolRuntime {
                 "replace",
                 "with",
                 "new_string",
+                "new_str",
             ],
         )?;
         let max_replacements =
@@ -341,7 +368,17 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let max_bytes = optional_usize_arg(&call.arguments, &["max_bytes", "limit"])
             .unwrap_or(DEFAULT_FILE_READ_MAX_BYTES);
         let result = FileTool::new(&self.workspace).read_text_bounded(&path, max_bytes)?;
@@ -366,7 +403,17 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let result = FileTool::new(&self.workspace).hash_file(&path)?;
         Ok(ToolCallResult {
             id: call.id,
@@ -388,7 +435,17 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let result = FileTool::new(&self.workspace).stat_path(&path)?;
         Ok(ToolCallResult {
             id: call.id,
@@ -416,7 +473,17 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let max_bytes = optional_usize_arg(&call.arguments, &["max_bytes", "limit"])
             .unwrap_or(DEFAULT_FILE_TAIL_MAX_BYTES);
         let max_lines = optional_usize_arg(&call.arguments, &["max_lines", "lines"]);
@@ -531,7 +598,16 @@ impl ToolRuntime {
     ) -> Result<ToolCallResult, RuntimeError> {
         let path = optional_string_arg(&call.arguments, &["path", "dir", "directory"])
             .unwrap_or_else(|| ".".to_string());
-        let query = string_arg(&call.arguments, &["query", "pattern", "text"])?;
+        let query = string_arg(
+            &call.arguments,
+            &[
+                "query",
+                "pattern",
+                "text",
+                "search_string",
+                "literal_string",
+            ],
+        )?;
         let max_results =
             optional_usize_arg(&call.arguments, &["max_results", "limit"]).unwrap_or(200);
         let max_file_bytes = optional_u64_arg(&call.arguments, &["max_file_bytes", "max_bytes"])
@@ -572,7 +648,17 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(&call.arguments, &["path", "file", "filename", "file_path"])?;
+        let path = string_arg(
+            &call.arguments,
+            &[
+                "path",
+                "file",
+                "filename",
+                "file_path",
+                "filepath",
+                "target_file",
+            ],
+        )?;
         let result = FileTool::new(&self.workspace).delete_path(&path)?;
         Ok(ToolCallResult {
             id: call.id,
@@ -803,6 +889,30 @@ impl From<ShellError> for RuntimeError {
     }
 }
 
+/// The name a canonical tool is advertised under to the model — its wire
+/// name. These are the names DeepSeek (and models trained on the same
+/// harness culture) produce unprompted, measured by the priors probe
+/// (verb_noun order: `read_file`, not `file_read`): meeting the model's
+/// training instead of making it translate ours.
+pub fn wire_tool_name(canonical: &str) -> &'static str {
+    match canonical {
+        "file.read" => "read_file",
+        "file.write" => "write_file",
+        "file.append" => "append_file",
+        "file.replace" => "edit_file",
+        "file.list" => "list_files",
+        "file.search" => "grep_search",
+        "file.tail" => "tail_file",
+        "file.hash" => "checksum_file",
+        "file.stat" => "stat_file",
+        "file.delete" => "delete_file",
+        "file.move" => "move_file",
+        "attachment.read" => "get_image",
+        "shell.exec" => "run_shell_command",
+        _ => "unknown_tool",
+    }
+}
+
 /// Canonical `file.*`/`shell.exec` name for any accepted alias, for display
 /// surfaces (the resolver itself stays private to the runtime). Returns `None`
 /// for names the runtime would reject.
@@ -826,30 +936,32 @@ impl ToolResolution {
                 "file.append"
             }
             "file.replace" | "file_replace" | "file.edit" | "file_edit" | "replace_file"
-            | "replace_text" | "edit_file" | "search_replace" => "file.replace",
+            | "replace_text" | "edit_file" | "search_replace" | "edit_and_apply"
+            | "replace_in_file" | "str_replace" => "file.replace",
             "file.read" | "file_read" | "read_file" => "file.read",
             "file.hash" | "file_hash" | "hash_file" | "checksum" | "checksum_file" => "file.hash",
             "file.stat" | "file_stat" | "stat_file" | "file.metadata" | "file_metadata"
-            | "metadata" => "file.stat",
+            | "metadata" | "stat" | "get_file_info" => "file.stat",
             "file.tail" | "file_tail" | "tail_file" | "tail" => "file.tail",
             "file.list" | "file_list" | "list_file" | "list_files" | "ls" => "file.list",
-            "file.search" | "file_search" | "search_file" | "search_files" | "grep" => {
-                "file.search"
-            }
+            "file.search" | "file_search" | "search_file" | "search_files" | "grep"
+            | "grep_search" => "file.search",
             "file.delete" | "file_delete" | "delete_file" | "remove_file" | "rm" => "file.delete",
             "file.move" | "file_move" | "move_file" | "rename_file" | "mv" => "file.move",
             "attachment.read" | "attachment_read" | "read_attachment" | "open_attachment"
-            | "image.read" | "image_read" | "inspect_image" | "read_image" => "attachment.read",
-            "shell.exec" | "shell_exec" | "run_command" | "shell" => "shell.exec",
+            | "image.read" | "image_read" | "inspect_image" | "read_image" | "get_image" => {
+                "attachment.read"
+            }
+            "shell.exec" | "shell_exec" | "run_command" | "shell" | "run_shell_command"
+            | "run_shell" => "shell.exec",
             _ => return Err(RuntimeError::UnknownTool(name.to_string())),
         };
 
-        // Tools are advertised to the model under an API-safe wire name where
-        // dots become underscores (`file.write` -> `file_write`), because OpenAI
-        // tool names may not contain dots. So a call to `file_write` is exactly
-        // what was offered and is NOT a repair; only a genuinely different alias
-        // (e.g. `write_file`, `grep`, `ls`) counts as one.
-        let wire = canonical.replace('.', "_");
+        // Tools are advertised to the model under their prior-aligned wire
+        // name (`read_file`, `grep_search`, …). Calling that name is exactly
+        // what was offered and is NOT a repair; only a genuinely different
+        // alias (e.g. `file_read`, `grep`, `ls`) counts as one.
+        let wire = wire_tool_name(canonical);
         let repaired = normalized != canonical && normalized != wire;
 
         Ok(Self {
@@ -1194,13 +1306,15 @@ fn batch_timeout_result(call: &ToolCall) -> ToolBatchResult {
 /// The canonical argument shape for each tool, used to build a repair memo.
 fn canonical_tool_usage(canonical: &str) -> &'static str {
     match canonical {
-        "file.write" | "file.append" => r#"{"path": "<file>", "content": "<text>"}"#,
-        "file.replace" => r#"{"path": "<file>", "old_text": "<text>", "new_text": "<text>"}"#,
+        "file.write" | "file.append" => r#"{"file_path": "<file>", "content": "<text>"}"#,
+        "file.replace" => {
+            r#"{"file_path": "<file>", "old_string": "<text>", "new_string": "<text>"}"#
+        }
         "file.read" | "file.hash" | "file.stat" | "file.tail" | "file.delete"
-        | "attachment.read" => r#"{"path": "<file>"}"#,
+        | "attachment.read" => r#"{"file_path": "<file>"}"#,
         "file.list" => r#"{"path": "<dir>"}"#,
         "file.search" => r#"{"query": "<text>", "path": "<dir>"}"#,
-        "file.move" => r#"{"source": "<file>", "target": "<file>"}"#,
+        "file.move" => r#"{"source": "<file>", "destination": "<file>"}"#,
         "shell.exec" => r#"{"command": "<text>"}"#,
         _ => "",
     }
@@ -1215,7 +1329,7 @@ fn canonical_tool_usage(canonical: &str) -> &'static str {
 /// distinguishes a genuine name alias from an argument-only correction so the
 /// advice matches what actually happened.
 fn repair_hint(requested: &str, canonical: &str) -> String {
-    let wire = canonical.replace('.', "_");
+    let wire = wire_tool_name(canonical).to_string();
     let usage = canonical_tool_usage(canonical);
     let normalized = requested
         .trim()

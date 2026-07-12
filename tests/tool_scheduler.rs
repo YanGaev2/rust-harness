@@ -32,7 +32,8 @@ fn scheduler_preserves_batch_order_and_reports_tool_errors_as_results() {
         vec!["first", "bad", "third"]
     );
     assert!(results[0].ok);
-    assert!(results[0].repaired);
+    // `write_file` is the advertised prior-aligned name — a clean call.
+    assert!(!results[0].repaired);
     assert!(!results[1].ok);
     assert_eq!(results[1].tool_name, "missing_tool");
     assert!(
@@ -61,7 +62,7 @@ fn scheduler_attaches_repair_memo_for_repaired_calls() {
     let results = scheduler.execute_batch(vec![
         ToolCall::new(
             "aliased",
-            "write_file",
+            "file_write",
             json!({"file": "a.txt", "text": "alpha"}),
         ),
         ToolCall::new(
@@ -78,11 +79,11 @@ fn scheduler_attaches_repair_memo_for_repaired_calls() {
         .as_deref()
         .expect("repaired call must include a memo hint");
     assert!(
-        memo.contains("file_write"),
-        "memo should name the callable wire tool: {memo}"
+        memo.contains("write_file"),
+        "memo should name the advertised wire tool: {memo}"
     );
     assert!(
-        memo.contains("write_file"),
+        memo.contains("file_write"),
         "memo should reference the requested name: {memo}"
     );
 

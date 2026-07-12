@@ -800,7 +800,8 @@ fn tool_call_command_executes_repaired_file_write_and_prints_json() {
     let result: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(result["ok"], true);
     assert_eq!(result["tool_name"], "file.write");
-    assert_eq!(result["repaired"], true);
+    // `write_file` is the advertised prior-aligned name now — clean call.
+    assert_eq!(result["repaired"], false);
     assert_eq!(
         std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
         "from cli"
@@ -830,7 +831,8 @@ fn tool_call_command_executes_repaired_file_append_and_prints_json() {
     let result: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(result["ok"], true);
     assert_eq!(result["tool_name"], "file.append");
-    assert_eq!(result["repaired"], true);
+    // `append_file` is the advertised prior-aligned name now — clean call.
+    assert_eq!(result["repaired"], false);
     assert_eq!(
         std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
         "first\nsecond\n"
@@ -1154,7 +1156,7 @@ fn agent_run_command_executes_tool_loop_and_prints_final_json() {
     let result: Value = serde_json::from_slice(&output).unwrap();
     assert_eq!(result["final_content"], "finished");
     assert_eq!(result["tool_rounds"], 1);
-    assert_eq!(result["tool_results"][0]["repaired"], true);
+    assert_eq!(result["tool_results"][0]["repaired"], false);
     assert_eq!(
         std::fs::read_to_string(workspace.join("notes.txt")).unwrap(),
         "agent cli"

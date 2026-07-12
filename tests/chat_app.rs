@@ -524,6 +524,27 @@ fn panel_caps_live_rows_to_the_tail() {
 // --- scrollback flushing ---
 
 #[test]
+fn peek_scrollback_is_side_effect_free_until_acknowledged() {
+    let mut app = app();
+    app.push_user_message("hi");
+    app.push_system_line("note");
+
+    let (first, limit) = app.peek_scrollback(80);
+    assert!(!first.is_empty());
+    assert_eq!(app.emitted(), 0, "peek must not advance emitted");
+
+    // A failed terminal write means the same plan is offered again.
+    let (second, limit_again) = app.peek_scrollback(80);
+    assert_eq!(limit, limit_again);
+    assert_eq!(lines_text(&first), lines_text(&second));
+
+    app.acknowledge_emitted(limit);
+    assert_eq!(app.emitted(), limit);
+    let (third, _) = app.peek_scrollback(80);
+    assert!(third.is_empty());
+}
+
+#[test]
 fn take_scrollback_flushes_user_and_system_while_busy_but_not_running_tool() {
     let mut app = app();
     app.push_user_message("hello");

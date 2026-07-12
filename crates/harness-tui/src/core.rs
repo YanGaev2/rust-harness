@@ -132,13 +132,72 @@ impl Screen {
         self.terminal.write_all(frame.as_bytes())
     }
 
-    /// Adopt a new terminal size: pin the panel to the bottom and fully
-    /// redraw it (the terminal reflowed the content above on its own).
+    /// Commit finalized rows at the current flow origin and paint the
+    /// next live frame directly below them — in ONE synchronized write,
+    /// so the terminal never shows the stale live frame between the two.
+    /// The scroll reserve is computed from the NEW live frame, not the
+    /// previously painted one.
+    pub fn present(&mut self, committed: &[Line], mut live: Vec<Line>) -> io::Result<()> {
+        let height = self.height.max(1);
+        let max_rows = height as usize;
+        if live.len() > max_rows {
+            live = live.split_off(live.len() - max_rows);
+        }
+        // Fast path: nothing to commit and the live frame kept its
+        // height — diff rows in place.
+        if committed.is_empty() && live.len() == self.panel.len() {
+            let updates = diff_frames(&self.panel, &live);
+            self.panel = live;
+            return self.terminal.present(&updates, self.origin);
+        }
+        let row0 = self.origin;
+        let k = committed.len() as u16;
+        let live_len = live.len() as u16;
+
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        frame.push_str(&esc::move_to(row0, 0));
+        frame.push_str(esc::CLEAR_DOWN);
+        for line in committed {
+            frame.push_str(&render_ansi(line));
+            frame.push_str("\r\n");
+        }
+        // Printing scrolled the buffer when it ran past the last row;
+        // scroll further only if the NEW live frame still doesn't fit.
+        let scrolled = (row0 + k).saturating_sub(height - 1);
+        let needed = (row0 + k + live_len).saturating_sub(height);
+        let extra = needed.saturating_sub(scrolled);
+        if extra > 0 {
+            frame.push_str(&esc::move_to(height - 1, 0));
+            for _ in 0..extra {
+                frame.push_str("\r\n");
+            }
+        }
+        let origin = (row0 + k).min(height.saturating_sub(live_len.max(1)));
+        push_panel_rows(&mut frame, &live, origin);
+        frame.push_str(esc::SYNC_END);
+        self.terminal.write_all(frame.as_bytes())?;
+        self.origin = origin;
+        self.panel = live;
+        Ok(())
+    }
+
+    /// Adopt a new terminal size: keep the content-following flow origin
+    /// (clamped so the panel still fits) and fully redraw the live frame
+    /// there. The origin is never derived from the bottom edge — resize
+    /// must not reinstate a bottom-pinned layout.
     pub fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
         self.width = width;
         self.height = height.max(1);
+        let max_rows = self.height as usize;
+        if self.panel.len() > max_rows {
+            let clipped = self.panel.split_off(self.panel.len() - max_rows);
+            self.panel = clipped;
+        }
         let panel_len = self.panel.len() as u16;
-        self.origin = self.height.saturating_sub(panel_len.max(1));
+        self.origin = self
+            .origin
+            .min(self.height.saturating_sub(panel_len.max(1)));
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(&esc::move_to(self.origin, 0));
@@ -149,9 +208,10 @@ impl Screen {
     }
 
     /// Wipe the visible viewport and home the cursor — the startup
-    /// clear (pi's `clearScreen`, Claude Code's launch): the TUI draws
-    /// from the top row, and the user's existing terminal scrollback is
-    /// left untouched.
+    /// claim. A deliberate product choice built on pi's `clearScreen`
+    /// primitive (pi itself starts at the shell cursor; we clear so the
+    /// TUI owns the window from row 0). The user's existing terminal
+    /// scrollback is left untouched.
     pub fn clear_screen(&mut self) -> io::Result<()> {
         self.panel.clear();
         self.origin = 0;

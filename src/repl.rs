@@ -473,10 +473,16 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                 }
                 ChatAction::NewSession => {
                     chat.start_new(active_provider.name(), &active_model);
+                    // The app already dropped its transcript; wipe the terminal
+                    // too so the old conversation does not linger on screen.
+                    screen.clear().map_err(ReplError::Io)?;
                     app.push_system_line("started new session");
                     for notice in chat.take_notices() {
                         app.push_system_line(notice);
                     }
+                }
+                ChatAction::ClearScreen => {
+                    screen.clear().map_err(ReplError::Io)?;
                 }
                 ChatAction::Submit(message) => {
                     app.set_busy(true);

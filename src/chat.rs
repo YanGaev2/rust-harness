@@ -35,6 +35,9 @@ pub enum ChatAction {
     /// `/new`: ask the loop to abandon the resumed conversation and start a
     /// fresh session file (the transcript is already cleared by the app).
     NewSession,
+    /// `/clear`: the transcript is already cleared by the app; the loop must
+    /// wipe the terminal screen and scrollback so old blocks disappear too.
+    ClearScreen,
     Exit,
 }
 
@@ -457,7 +460,7 @@ impl ChatApp {
             Some("clear") => {
                 self.transcript.clear();
                 self.emitted = 0;
-                ChatAction::Continue
+                ChatAction::ClearScreen
             }
             Some("new") => {
                 self.transcript.clear();

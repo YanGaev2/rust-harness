@@ -216,7 +216,7 @@ fn slash_clear_empties_transcript_and_resets_emitted() {
     app.push_user_message("hi");
     app.take_scrollback(80);
     let action = submit_message(&mut app, "/clear");
-    assert_eq!(action, ChatAction::Continue);
+    assert_eq!(action, ChatAction::ClearScreen);
     assert!(app.transcript_text().is_empty());
     assert_eq!(app.emitted(), 0);
 }

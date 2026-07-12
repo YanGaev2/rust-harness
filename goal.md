@@ -475,3 +475,12 @@ paste support for text/images.
   drawn inside a rounded full-width frame (`framed_lines` in `src/chat.rs`,
   rows clipped/padded to the inner width), and the panel reserve accounts
   for the two border rows.
+- 2026-07-12 (bottom-pinned panel): `Screen` now keeps a content cursor
+  separate from the panel position — content flows top-down into native
+  scrollback while the panel is always painted on the bottom rows of the
+  window (the input field no longer floats right under the last block near
+  the top of an empty screen). A growing panel scrolls content up to make
+  room; a shrinking one clears its stale rows. Also fixed a session-id
+  collision: `create_session` bumps its millisecond seed until the path is
+  fresh, so `/new` in the same millisecond no longer appends to (and later
+  resumes) the session it just abandoned — this was a real flake on tmpfs.

@@ -153,6 +153,116 @@ fn model_prior_tool_names_resolve_without_repair() {
 }
 
 #[test]
+fn absolute_path_inside_workspace_is_accepted() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("README.md"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // The system prompt tells the model the workspace root; models
+    // trained on absolute-path harnesses legitimately send
+    // <root>/README.md. That path IS inside the workspace.
+    let absolute = root.path().join("README.md").display().to_string();
+    let result = runtime
+        .execute(ToolCall::new(
+            "abs-read",
+            "read_file",
+            json!({"path": absolute}),
+        ))
+        .unwrap();
+    assert!(
+        result.ok,
+        "absolute in-workspace path must work: {result:?}"
+    );
+    assert_eq!(result.content, "hello");
+
+    // Writing through an absolute in-workspace path works too.
+    let absolute_new = root.path().join("sub/new.txt").display().to_string();
+    let result = runtime
+        .execute(ToolCall::new(
+            "abs-write",
+            "write_file",
+            json!({"path": absolute_new, "content": "created"}),
+        ))
+        .unwrap();
+    assert!(result.ok, "{result:?}");
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("sub/new.txt")).unwrap(),
+        "created"
+    );
+}
+
+#[test]
+fn absolute_path_outside_workspace_is_rejected_with_honest_message() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), "no").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let absolute = outside.path().join("secret.txt").display().to_string();
+    let err = runtime
+        .execute(ToolCall::new(
+            "abs-out",
+            "read_file",
+            json!({"path": absolute}),
+        ))
+        .unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("outside the workspace"),
+        "message must be honest: {message}"
+    );
+    assert!(
+        message.contains("relative"),
+        "message must teach the fix: {message}"
+    );
+}
+
+#[test]
+fn list_files_hides_dot_directories_and_honors_depth() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(root.path().join(".git")).unwrap();
+    std::fs::write(root.path().join(".git/config"), "x").unwrap();
+    std::fs::create_dir_all(root.path().join("src/deep")).unwrap();
+    std::fs::write(root.path().join("src/main.rs"), "fn main() {}").unwrap();
+    std::fs::write(root.path().join("src/deep/inner.rs"), "x").unwrap();
+    std::fs::write(root.path().join("README.md"), "x").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Dot directories are noise for the model unless it asks for them.
+    let result = runtime
+        .execute(ToolCall::new("ls-1", "list_files", json!({"path": "."})))
+        .unwrap();
+    assert!(!result.content.contains(".git"), "{}", result.content);
+    assert!(result.content.contains("src/main.rs"));
+
+    // `depth` is the model's own vocabulary (seen live): 1 = top level only.
+    let result = runtime
+        .execute(ToolCall::new(
+            "ls-2",
+            "list_files",
+            json!({"path": ".", "depth": 1}),
+        ))
+        .unwrap();
+    assert!(result.content.contains("README.md"));
+    assert!(result.content.contains("src/"));
+    assert!(
+        !result.content.contains("src/main.rs"),
+        "depth 1 must not descend: {}",
+        result.content
+    );
+
+    // Hidden entries are reachable on request.
+    let result = runtime
+        .execute(ToolCall::new(
+            "ls-3",
+            "list_files",
+            json!({"path": ".", "show_hidden": true}),
+        ))
+        .unwrap();
+    assert!(result.content.contains(".git/config"), "{}", result.content);
+}
+
+#[test]
 fn bare_timeout_argument_means_seconds_not_milliseconds() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new(root.path());

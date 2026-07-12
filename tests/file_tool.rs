@@ -33,7 +33,7 @@ fn write_text_rejects_paths_outside_workspace() {
         .write_text("../escape.txt", "bad", WriteMode::Replace)
         .unwrap_err();
 
-    assert!(err.to_string().contains("outside workspace"));
+    assert!(err.to_string().contains("outside the workspace"));
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn list_files_returns_sorted_bounded_workspace_relative_entries() {
     )
     .unwrap();
 
-    let result = tool.list_files("src", 2).unwrap();
+    let result = tool.list_files("src", 2, None, false).unwrap();
 
     assert_eq!(result.entries.len(), 2);
     assert_eq!(result.entries[0].path, "src/a.txt");
@@ -185,7 +185,7 @@ fn list_files_stops_scanning_after_limit_plus_one() {
         .unwrap();
     }
 
-    let result = tool.list_files("many", 5).unwrap();
+    let result = tool.list_files("many", 5, None, false).unwrap();
 
     assert_eq!(result.entries.len(), 5);
     assert_eq!(result.scanned, 6);

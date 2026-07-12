@@ -1,0 +1,6 @@
+/target
+/.harness/
+/.claude-conversations/
+/artifacts/
+/external/
+/hermes-agent/

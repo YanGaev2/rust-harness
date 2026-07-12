@@ -167,7 +167,10 @@ fn clear_wipes_screen_and_scrollback_and_resets_origin() {
     let after_clear = buf.contents().len();
     screen.render_panel(lines(&["input", "status"])).unwrap();
     let repaint = buf.contents()[after_clear..].to_string();
-    assert!(repaint.contains("\x1b[1;1H"), "panel not at top: {repaint:?}");
+    assert!(
+        repaint.contains("\x1b[1;1H"),
+        "panel not at top: {repaint:?}"
+    );
     assert!(repaint.contains("input"));
     assert!(repaint.contains("status"));
 }

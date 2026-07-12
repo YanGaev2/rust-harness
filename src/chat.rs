@@ -17,7 +17,7 @@ use harness_tui::components::menu::{MenuItem, menu_lines};
 use harness_tui::components::spinner::spinner_lines;
 use harness_tui::components::status::status_line;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Color, Line, Span, Style};
+use harness_tui::text::{Color, Line, Span, Style, visible_width};
 
 /// What the event loop should do after the app handled an input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -696,7 +696,8 @@ impl ChatApp {
             lines.extend(palette_lines());
         }
 
-        lines.extend(self.editor.render(width, EDITOR_MAX_ROWS));
+        let editor_rows = self.editor.render(width.saturating_sub(2), EDITOR_MAX_ROWS);
+        lines.extend(framed_lines(editor_rows, width));
 
         if self.completion_visible() {
             let items: Vec<MenuItem> = self
@@ -770,6 +771,64 @@ impl ChatApp {
         };
         status_line(width, left, right)
     }
+}
+
+/// Wrap rows in a rounded full-width frame: `╭─╮` / `│ … │` / `╰─╯`.
+/// Rows are clipped and padded to the inner width so the right border
+/// always lines up.
+fn framed_lines(inner: Vec<Line>, width: usize) -> Vec<Line> {
+    let width = width.max(4);
+    let inner_width = width - 2;
+    let horizontal = "─".repeat(inner_width);
+    let mut lines = Vec::with_capacity(inner.len() + 2);
+    lines.push(styled_line(format!("╭{horizontal}╮"), dim_style()));
+    for row in inner {
+        let (mut spans, used) = clip_spans(row, inner_width);
+        spans.insert(0, Span::styled("│", dim_style()));
+        if used < inner_width {
+            spans.push(Span::raw(" ".repeat(inner_width - used)));
+        }
+        spans.push(Span::styled("│", dim_style()));
+        lines.push(Line { spans });
+    }
+    lines.push(styled_line(format!("╰{horizontal}╯"), dim_style()));
+    lines
+}
+
+/// Truncate a row to `max_width` columns, keeping span styles; returns
+/// the surviving spans and the columns they occupy.
+fn clip_spans(row: Line, max_width: usize) -> (Vec<Span>, usize) {
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    for span in row.spans {
+        if used >= max_width {
+            break;
+        }
+        let span_width = visible_width(&span.text);
+        if used + span_width <= max_width {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        let mut clipped = String::new();
+        for ch in span.text.chars() {
+            let mut buf = [0u8; 4];
+            let ch_width = visible_width(ch.encode_utf8(&mut buf));
+            if used + ch_width > max_width {
+                break;
+            }
+            clipped.push(ch);
+            used += ch_width;
+        }
+        if !clipped.is_empty() {
+            spans.push(Span {
+                text: clipped,
+                style: span.style,
+            });
+        }
+        break;
+    }
+    (spans, used)
 }
 
 /// The `/help` palette as plain panel lines.

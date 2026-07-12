@@ -575,9 +575,10 @@ fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
     if !scrollback.is_empty() {
         screen.emit(&scrollback).map_err(ReplError::Io)?;
     }
-    // Reserve rows for editor (≤6) + menu/palette + spinner + status; the
-    // live block area gets the rest and shows its tail when over budget.
-    let max_live_rows = height.saturating_sub(12).max(3);
+    // Reserve rows for the framed editor (≤6 + 2 border rows) + menu/
+    // palette + spinner + status; the live block area gets the rest and
+    // shows its tail when over budget.
+    let max_live_rows = height.saturating_sub(14).max(3);
     let mut panel = app.panel_lines(width, max_live_rows);
     let max_panel = height.saturating_sub(1).max(1);
     if panel.len() > max_panel {

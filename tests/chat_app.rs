@@ -450,6 +450,45 @@ fn panel_contains_editor_prompt_and_status_row() {
 }
 
 #[test]
+fn editor_is_framed_in_a_rounded_border() {
+    let mut app = app();
+    let rows: Vec<String> = app
+        .panel_lines(40, 20)
+        .iter()
+        .map(|line| line.text())
+        .collect();
+    let top = rows
+        .iter()
+        .position(|row| row.starts_with('╭'))
+        .expect("top border row");
+    assert_eq!(rows[top].chars().count(), 40, "border spans the full width");
+    assert!(rows[top].ends_with('╮'));
+    // The editor row sits inside the frame, padded out to the right edge.
+    assert!(
+        rows[top + 1].starts_with("│ > "),
+        "editor row must be framed: {:?}",
+        rows[top + 1]
+    );
+    assert!(rows[top + 1].ends_with('│'));
+    assert_eq!(rows[top + 1].chars().count(), 40, "row padded to the frame");
+    assert!(rows[top + 2].starts_with('╰'));
+    assert!(rows[top + 2].ends_with('╯'));
+
+    // Typed text stays inside the frame.
+    type_text(&mut app, "hello");
+    let rows: Vec<String> = app
+        .panel_lines(40, 20)
+        .iter()
+        .map(|line| line.text())
+        .collect();
+    let row = rows
+        .iter()
+        .find(|row| row.contains("> hello"))
+        .expect("typed row");
+    assert!(row.starts_with('│') && row.ends_with('│'), "{row:?}");
+}
+
+#[test]
 fn busy_panel_shows_working_row_with_spacer_and_live_entry() {
     let mut app = app();
     app.push_user_message("long task");

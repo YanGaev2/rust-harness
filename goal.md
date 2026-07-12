@@ -513,3 +513,20 @@ paste support for text/images.
   giant paragraph / open fence) leaves the entry alone with the head-clip
   cap as backstop. Verified live in tmux: mid-stream the spinner is active
   while the answer head is already reachable in terminal scrollback.
+- 2026-07-12 (bench-driven tool ergonomics, DeepSeek priors): a 10-task pilot
+  bench (NIAH-in-files, file-ops, code-fix, shell, QA; runner in scratchpad,
+  traces per task) plus a 13-tool priors probe (continue-the-phrase at four
+  temperatures, then ask the model which arguments it expects for the name it
+  chose) drove four rounds of harness fixes: (1) valid argument aliases are
+  first-class, not "repairs" with memo noise; (2) PowerShell output is forced
+  to UTF-8 with an OEM fallback decode (kernel32 MultiByteToWideChar) so the
+  model can read its own errors; (3) tools are advertised under the model's
+  prior names via wire_tool_name() - read_file, write_file, edit_file,
+  list_files, grep_search, tail_file, checksum_file, stat_file, delete_file,
+  move_file, get_image, run_shell_command - with the old file_* names and the
+  probe vocabulary (edit_and_apply, replace_in_file, str_replace, stat,
+  get_file_info, text_to_replace, ...) as aliases; (4) bare `timeout` now
+  means seconds (subprocess convention), only timeout_ms is milliseconds.
+  Bench: pass-rate 9/10 -> 10/10 stable, repairs 8 -> 0, unit-mistake errors
+  eliminated; the model now emits the advertised names unprompted (read_file
+  x71 in the final run). Probe data: scratchpad bench-10/probe_all_tools.json.

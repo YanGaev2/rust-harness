@@ -374,6 +374,27 @@ fn chat_session_start_new_switches_to_a_fresh_session() {
 }
 
 #[test]
+fn back_to_back_sessions_never_collide_on_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let workspace = PathBuf::from("F:\\rust-harness");
+    let mut paths = std::collections::BTreeSet::new();
+    // Same process, same workspace, and (on a fast tmpfs) the same
+    // millisecond — the id seed must still yield a fresh file each time,
+    // or `/new` silently appends to the session it was meant to leave.
+    for _ in 0..20 {
+        let session = store
+            .create_session(&workspace, "deepseek", "chat")
+            .unwrap();
+        assert!(
+            paths.insert(session.path().to_path_buf()),
+            "duplicate session file: {}",
+            session.path().display()
+        );
+    }
+}
+
+#[test]
 fn chat_session_without_store_works_in_memory() {
     let mut chat = ChatSession::start(None, &PathBuf::from("F:\\rust-harness"), "deepseek", "chat");
 

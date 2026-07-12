@@ -36,13 +36,14 @@ fn lines(texts: &[&str]) -> Vec<Line> {
 }
 
 #[test]
-fn panel_draws_at_start_row_when_screen_is_empty() {
+fn panel_pins_to_the_bottom_even_on_an_empty_screen() {
     let (mut screen, buf) = screen(40, 10, 0);
     screen.render_panel(lines(&["input", "status"])).unwrap();
     let out = buf.contents();
-    assert!(out.contains("\x1b[1;1H")); // row 0 → escape row 1
+    // Height 10, panel 2 → rows 8 and 9 (escape rows 9 and 10).
+    assert!(out.contains("\x1b[9;1H"));
     assert!(out.contains("input"));
-    assert!(out.contains("\x1b[2;1H"));
+    assert!(out.contains("\x1b[10;1H"));
     assert!(out.contains("status"));
 }
 
@@ -53,12 +54,12 @@ fn emit_prints_content_and_repaints_panel_below() {
     let before = buf.contents().len();
     screen.emit(&lines(&["one", "two", "three"])).unwrap();
     let out = buf.contents()[before..].to_string();
-    // Content starts where the panel was, panel is cleared first.
+    // Content starts at the top; the old panel area is cleared first.
     assert!(out.contains("\x1b[1;1H"));
     assert!(out.contains(esc::CLEAR_DOWN));
     assert!(out.contains("one\r\ntwo\r\nthree\r\n"));
-    // Panel repainted right below the content (row 3 → escape row 4).
-    assert!(out.contains("\x1b[4;1H"));
+    // Panel stays pinned to the bottom row (height 10 → escape row 10).
+    assert!(out.contains("\x1b[10;1H"));
     assert!(out.contains("panel"));
 }
 
@@ -88,10 +89,11 @@ fn emitting_again_appends_below_previous_content() {
     let before = buf.contents().len();
     screen.emit(&lines(&["b"])).unwrap();
     let out = buf.contents()[before..].to_string();
-    // Second emission starts at row 1 (below "a"), panel lands at row 2.
+    // Second emission starts at row 1 (below "a"); the panel stays at
+    // the bottom (height 10 → escape row 10).
     assert!(out.contains("\x1b[2;1H"));
     assert!(out.contains("b\r\n"));
-    assert!(out.contains("\x1b[3;1H"));
+    assert!(out.contains("\x1b[10;1H"));
 }
 
 #[test]
@@ -163,13 +165,14 @@ fn clear_wipes_screen_and_scrollback_and_resets_origin() {
     let out = buf.contents()[before..].to_string();
     assert!(out.contains("\x1b[2J"), "missing screen wipe: {out:?}");
     assert!(out.contains("\x1b[3J"), "missing scrollback wipe: {out:?}");
-    // The panel is forgotten: the next paint is a full redraw at row 0.
+    // The panel is forgotten: the next paint is a full redraw pinned to
+    // the bottom (height 10, panel 2 → escape row 9).
     let after_clear = buf.contents().len();
     screen.render_panel(lines(&["input", "status"])).unwrap();
     let repaint = buf.contents()[after_clear..].to_string();
     assert!(
-        repaint.contains("\x1b[1;1H"),
-        "panel not at top: {repaint:?}"
+        repaint.contains("\x1b[9;1H"),
+        "panel not pinned to bottom: {repaint:?}"
     );
     assert!(repaint.contains("input"));
     assert!(repaint.contains("status"));

@@ -468,3 +468,10 @@ paste support for text/images.
   width-only changes, torn escapes on >3ms read splits, legacy burst-coalesce
   semantics, DSR robustness, guard non-composability, worker survival on draw
   errors, char-count (not width) panel row caps for CJK.
+- 2026-07-12 (post-migration UX fixes): `/new` and `/clear` now wipe the
+  terminal screen and scrollback via the new `Screen::clear` (CSI 2J + 3J,
+  origin reset, panel forgotten) — previously only the app transcript was
+  dropped and the old conversation stayed visible; the chat input field is
+  drawn inside a rounded full-width frame (`framed_lines` in `src/chat.rs`,
+  rows clipped/padded to the inner width), and the panel reserve accounts
+  for the two border rows.

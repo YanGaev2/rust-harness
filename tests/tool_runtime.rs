@@ -74,6 +74,37 @@ fn runtime_does_not_flag_api_wire_tool_name_as_repaired() {
 }
 
 #[test]
+fn accepted_argument_aliases_are_not_flagged_as_repaired() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("data.txt"), "needle here").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // `pattern` is the grep-style name models actually send; it is a
+    // documented alias for file.search and must not trigger a memo.
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-search-pattern",
+            "file_search",
+            json!({"path": ".", "pattern": "needle"}),
+        ))
+        .unwrap();
+    assert!(result.ok);
+    assert_eq!(result.tool_name, "file.search");
+    assert!(!result.repaired, "valid alias must be first-class");
+
+    // Same for file/text on a canonical write call.
+    let result = runtime
+        .execute(ToolCall::new(
+            "call-write-alias",
+            "file_write",
+            json!({"file": "out.txt", "text": "ok"}),
+        ))
+        .unwrap();
+    assert!(result.ok);
+    assert!(!result.repaired, "valid alias must be first-class");
+}
+
+#[test]
 fn runtime_repairs_codex_style_file_write_arguments() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new(root.path());
@@ -144,7 +175,10 @@ fn runtime_repairs_codex_style_file_append_arguments() {
 
     assert!(result.ok);
     assert_eq!(result.tool_name, "file.append");
-    assert!(result.repaired);
+    // Accepted argument aliases are first-class, not repairs: the bench
+    // showed corrective memos on valid aliases only add noise the model
+    // never learns from (canonical name repairs still get memos).
+    assert!(!result.repaired);
     assert_eq!(
         std::fs::read_to_string(root.path().join("notes").join("todo.txt")).unwrap(),
         "first\nsecond"

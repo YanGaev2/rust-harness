@@ -484,3 +484,8 @@ paste support for text/images.
   collision: `create_session` bumps its millisecond seed until the path is
   fresh, so `/new` in the same millisecond no longer appends to (and later
   resumes) the session it just abandoned — this was a real flake on tmpfs.
+- 2026-07-12 (full-window takeover): `Screen::takeover` scrolls the shell's
+  leftover screen content into native scrollback and starts the TUI with a
+  blank viewport — chat and setup claim the whole window on launch (content
+  from the top row, panel pinned to the bottom) instead of attaching below
+  the shell prompt. The shell banner stays reachable by scrolling up.

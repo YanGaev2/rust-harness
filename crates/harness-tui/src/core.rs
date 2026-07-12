@@ -148,6 +148,21 @@ impl Screen {
         self.terminal.write_all(frame.as_bytes())
     }
 
+    /// Wipe the visible screen and the terminal's scrollback and forget
+    /// the painted panel — the `/new`-style full reset. The next
+    /// `render_panel`/`emit` starts from the top row.
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.panel.clear();
+        self.origin = 0;
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        frame.push_str(esc::CLEAR_ALL);
+        frame.push_str(esc::CLEAR_SCROLLBACK);
+        frame.push_str(&esc::move_to(0, 0));
+        frame.push_str(esc::SYNC_END);
+        self.terminal.write_all(frame.as_bytes())
+    }
+
     /// Clear the panel area and leave the cursor below the scrollback —
     /// call before exiting so the shell prompt lands cleanly.
     pub fn release(&mut self) -> io::Result<()> {

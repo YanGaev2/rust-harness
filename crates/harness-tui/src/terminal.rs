@@ -59,6 +59,10 @@ pub mod esc {
     pub const CLEAR_LINE: &str = "\x1b[2K";
     /// Erase from the cursor to the end of the screen.
     pub const CLEAR_DOWN: &str = "\x1b[0J";
+    /// Erase the whole visible screen.
+    pub const CLEAR_ALL: &str = "\x1b[2J";
+    /// Erase the terminal's scrollback buffer (xterm extension).
+    pub const CLEAR_SCROLLBACK: &str = "\x1b[3J";
 
     pub fn move_to(row: u16, col: u16) -> String {
         format!("\x1b[{};{}H", row + 1, col + 1)

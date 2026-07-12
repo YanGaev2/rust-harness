@@ -503,3 +503,13 @@ paste support for text/images.
   origin. Deferred from the report: progressive commit of streaming
   responses taller than the live budget (Qwen Static/pending model),
   debounced full-replay resize.
+- 2026-07-12 (progressive stream commit): the last deferred codex finding is
+  implemented - a streaming answer taller than the live budget no longer
+  head-clips out of view. `ChatApp::freeze_streaming_overflow` splits the
+  streaming entry at the last blank line outside any code fence, freezes the
+  stable prefix into a final entry (flushes to native scrollback mid-stream)
+  and keeps only the fresh tail live as `AssistantContinuation` (hanging
+  indent, no second bullet, deltas keep appending). No safe boundary (one
+  giant paragraph / open fence) leaves the entry alone with the head-clip
+  cap as backstop. Verified live in tmux: mid-stream the spinner is active
+  while the answer head is already reachable in terminal scrollback.

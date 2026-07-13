@@ -163,9 +163,16 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   blocks, rules, and inline `**bold**`/`*italic*`/`` `code` ``.
 - Offers **slash-command autocomplete**: type `/` to open a filtered menu below the
   input (`/p` → `/provider`, typed prefix highlighted, usage + description per row);
-  Up/Down select, Tab completes, Esc closes, Enter runs.
-  Commands: `/model PROVIDER MODEL`, `/provider`, `/history QUERY`, `/clear`,
-  `/new`, `/help`, `/exit`.
+  Up/Down select, Tab completes, Esc closes, Enter runs. Typing `/model ` extends
+  the menu with the saved provider/model pairs themselves.
+  Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/history QUERY`,
+  `/clear`, `/new`, `/cost`, `/help`, `/exit`.
+- **Model picker**: `/model` alone lists every saved provider/model as a numbered
+  menu (`[1] deepseek/deepseek-v4-pro (active)` …); switch with `/model 2`, a bare
+  model or provider name, or the full pair. A model name the config has never
+  seen switches to it AND saves it to the provider (`model X saved to provider
+  Y`), so typing a brand-new model is enough to add it. `/provider` lists all
+  saved providers with their models.
 - **Resumes the last chat on launch**: the conversation is persisted per
   workspace and reloaded at startup (a `resumed session … (N messages)` notice
   appears in the transcript). `/new` abandons it and starts a fresh session.

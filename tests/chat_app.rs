@@ -224,14 +224,109 @@ fn slash_model_returns_switch_action_without_echo() {
 }
 
 #[test]
-fn slash_model_without_arguments_shows_usage() {
-    let mut app = app();
-    let action = submit_message(&mut app, "/model claude");
+fn slash_model_without_catalog_shows_usage() {
+    let mut app = app(); // no catalog attached
+    let action = submit_message(&mut app, "/model");
     assert_eq!(action, ChatAction::Continue);
-    assert!(
-        app.transcript_text()
-            .contains("usage: /model PROVIDER MODEL")
+    assert!(app.transcript_text().contains("usage: /model"));
+}
+
+fn catalog_app() -> ChatApp {
+    ChatApp::new("deepseek/deepseek-v4-pro", "C:/work/project").with_catalog(vec![
+        (
+            "deepseek".to_string(),
+            vec![
+                "deepseek-v4-pro".to_string(),
+                "deepseek-v4-flash".to_string(),
+            ],
+        ),
+        ("glm".to_string(), vec!["glm-5.2".to_string()]),
+    ])
+}
+
+#[test]
+fn slash_model_no_args_lists_numbered_menu() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model");
+    assert_eq!(action, ChatAction::Continue);
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("[1] deepseek/deepseek-v4-pro"));
+    assert!(transcript.contains("[2] deepseek/deepseek-v4-flash"));
+    assert!(transcript.contains("[3] glm/glm-5.2"));
+    // The active pair is marked so the menu doubles as a status view.
+    assert!(transcript.contains("[1] deepseek/deepseek-v4-pro (active)"));
+    // The hint teaches every accepted form.
+    assert!(transcript.contains("/model N"));
+}
+
+#[test]
+fn slash_model_numeric_picks_menu_entry() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model 3");
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "glm".to_string(),
+            model: "glm-5.2".to_string(),
+        }
     );
+}
+
+#[test]
+fn slash_model_out_of_range_number_reports_error() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model 9");
+    assert_eq!(action, ChatAction::Continue);
+    assert!(app.transcript_text().contains("no menu entry 9"));
+}
+
+#[test]
+fn slash_model_single_model_name_finds_owning_provider() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model deepseek-v4-flash");
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+        }
+    );
+}
+
+#[test]
+fn slash_model_provider_name_switches_to_its_first_model() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model glm");
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "glm".to_string(),
+            model: "glm-5.2".to_string(),
+        }
+    );
+}
+
+#[test]
+fn slash_model_unknown_name_targets_active_provider_as_new_model() {
+    let mut app = catalog_app();
+    let action = submit_message(&mut app, "/model qwen3.7-max-preview");
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "deepseek".to_string(),
+            model: "qwen3.7-max-preview".to_string(),
+        }
+    );
+}
+
+#[test]
+fn slash_provider_lists_catalog_with_active_marker() {
+    let mut app = catalog_app();
+    submit_message(&mut app, "/provider");
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("active provider: deepseek/deepseek-v4-pro"));
+    assert!(transcript.contains("deepseek: deepseek-v4-pro, deepseek-v4-flash"));
+    assert!(transcript.contains("glm: glm-5.2"));
 }
 
 #[test]
@@ -279,7 +374,7 @@ fn slash_help_opens_palette_and_any_key_closes_it() {
     // The palette content is part of the pinned panel.
     let panel = lines_text(&app.panel_lines(100, 20));
     assert!(panel.contains("Commands"));
-    assert!(panel.contains("/model PROVIDER MODEL"));
+    assert!(panel.contains("/model [N | MODEL | PROVIDER MODEL]"));
 
     // Any key closes the palette without editing the compose.
     let action = app.handle_key(key(KeyCode::Char('x')));
@@ -342,6 +437,41 @@ fn tab_completes_selection_with_trailing_space() {
     app.handle_key(key(KeyCode::Tab));
     assert_eq!(app.input(), "/provider ");
     assert!(!app.completion_visible());
+}
+
+#[test]
+fn model_argument_completions_offer_provider_model_pairs() {
+    let mut app = catalog_app();
+    type_text(&mut app, "/model g");
+    assert!(app.completion_visible());
+    let suggestions = app.completion_suggestions();
+    assert!(suggestions.contains(&"/model glm glm-5.2".to_string()));
+    // deepseek pairs do not match the "g" prefix on either side.
+    assert!(!suggestions.iter().any(|s| s.contains("deepseek-v4-pro")));
+    app.handle_key(key(KeyCode::Tab));
+    assert_eq!(app.input(), "/model glm glm-5.2 ");
+}
+
+#[test]
+fn model_argument_completions_list_all_pairs_after_bare_command() {
+    let mut app = catalog_app();
+    type_text(&mut app, "/model ");
+    assert!(app.completion_visible());
+    assert_eq!(app.completion_suggestions().len(), 3);
+}
+
+#[test]
+fn add_catalog_model_extends_menu_for_future_switches() {
+    let mut app = catalog_app();
+    app.add_catalog_model("glm", "glm-5.2-fast-preview");
+    let action = submit_message(&mut app, "/model glm-5.2-fast-preview");
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "glm".to_string(),
+            model: "glm-5.2-fast-preview".to_string(),
+        }
+    );
 }
 
 // --- agent events ---

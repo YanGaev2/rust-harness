@@ -101,13 +101,13 @@ struct ChatCommand {
 const CHAT_COMMANDS: &[ChatCommand] = &[
     ChatCommand {
         name: "/model",
-        usage: "/model PROVIDER MODEL",
-        description: "switch the active provider/model",
+        usage: "/model [N | MODEL | PROVIDER MODEL]",
+        description: "list models or switch (new names are saved)",
     },
     ChatCommand {
         name: "/provider",
         usage: "/provider",
-        description: "show the active provider",
+        description: "list saved providers and their models",
     },
     ChatCommand {
         name: "/history",
@@ -140,6 +140,15 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
         description: "leave the session",
     },
 ];
+
+/// One row of the autocomplete menu: what Tab inserts plus the hint columns.
+/// Owned (not `&'static ChatCommand`) because model-argument rows are built
+/// from the runtime catalog.
+struct CompletionItem {
+    insert: String,
+    usage: String,
+    description: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolStatus {
@@ -205,6 +214,10 @@ pub struct ChatApp {
     /// Usage at the start of the current run, so per-run deltas fold into
     /// the session total without double-counting.
     run_usage_base: crate::agent::UsageTotals,
+    /// Saved providers and their models, for the `/model` menu, shorthand
+    /// switching, and argument completions. Empty when the host never
+    /// attached one (tests, bare sessions) — `/model` then shows usage only.
+    catalog: Vec<(String, Vec<String>)>,
 }
 
 impl ChatApp {
@@ -227,7 +240,50 @@ impl ChatApp {
             spinner_frame: 0,
             session_usage: crate::agent::UsageTotals::default(),
             run_usage_base: crate::agent::UsageTotals::default(),
+            catalog: Vec::new(),
         }
+    }
+
+    /// Attach the saved provider/model catalog that `/model` and `/provider`
+    /// menus are built from.
+    pub fn with_catalog(mut self, catalog: Vec<(String, Vec<String>)>) -> Self {
+        self.catalog = catalog;
+        self
+    }
+
+    /// Record a model that was added to a provider mid-session (e.g. the
+    /// user switched to a brand-new model name) so menus and completions
+    /// pick it up immediately.
+    pub fn add_catalog_model(&mut self, provider: &str, model: &str) {
+        if let Some((_, models)) = self.catalog.iter_mut().find(|(name, _)| name == provider) {
+            if !models.iter().any(|existing| existing == model) {
+                models.push(model.to_string());
+            }
+        } else {
+            self.catalog
+                .push((provider.to_string(), vec![model.to_string()]));
+        }
+    }
+
+    /// Flat `[provider, model]` pairs in menu order — the numbering shown by
+    /// `/model` and accepted by `/model N`.
+    fn model_menu_pairs(&self) -> Vec<(String, String)> {
+        self.catalog
+            .iter()
+            .flat_map(|(provider, models)| {
+                models
+                    .iter()
+                    .map(move |model| (provider.clone(), model.clone()))
+            })
+            .collect()
+    }
+
+    /// The provider half of the active `provider/model` label.
+    fn active_provider_name(&self) -> &str {
+        self.provider_label
+            .split_once('/')
+            .map(|(provider, _)| provider)
+            .unwrap_or(&self.provider_label)
     }
 
     /// The current compose text.
@@ -272,22 +328,22 @@ impl ChatApp {
         !self.completion_dismissed && !self.help_visible && !self.completion_matches().is_empty()
     }
 
-    /// Command names currently offered by the autocomplete menu.
+    /// Insert-texts currently offered by the autocomplete menu.
     pub fn completion_suggestions(&self) -> Vec<String> {
         self.completion_matches()
             .iter()
-            .map(|command| command.name.to_string())
+            .map(|item| item.insert.clone())
             .collect()
     }
 
-    /// The command name the autocomplete menu would accept on Tab.
+    /// The text the autocomplete menu would accept on Tab.
     pub fn completion_selected(&self) -> Option<String> {
         let matches = self.completion_matches();
         if matches.is_empty() {
             return None;
         }
         let index = self.completion_index.min(matches.len() - 1);
-        Some(matches[index].name.to_string())
+        Some(matches[index].insert.clone())
     }
 
     /// Whether the command palette / help overlay is open.
@@ -437,17 +493,54 @@ impl ChatApp {
         }
     }
 
-    /// The candidate commands for the current input, or empty if not typing a
-    /// `/command` token (no leading slash, or a space already typed).
-    fn completion_matches(&self) -> Vec<&'static ChatCommand> {
-        let query = self.editor.text();
-        if !query.starts_with('/') || query.chars().any(char::is_whitespace) {
+    /// The candidates for the current input: command names while a bare
+    /// `/command` token is being typed, and provider/model pairs once the
+    /// input is `/model ...` — that argument menu is what makes models
+    /// discoverable without leaving the compose line.
+    fn completion_matches(&self) -> Vec<CompletionItem> {
+        let text = self.editor.text();
+        if !text.starts_with('/') {
             return Vec::new();
         }
-        let query = query.to_ascii_lowercase();
+        if let Some(rest) = text.strip_prefix("/model ") {
+            let needle = rest.trim().to_ascii_lowercase();
+            return self
+                .model_menu_pairs()
+                .into_iter()
+                .filter(|(provider, model)| {
+                    needle.is_empty()
+                        || provider.to_ascii_lowercase().starts_with(&needle)
+                        || model.to_ascii_lowercase().starts_with(&needle)
+                        || format!("{provider} {model}")
+                            .to_ascii_lowercase()
+                            .starts_with(&needle)
+                })
+                .map(|(provider, model)| {
+                    let active = format!("{provider}/{model}") == self.provider_label;
+                    CompletionItem {
+                        insert: format!("/model {provider} {model}"),
+                        usage: format!("{provider}/{model}"),
+                        description: if active {
+                            "active".to_string()
+                        } else {
+                            String::new()
+                        },
+                    }
+                })
+                .collect();
+        }
+        if text.chars().any(char::is_whitespace) {
+            return Vec::new();
+        }
+        let query = text.to_ascii_lowercase();
         CHAT_COMMANDS
             .iter()
             .filter(|command| command.name.starts_with(&query))
+            .map(|command| CompletionItem {
+                insert: command.name.to_string(),
+                usage: command.usage.to_string(),
+                description: command.description.to_string(),
+            })
             .collect()
     }
 
@@ -498,6 +591,12 @@ impl ChatApp {
             Some("provider") => {
                 let label = self.provider_label.clone();
                 self.push_system_line(format!("active provider: {label}"));
+                for (provider, models) in self.catalog.clone() {
+                    self.transcript.push(ChatEntry::System(format!(
+                        "  {provider}: {}",
+                        models.join(", ")
+                    )));
+                }
                 ChatAction::Continue
             }
             Some("cost") => {
@@ -536,17 +635,22 @@ impl ChatApp {
                 ChatAction::Continue
             }
             Some("model") => {
-                let provider = parts.next();
-                let model = parts.next();
-                match (provider, model) {
+                let first = parts.next();
+                let second = parts.next();
+                match (first, second) {
                     (Some(provider), Some(model)) if parts.next().is_none() => {
                         ChatAction::SwitchModel {
                             provider: provider.to_string(),
                             model: model.to_string(),
                         }
                     }
+                    (Some(arg), None) => self.switch_model_shorthand(arg),
+                    (None, None) => {
+                        self.show_model_menu();
+                        ChatAction::Continue
+                    }
                     _ => {
-                        self.push_system_line("usage: /model PROVIDER MODEL");
+                        self.push_system_line("usage: /model [N | MODEL | PROVIDER MODEL]");
                         ChatAction::Continue
                     }
                 }
@@ -577,6 +681,66 @@ impl ChatApp {
                 ChatAction::Continue
             }
             None => ChatAction::Continue,
+        }
+    }
+
+    /// Print the numbered provider/model menu that `/model N` indexes into.
+    fn show_model_menu(&mut self) {
+        let pairs = self.model_menu_pairs();
+        if pairs.is_empty() {
+            self.push_system_line(
+                "usage: /model [N | MODEL | PROVIDER MODEL] (no saved providers)",
+            );
+            return;
+        }
+        let active = self.provider_label.clone();
+        self.push_system_line("available models:");
+        for (index, (provider, model)) in pairs.iter().enumerate() {
+            let marker = if format!("{provider}/{model}") == active {
+                " (active)"
+            } else {
+                ""
+            };
+            self.transcript.push(ChatEntry::System(format!(
+                "  [{}] {provider}/{model}{marker}",
+                index + 1
+            )));
+        }
+        self.transcript.push(ChatEntry::System(
+            "switch: /model N, /model MODEL, /model PROVIDER MODEL (new model names are saved)"
+                .to_string(),
+        ));
+    }
+
+    /// `/model ARG` with a single token: menu number, provider name, model
+    /// name, or a brand-new model for the active provider.
+    fn switch_model_shorthand(&mut self, arg: &str) -> ChatAction {
+        if let Ok(number) = arg.parse::<usize>() {
+            let pairs = self.model_menu_pairs();
+            return match number.checked_sub(1).and_then(|i| pairs.get(i)) {
+                Some((provider, model)) => ChatAction::SwitchModel {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                },
+                None => {
+                    self.push_system_line(format!(
+                        "no menu entry {number} (run /model to see the list)"
+                    ));
+                    ChatAction::Continue
+                }
+            };
+        }
+        if self.catalog.is_empty() {
+            self.push_system_line("usage: /model [N | MODEL | PROVIDER MODEL]");
+            return ChatAction::Continue;
+        }
+        let active = self.active_provider_name().to_string();
+        match crate::providers::resolve_model_shorthand(&self.catalog, &active, arg) {
+            Ok((provider, model)) => ChatAction::SwitchModel { provider, model },
+            Err(err) => {
+                self.push_system_line(err);
+                ChatAction::Continue
+            }
         }
     }
 
@@ -776,11 +940,11 @@ impl ChatApp {
         if self.completion_visible() {
             let items: Vec<MenuItem> = self
                 .completion_matches()
-                .iter()
-                .map(|command| MenuItem {
-                    name: command.name.to_string(),
-                    usage: command.usage.to_string(),
-                    description: command.description.to_string(),
+                .into_iter()
+                .map(|item| MenuItem {
+                    name: item.insert,
+                    usage: item.usage,
+                    description: item.description,
                 })
                 .collect();
             let selected = self.completion_index.min(items.len().saturating_sub(1));

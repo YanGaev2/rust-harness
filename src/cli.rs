@@ -477,11 +477,9 @@ fn provider_subscriptions<W: Write>(output: &mut W) -> Result<(), CliError> {
 fn tool_call<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     let flags = ToolCallFlags::parse(args)?;
     let arguments = serde_json::from_str(&flags.arguments).map_err(CliError::Json)?;
-    let result = ToolRuntime::new(flags.workspace).execute(ToolCall::new(
-        "cli-tool-call",
-        flags.tool_name,
-        arguments,
-    ))?;
+    let result = ToolRuntime::new(flags.workspace)
+        .with_shell_profile(crate::platform::ShellProfile::detected().cloned())
+        .execute(ToolCall::new("cli-tool-call", flags.tool_name, arguments))?;
     serde_json::to_writer(&mut *output, &result).map_err(CliError::Json)?;
     writeln!(output)?;
     Ok(())
@@ -490,8 +488,11 @@ fn tool_call<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> 
 fn tool_batch<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     let flags = ToolBatchFlags::parse(args)?;
     let calls: Vec<ToolCall> = serde_json::from_str(&flags.calls).map_err(CliError::Json)?;
-    let mut scheduler = ToolScheduler::new(ToolRuntime::new(flags.workspace))
-        .with_max_concurrency(flags.max_concurrency);
+    let mut scheduler = ToolScheduler::new(
+        ToolRuntime::new(flags.workspace)
+            .with_shell_profile(crate::platform::ShellProfile::detected().cloned()),
+    )
+    .with_max_concurrency(flags.max_concurrency);
     if let Some(timeout) = flags.timeout {
         scheduler = scheduler.with_timeout(timeout);
     }
@@ -511,7 +512,9 @@ fn chat_once<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> 
     let envelope = RequestEnvelope::new(provider.name(), flags.model)
         .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
         .with_cache_mode(CacheMode::ProviderPrefix)
-        .with_tools(ToolRuntime::tool_specs())
+        .with_tools(ToolRuntime::tool_specs_with_shell(
+            crate::platform::ShellProfile::detected(),
+        ))
         .with_messages(vec![ChatMessage::user(flags.message)]);
 
     let response = ProviderChatClient::new(flags.timeout).send(&provider, &envelope)?;
@@ -530,7 +533,9 @@ fn chat_stream<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError
     let envelope = RequestEnvelope::new(provider.name(), flags.model)
         .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
         .with_cache_mode(CacheMode::ProviderPrefix)
-        .with_tools(ToolRuntime::tool_specs())
+        .with_tools(ToolRuntime::tool_specs_with_shell(
+            crate::platform::ShellProfile::detected(),
+        ))
         .with_messages(vec![ChatMessage::user(flags.message)]);
 
     ProviderChatClient::new(flags.timeout).stream_text(&provider, &envelope, |delta| {

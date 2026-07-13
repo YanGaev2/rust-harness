@@ -1,6 +1,44 @@
+use harness_cli::platform::{OsFamily, ShellProfile};
 use harness_cli::runtime::{ToolCall, ToolRuntime};
 use serde_json::json;
 use std::time::{Duration, Instant};
+
+#[test]
+fn shell_tool_description_names_the_detected_dialect() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("powershell.exe"), "stub").unwrap();
+    std::fs::write(dir.path().join("cmd.exe"), "stub").unwrap();
+    let profile =
+        ShellProfile::detect_in(OsFamily::Windows, &[dir.path().to_path_buf()], &|_path| {
+            Some(5)
+        })
+        .unwrap();
+
+    let specs = ToolRuntime::tool_specs_with_shell(Some(&profile));
+    let shell_spec = specs
+        .iter()
+        .find(|spec| spec.name() == "run_shell_command")
+        .expect("shell tool must be advertised");
+
+    // Shell probe 2026-07-13: the model writes PowerShell 20/20 when it is
+    // told the interpreter is PowerShell, but falls into cmd idioms when the
+    // dialect is left unspecified. The description carries that one bit.
+    assert!(shell_spec.description().contains("PowerShell 5.1"));
+}
+
+#[test]
+fn shell_tool_is_not_advertised_when_no_shell_exists() {
+    let specs = ToolRuntime::tool_specs_with_shell(None);
+
+    assert!(
+        specs.iter().all(|spec| spec.name() != "run_shell_command"),
+        "a shell-less environment must not advertise run_shell_command"
+    );
+    assert!(
+        specs.iter().any(|spec| spec.name() == "read_file"),
+        "file tools stay available without a shell"
+    );
+}
 
 #[test]
 fn runtime_repairs_common_file_write_alias_and_argument_names() {

@@ -122,10 +122,16 @@ impl AgentRunner {
         if let Some(cancel) = &self.cancel {
             client = client.with_cancel_flag(cancel.clone());
         }
-        let runtime = ToolRuntime::new(&self.workspace).with_shell_timeout(self.timeout);
+        // One probe per process; prompt, tool description, and execution all
+        // agree on the same interpreter (the model writes whichever dialect
+        // it is told about — telling it wrong is worse than not telling).
+        let shell = crate::platform::ShellProfile::detected();
+        let runtime = ToolRuntime::new(&self.workspace)
+            .with_shell_timeout(self.timeout)
+            .with_shell_profile(shell.cloned());
         // Built once per run: constant within the session, so the cache prefix
         // over the system prompt stays stable across rounds.
-        let system_prompt = agent_system_prompt(&self.workspace);
+        let system_prompt = agent_system_prompt(&self.workspace, shell);
         let user_message = user_message.into();
         let mut messages = self.history.clone();
         messages.push(ChatMessage::user(user_message.clone()));
@@ -145,7 +151,7 @@ impl AgentRunner {
             let envelope = RequestEnvelope::new(self.provider.name(), &self.model)
                 .with_system_prompt(&system_prompt)
                 .with_cache_mode(CacheMode::ProviderPrefix)
-                .with_tools(ToolRuntime::tool_specs())
+                .with_tools(ToolRuntime::tool_specs_with_shell(shell))
                 .with_messages(messages.clone());
             // When streaming, thinking and answer fragments are emitted live as
             // they arrive; the flags below stop us re-emitting the full text again.

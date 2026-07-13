@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::platform::ShellProfile;
+use crate::platform::{ShellKind, ShellProfile};
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
@@ -22,10 +22,14 @@ pub struct ShellTool {
 
 impl ShellTool {
     pub fn native(cwd: impl Into<PathBuf>, timeout: Duration) -> Self {
+        Self::with_profile(cwd, timeout, ShellProfile::native())
+    }
+
+    pub fn with_profile(cwd: impl Into<PathBuf>, timeout: Duration, profile: ShellProfile) -> Self {
         Self {
             cwd: cwd.into(),
             timeout,
-            profile: ShellProfile::native(),
+            profile,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
         }
     }
@@ -36,19 +40,24 @@ impl ShellTool {
     }
 
     pub fn run(&self, command: &str) -> Result<ShellOutput, ShellError> {
-        // PowerShell 5.1 encodes its piped streams with the OEM code page
+        // Windows shells encode their piped streams with the OEM code page
         // (CP866 on Russian Windows) — the model would receive mojibake
         // error text and retry blindly. Switching the console to UTF-8
         // first also covers nested processes the command spawns.
         let command_buf;
-        let command = if self.profile.program().contains("powershell") {
-            command_buf = format!(
-                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
-                 $OutputEncoding=[System.Text.Encoding]::UTF8; {command}"
-            );
-            &command_buf
-        } else {
-            command
+        let command = match self.profile.kind() {
+            ShellKind::Pwsh | ShellKind::WindowsPowerShell => {
+                command_buf = format!(
+                    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
+                     $OutputEncoding=[System.Text.Encoding]::UTF8; {command}"
+                );
+                &command_buf
+            }
+            ShellKind::Cmd => {
+                command_buf = format!("chcp 65001>nul & {command}");
+                &command_buf
+            }
+            ShellKind::Bash | ShellKind::PosixSh => command,
         };
         let mut child = Command::new(self.profile.program())
             .args(self.profile.args())

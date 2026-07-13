@@ -601,3 +601,18 @@ paste support for text/images.
   deliberately running a failing test (honest tool work), and the
   grep-vs-read-everything strategy flip in niah_small is model variance
   (N=1), not a harness defect. Both fixes verified live.
+- 2026-07-13 (verified presets + session cost): provider presets for the
+  two bench-verified pairs - `provider add --name deepseek|glm` needs only
+  a key source; base_url and the verified default model (deepseek-v4-pro,
+  glm-5.2) come from the builtin profile, unverified families still
+  require --url. Dated builtin price list (official pages 2026-07-13:
+  v4-pro $0.435/$0.003625/$0.87, glm-5.2 $1.40/$0.26/$4.40 per 1M) powers
+  cache-aware cost estimates. AgentRunner accumulates per-round usage
+  into AgentTrace (requests/prompt/cached/completion + estimated_cost_usd
+  + pricing_as_of - closes the old "usage in traces" gap) and emits
+  UsageUpdated; /cost in the REPL prints session tokens and the dated
+  estimate. Verified live: preset add writes url+model with no key in the
+  file; a real glm-5.2 run traced usage {2 req, 3371 prompt, 1600 cached,
+  35 completion} -> $0.0030. Vendor APIs expose models but no prices
+  (checked both); litellm community JSON is the refresh source (pricing
+  refresh command still pending).

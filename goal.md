@@ -587,3 +587,17 @@ paste support for text/images.
   is EMPTY, so reads returned ok=true with empty content (silent lie;
   the model distrusted it and re-checked via Get-Content, wasting 2
   calls). All verified live with the installed binary.
+- 2026-07-13 (run6 strict tool-error pass): re-read the run6 traces with
+  one filter - only OUR tools misbehaving, model strategy choices are out
+  of scope. Two defects found and fixed. (1) edit_file rejected text that
+  IS in the file: CRLF file vs LF old_string (the model composes LF while
+  reading our CRLF content; codefix_slug lost 3 calls recovering via a
+  whole-file rewrite). Literal-match failure now retries with the search
+  and replacement re-encoded to the file's own line-ending convention -
+  the file stays consistent, the result is repaired with a memo naming
+  the cause. (2) a successful quiet command (Set-Content) returned bare
+  empty content; it now reads (command exited with code 0; no output).
+  Confirmed non-errors: the Traceback in codefix_slug was the model
+  deliberately running a failing test (honest tool work), and the
+  grep-vs-read-everything strategy flip in niah_small is model variance
+  (N=1), not a harness defect. Both fixes verified live.

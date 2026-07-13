@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -18,6 +18,7 @@ use crate::clipboard::{
     AttachmentStore, ClipboardAttachment, ClipboardCapture, ClipboardError, ClipboardSource,
     SystemClipboard,
 };
+use crate::config::ConfigStore;
 use crate::providers::ProviderConfig;
 use crate::request::ChatMessage;
 use crate::session::{ChatSession, SessionStore};
@@ -39,6 +40,12 @@ pub enum ReplAction {
     Continue,
     Submit(ReplSubmission),
     SwitchModel(ReplModelSelection),
+    /// `/model ARG` with one token — resolved against the provider catalog
+    /// (menu number, provider, model, or a brand-new model name) by the
+    /// run loop, which owns the catalog.
+    SwitchModelShorthand(String),
+    /// `/model` with no arguments: list the saved provider/model pairs.
+    ShowModels,
     HistorySearch(Vec<ReplHistoryMatch>),
     CommandError(String),
     /// `/new`: abandon the resumed conversation and start a fresh session file.
@@ -199,21 +206,23 @@ impl ReplSession {
                 Some(ReplAction::HistorySearch(self.search_history(&query)))
             }
             "/new" => Some(ReplAction::NewSession),
+            "/exit" | "/quit" => Some(ReplAction::Exit),
             "/model" => {
-                let provider_name = parts.next();
-                let model = parts.next();
-                if provider_name.is_none() || model.is_none() || parts.next().is_some() {
-                    return Some(ReplAction::CommandError(
-                        "usage: /model PROVIDER MODEL".to_string(),
-                    ));
+                let first = parts.next();
+                let second = parts.next();
+                match (first, second) {
+                    (Some(provider_name), Some(model)) if parts.next().is_none() => {
+                        Some(ReplAction::SwitchModel(ReplModelSelection {
+                            provider_name: provider_name.to_string(),
+                            model: model.to_string(),
+                        }))
+                    }
+                    (Some(arg), None) => Some(ReplAction::SwitchModelShorthand(arg.to_string())),
+                    (None, None) => Some(ReplAction::ShowModels),
+                    _ => Some(ReplAction::CommandError(
+                        "usage: /model [N | MODEL | PROVIDER MODEL]".to_string(),
+                    )),
                 }
-
-                Some(ReplAction::SwitchModel(ReplModelSelection {
-                    provider_name: provider_name
-                        .expect("provider presence checked")
-                        .to_string(),
-                    model: model.expect("model presence checked").to_string(),
-                }))
             }
             other => Some(ReplAction::CommandError(format!(
                 "unknown command: {other}"
@@ -232,6 +241,10 @@ pub struct ReplOptions {
     pub max_rounds: usize,
     pub max_tool_concurrency: Option<usize>,
     pub tool_timeout: Option<Duration>,
+    /// Where the provider config lives, so an in-session switch to a
+    /// brand-new model name can be saved back for future menus. `None`
+    /// (tests, ad-hoc sessions) simply skips persistence.
+    pub config_path: Option<PathBuf>,
 }
 
 pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Result<(), ReplError> {
@@ -244,16 +257,20 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
         max_rounds,
         max_tool_concurrency,
         tool_timeout,
+        config_path,
     } = options;
     let mut active_provider = provider;
     let mut active_model = model;
-    let catalog = if provider_catalog.is_empty() {
+    let mut catalog = if provider_catalog.is_empty() {
         vec![active_provider.clone()]
     } else {
         provider_catalog
     };
 
-    let _raw = RawModeGuard::enable()?;
+    // Raw mode needs a real console; a fully piped run (tests, scripts,
+    // `echo … | harness repl > out`) has none, and cooked pipe input is
+    // exactly what the line reader wants there — so a failure is fine.
+    let _raw = RawModeGuard::enable().ok();
     let clipboard = SystemClipboard;
     let mut session = ReplSession::new(AttachmentStore::new(&workspace));
     let mut chat = ChatSession::start(
@@ -265,7 +282,7 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
 
     writeln!(
         output,
-        "harness repl. Ctrl+V paste, Enter send, Ctrl+C exit, /model PROVIDER MODEL switch, /new fresh session."
+        "harness repl. Ctrl+V paste, Enter send, Ctrl+C exit, /model to pick a model, /new fresh session."
     )?;
     for notice in chat.take_notices() {
         writeln!(output, "{notice}")?;
@@ -293,19 +310,83 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
             }
             ReplAction::SwitchModel(selection) => {
                 writeln!(output)?;
-                match resolve_model_selection(&catalog, &selection) {
-                    Ok(provider) => {
+                match perform_model_switch(&mut catalog, config_path.as_deref(), &selection) {
+                    Ok((provider, notes)) => {
                         active_provider = provider;
                         active_model = selection.model;
-                        writeln!(
-                            output,
-                            "switched to {}/{}",
-                            active_provider.name(),
-                            active_model
-                        )?;
+                        for note in notes {
+                            writeln!(output, "{note}")?;
+                        }
                     }
                     Err(err) => writeln!(output, "{err}")?,
                 }
+                write!(output, "> ")?;
+                output.flush()?;
+            }
+            ReplAction::SwitchModelShorthand(arg) => {
+                writeln!(output)?;
+                let pairs = catalog_pairs(&catalog);
+                let flat: Vec<(String, String)> = pairs
+                    .iter()
+                    .flat_map(|(provider, models)| {
+                        models
+                            .iter()
+                            .map(move |model| (provider.clone(), model.clone()))
+                    })
+                    .collect();
+                let resolved = match arg.parse::<usize>() {
+                    Ok(number) => number
+                        .checked_sub(1)
+                        .and_then(|i| flat.get(i).cloned())
+                        .ok_or_else(|| {
+                            format!("no menu entry {number} (run /model to see the list)")
+                        }),
+                    Err(_) => crate::providers::resolve_model_shorthand(
+                        &pairs,
+                        active_provider.name(),
+                        &arg,
+                    ),
+                };
+                match resolved.and_then(|(provider_name, model)| {
+                    let selection = ReplModelSelection {
+                        provider_name,
+                        model,
+                    };
+                    perform_model_switch(&mut catalog, config_path.as_deref(), &selection)
+                        .map(|switched| (switched, selection.model))
+                }) {
+                    Ok(((provider, notes), model)) => {
+                        active_provider = provider;
+                        active_model = model;
+                        for note in notes {
+                            writeln!(output, "{note}")?;
+                        }
+                    }
+                    Err(err) => writeln!(output, "{err}")?,
+                }
+                write!(output, "> ")?;
+                output.flush()?;
+            }
+            ReplAction::ShowModels => {
+                writeln!(output)?;
+                writeln!(output, "available models:")?;
+                let mut index = 0;
+                for (provider_name, models) in catalog_pairs(&catalog) {
+                    for model in models {
+                        index += 1;
+                        let marker =
+                            if provider_name == active_provider.name() && model == active_model {
+                                " (active)"
+                            } else {
+                                ""
+                            };
+                        writeln!(output, "  [{index}] {provider_name}/{model}{marker}")?;
+                    }
+                }
+                writeln!(
+                    output,
+                    "switch: /model N, /model MODEL, /model PROVIDER MODEL (new model names are saved)"
+                )?;
                 write!(output, "> ")?;
                 output.flush()?;
             }
@@ -396,10 +477,11 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
         max_rounds,
         max_tool_concurrency,
         tool_timeout,
+        config_path,
     } = options;
     let mut active_provider = provider;
     let mut active_model = model;
-    let catalog = if provider_catalog.is_empty() {
+    let mut catalog = if provider_catalog.is_empty() {
         vec![active_provider.clone()]
     } else {
         provider_catalog
@@ -417,7 +499,8 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     let mut app = ChatApp::new(
         format!("{}/{}", active_provider.name(), active_model),
         &workspace,
-    );
+    )
+    .with_catalog(catalog_pairs(&catalog));
     let mut chat = ChatSession::start(
         SessionStore::for_workspace(&workspace),
         &workspace,
@@ -450,14 +533,12 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                     capture_into_chat(&mut app, &mut capture, &clipboard);
                 }
                 ChatAction::SwitchModel { provider, model } => {
-                    match resolve_model_selection(
-                        &catalog,
-                        &ReplModelSelection {
-                            provider_name: provider,
-                            model: model.clone(),
-                        },
-                    ) {
-                        Ok(resolved) => {
+                    let selection = ReplModelSelection {
+                        provider_name: provider,
+                        model: model.clone(),
+                    };
+                    match perform_model_switch(&mut catalog, config_path.as_deref(), &selection) {
+                        Ok((resolved, notes)) => {
                             active_provider = resolved;
                             active_model = model;
                             app.set_provider_label(format!(
@@ -465,11 +546,10 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                                 active_provider.name(),
                                 active_model
                             ));
-                            app.push_system_line(format!(
-                                "switched to {}/{}",
-                                active_provider.name(),
-                                active_model
-                            ));
+                            app.add_catalog_model(active_provider.name(), &active_model);
+                            for note in notes {
+                                app.push_system_line(note);
+                            }
                         }
                         Err(err) => app.push_system_line(err),
                     }
@@ -773,14 +853,78 @@ pub fn resolve_model_selection(
         .find(|provider| provider.name() == selection.provider_name)
         .ok_or_else(|| format!("unknown provider: {}", selection.provider_name))?;
 
-    if !provider.models().is_empty() && !provider.models().contains(&selection.model) {
-        return Err(format!(
-            "model {} is not configured for provider {}",
-            selection.model, selection.provider_name
-        ));
-    }
-
+    // Any model name is accepted for a known provider: the user must be able
+    // to type a model the config has never seen (it is then saved via
+    // `persist_model_addition`). A typo fails loudly at request time instead.
     Ok(provider.clone())
+}
+
+/// The `(provider, models)` view of the catalog used by shorthand
+/// resolution and the `/model` menus.
+fn catalog_pairs(catalog: &[ProviderConfig]) -> Vec<(String, Vec<String>)> {
+    catalog
+        .iter()
+        .map(|provider| (provider.name().to_string(), provider.models().to_vec()))
+        .collect()
+}
+
+/// Resolve a switch, persist a brand-new model name when the config path is
+/// known, and mirror it into the in-memory catalog so menus stay current.
+/// Returns the provider to activate plus the lines to show the user.
+fn perform_model_switch(
+    catalog: &mut [ProviderConfig],
+    config_path: Option<&Path>,
+    selection: &ReplModelSelection,
+) -> Result<(ProviderConfig, Vec<String>), String> {
+    let provider = resolve_model_selection(catalog, selection)?;
+    let mut notes = vec![format!(
+        "switched to {}/{}",
+        provider.name(),
+        selection.model
+    )];
+    if !provider.models().contains(&selection.model) {
+        if let Some(path) = config_path {
+            match persist_model_addition(path, provider.name(), &selection.model) {
+                Ok(true) => notes.push(format!(
+                    "model {} saved to provider {}",
+                    selection.model,
+                    provider.name()
+                )),
+                Ok(false) => {}
+                Err(err) => notes.push(format!("note: model not saved to config: {err}")),
+            }
+        }
+        if let Some(entry) = catalog
+            .iter_mut()
+            .find(|entry| entry.name() == selection.provider_name)
+        {
+            *entry = entry.clone().with_model(&selection.model);
+        }
+    }
+    Ok((provider, notes))
+}
+
+/// Append `model` to the saved provider's model list in the config file.
+/// Returns `Ok(true)` when the model was new, `Ok(false)` when it was
+/// already present (no write happens).
+pub fn persist_model_addition(
+    config_path: &Path,
+    provider_name: &str,
+    model: &str,
+) -> Result<bool, String> {
+    let store = ConfigStore::new(config_path);
+    let config = store.load().map_err(|err| err.to_string())?;
+    let Some(provider) = config.provider(provider_name) else {
+        return Err(format!("unknown provider: {provider_name}"));
+    };
+    if provider.models().iter().any(|existing| existing == model) {
+        return Ok(false);
+    }
+    let updated = provider.clone().with_model(model);
+    store
+        .save_provider(updated)
+        .map_err(|err| err.to_string())?;
+    Ok(true)
 }
 
 #[derive(Debug)]

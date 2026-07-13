@@ -531,7 +531,8 @@ paste support for text/images.
   eliminated; the model now emits the advertised names unprompted (read_file
   x71 in the final run). Probe data: scratchpad bench-10/probe_all_tools.json.
 - 2026-07-13 (live-trace fixes: absolute paths, list ergonomics): a real chat
-  trace showed the model sending `F:ust-harness\README.md` - the absolute
+  trace showed the model sending `F:
+ust-harness\README.md` - the absolute
   form of an in-workspace path (the system prompt itself names the root) -
   and getting a false "outside workspace" rejection. Absolute paths that
   canonicalize inside the workspace are now normalized to relative and
@@ -616,3 +617,27 @@ paste support for text/images.
   35 completion} -> $0.0030. Vendor APIs expose models but no prices
   (checked both); litellm community JSON is the refresh source (pricing
   refresh command still pending).
+
+- REPL model picker (2026-07-13): the user could not see or change models from
+  inside the chat. Now /model alone prints a numbered provider/model menu with
+  the active pair marked; /model N, /model MODEL (owning provider looked up,
+  provider name jumps to its first model), and /model PROVIDER MODEL all
+  switch; a brand-new model name is accepted, switched to, and appended to the
+  provider in providers.json (persist_model_addition, mirrored into the
+  in-session catalog). Typing "/model " extends the autocomplete menu with the
+  saved provider/model pairs. /provider lists every saved provider with its
+  models; line REPL gained /exit; /quit; raw mode is optional so fully piped
+  line-mode runs work. resolve_model_selection no longer rejects models missing
+  from the saved list - the allowlist made adding a model from the REPL
+  impossible.
+- qwen3.7-max probed and benched (2026-07-13): priors are near-identical to
+  DeepSeek/GLM (verb_noun, file_path/content/old_string/new_string, timeout in
+  seconds); the free-form toolset listing is literally the Claude Code set
+  (Read/Write/Edit/MultiEdit/Bash/Glob/Grep/LS/WebFetch/TodoWrite/Task). Bench
+  v2 26x2 via DashScope compatible-mode: 50/52, 195 calls, 0 repairs, 0 failed
+  calls; both fails are model-side (mental-math sum, a safety refusal on the
+  "secret deployment code" needle task). Cache: OpenAI-style
+  prompt_tokens_details.cached_tokens, but only prefixes >= 2048 tokens are
+  cached (agent-loop hit 30% overall vs DeepSeek ~85%; short 2-request runs get
+  0). enable_thinking:false disables thinking in probes (thinking is on by
+  default, temperature>1 accepted).

@@ -141,7 +141,7 @@ fn slash_model_command_switches_provider_and_model_without_llm_submit() {
 }
 
 #[test]
-fn slash_model_command_reports_usage_error_for_missing_arguments() {
+fn slash_model_single_argument_returns_shorthand_action() {
     let root = tempfile::tempdir().unwrap();
     let source = StaticClipboard::new(None);
     let mut session = ReplSession::new(AttachmentStore::new(root.path()));
@@ -151,16 +151,30 @@ fn slash_model_command_reports_usage_error_for_missing_arguments() {
         .unwrap();
 
     let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
-    let ReplAction::CommandError(error) = action else {
-        panic!("expected command error action");
+    let ReplAction::SwitchModelShorthand(arg) = action else {
+        panic!("expected shorthand switch action, got {action:?}");
     };
 
-    assert!(error.contains("/model PROVIDER MODEL"));
+    assert_eq!(arg, "claude");
     assert_eq!(session.input(), "");
 }
 
 #[test]
-fn model_selection_resolver_uses_provider_catalog_and_model_allowlist() {
+fn slash_model_without_arguments_lists_models() {
+    let root = tempfile::tempdir().unwrap();
+    let source = StaticClipboard::new(None);
+    let mut session = ReplSession::new(AttachmentStore::new(root.path()));
+
+    session
+        .handle_event(ReplEvent::Text("/model".to_string()), &source)
+        .unwrap();
+
+    let action = session.handle_event(ReplEvent::Submit, &source).unwrap();
+    assert_eq!(action, ReplAction::ShowModels);
+}
+
+#[test]
+fn model_selection_resolver_accepts_new_models_for_known_providers() {
     let catalog = vec![
         ProviderConfig::new("local", "http://localhost:11434/v1", "local-key")
             .with_model("qwen3-coder"),
@@ -176,19 +190,96 @@ fn model_selection_resolver_uses_provider_catalog_and_model_allowlist() {
         },
     )
     .unwrap();
+    assert_eq!(resolved.name(), "claude");
 
+    // A model the config has never seen is accepted: the user must be able
+    // to type a brand-new model name and have it used as-is.
+    let resolved = resolve_model_selection(
+        &catalog,
+        &ReplModelSelection {
+            provider_name: "claude".to_string(),
+            model: "claude-opus-5".to_string(),
+        },
+    )
+    .unwrap();
     assert_eq!(resolved.name(), "claude");
 
     let err = resolve_model_selection(
         &catalog,
         &ReplModelSelection {
-            provider_name: "claude".to_string(),
-            model: "missing-model".to_string(),
+            provider_name: "nope".to_string(),
+            model: "any".to_string(),
         },
     )
     .unwrap_err();
+    assert!(err.contains("unknown provider: nope"));
+}
 
-    assert!(err.contains("model missing-model is not configured for provider claude"));
+#[test]
+fn resolve_model_shorthand_matches_provider_model_or_falls_back_to_active() {
+    let catalog = vec![
+        (
+            "deepseek".to_string(),
+            vec![
+                "deepseek-v4-pro".to_string(),
+                "deepseek-v4-flash".to_string(),
+            ],
+        ),
+        ("glm".to_string(), vec!["glm-5.2".to_string()]),
+    ];
+
+    // Provider name → its first model.
+    assert_eq!(
+        harness_cli::providers::resolve_model_shorthand(&catalog, "deepseek", "glm").unwrap(),
+        ("glm".to_string(), "glm-5.2".to_string())
+    );
+    // Unique model name → its owning provider.
+    assert_eq!(
+        harness_cli::providers::resolve_model_shorthand(&catalog, "glm", "deepseek-v4-flash")
+            .unwrap(),
+        ("deepseek".to_string(), "deepseek-v4-flash".to_string())
+    );
+    // Unknown name → a new model on the active provider.
+    assert_eq!(
+        harness_cli::providers::resolve_model_shorthand(&catalog, "glm", "glm-5.3").unwrap(),
+        ("glm".to_string(), "glm-5.3".to_string())
+    );
+    // No active provider match at all → error.
+    assert!(
+        harness_cli::providers::resolve_model_shorthand(&catalog, "missing", "brand-new").is_err()
+    );
+}
+
+#[test]
+fn persist_model_addition_appends_once_and_reports_novelty() {
+    use harness_cli::config::ConfigStore;
+    use harness_cli::repl::persist_model_addition;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("providers.json");
+    let store = ConfigStore::new(&path);
+    store
+        .save_provider(
+            ProviderConfig::new("glm", "https://api.z.ai/api/paas/v4", "").with_model("glm-5.2"),
+        )
+        .unwrap();
+
+    // First switch to a new model appends it to the saved provider.
+    assert_eq!(
+        persist_model_addition(&path, "glm", "glm-5.2-fast-preview"),
+        Ok(true)
+    );
+    let config = store.load().unwrap();
+    let models = config.provider("glm").unwrap().models().to_vec();
+    assert_eq!(models, vec!["glm-5.2", "glm-5.2-fast-preview"]);
+
+    // Repeating the switch is a no-op, not a duplicate entry.
+    assert_eq!(
+        persist_model_addition(&path, "glm", "glm-5.2-fast-preview"),
+        Ok(false)
+    );
+    let config = store.load().unwrap();
+    assert_eq!(config.provider("glm").unwrap().models().len(), 2);
 }
 
 #[test]

@@ -469,6 +469,40 @@ impl ModelDiscovery {
     }
 }
 
+/// Resolve a single `/model ARG` token against a `(provider, models)`
+/// catalog. Priority: exact provider name (→ its first model), then a model
+/// owned by exactly one provider, then a brand-new model on the active
+/// provider. Ambiguous model names fall through to the active provider so a
+/// duplicate name never silently switches providers.
+pub fn resolve_model_shorthand(
+    catalog: &[(String, Vec<String>)],
+    active_provider: &str,
+    arg: &str,
+) -> Result<(String, String), String> {
+    if let Some((name, models)) = catalog.iter().find(|(name, _)| name == arg) {
+        return match models.first() {
+            Some(model) => Ok((name.clone(), model.clone())),
+            None => Err(format!("provider {arg} has no configured models")),
+        };
+    }
+
+    let owners: Vec<&String> = catalog
+        .iter()
+        .filter(|(_, models)| models.iter().any(|model| model == arg))
+        .map(|(name, _)| name)
+        .collect();
+    if owners.len() == 1 {
+        return Ok((owners[0].clone(), arg.to_string()));
+    }
+
+    if catalog.iter().any(|(name, _)| name == active_provider) {
+        return Ok((active_provider.to_string(), arg.to_string()));
+    }
+    Err(format!(
+        "unknown model {arg} and no active provider to attach it to"
+    ))
+}
+
 #[derive(Debug)]
 pub enum ModelDiscoveryError {
     InvalidJson(serde_json::Error),

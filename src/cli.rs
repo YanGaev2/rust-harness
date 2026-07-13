@@ -673,7 +673,8 @@ pub fn resolve_repl_provider(
 
 fn repl<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     let flags = ReplFlags::parse(args)?;
-    let config = ConfigStore::new(flags.config_path).load()?;
+    let config_path = flags.config_path.clone();
+    let config = ConfigStore::new(&config_path).load()?;
     let (provider, model) = resolve_repl_provider(
         &config,
         flags.provider_name.as_deref(),
@@ -688,6 +689,7 @@ fn repl<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
         max_rounds: flags.max_rounds,
         max_tool_concurrency: flags.max_tool_concurrency,
         tool_timeout: flags.tool_timeout,
+        config_path: Some(config_path),
     };
 
     // On a real terminal, drive the Ratatui chat TUI; pipes and tests keep the

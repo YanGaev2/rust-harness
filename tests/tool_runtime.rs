@@ -109,6 +109,98 @@ fn shell_timeout_is_clamped_to_the_bounded_maximum() {
 }
 
 #[test]
+fn empty_search_result_says_no_matches_instead_of_silence() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "alpha\nbeta\n").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Bench run5: the model got a bare empty string 8 times while probing
+    // patterns and had to guess whether the search worked at all.
+    let result = runtime
+        .execute(ToolCall::new(
+            "s-empty",
+            "grep_search",
+            json!({"pattern": "needle", "path": "."}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert!(
+        result.content.contains("no matches"),
+        "empty result must say so: {:?}",
+        result.content
+    );
+    assert!(result.content.contains("needle"), "{:?}", result.content);
+}
+
+#[test]
+fn search_returns_context_lines_around_matches() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("log.txt"),
+        "one\ntwo\nneedle here\nfour\nfive\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Probe prior: the model expects grep tools to take context_lines.
+    // run5 niah_decoy: without context it fell back to reading 18 whole
+    // files (~30KB) just to see what surrounds each match.
+    let result = runtime
+        .execute(ToolCall::new(
+            "s-ctx",
+            "grep_search",
+            json!({"pattern": "needle", "context_lines": 1}),
+        ))
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(result.content.contains("log.txt:3:needle here"));
+    assert!(
+        result.content.contains("log.txt-2-two"),
+        "{}",
+        result.content
+    );
+    assert!(
+        result.content.contains("log.txt-4-four"),
+        "{}",
+        result.content
+    );
+    assert!(!result.content.contains("five"), "{}", result.content);
+}
+
+#[test]
+fn shell_metadata_does_not_duplicate_captured_output() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "sh-meta",
+            "run_shell_command",
+            json!({"command": "echo dedup-check"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok);
+    assert!(result.content.contains("dedup-check"));
+    // stdout/stderr already travel in `content`; copying them into the
+    // metadata doubles the tokens of every shell result the model reads.
+    assert!(
+        result.metadata.get("stdout").is_none(),
+        "{:?}",
+        result.metadata
+    );
+    assert!(
+        result.metadata.get("stderr").is_none(),
+        "{:?}",
+        result.metadata
+    );
+    assert_eq!(result.metadata["exit_code"], 0);
+    assert_eq!(result.metadata["stdout_truncated"], false);
+}
+
+#[test]
 fn shell_tool_is_not_advertised_when_no_shell_exists() {
     let specs = ToolRuntime::tool_specs_with_shell(None);
 

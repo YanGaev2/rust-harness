@@ -260,6 +260,11 @@ impl ToolRuntime {
                             "string",
                             "Directory to search (default: workspace root)",
                         ),
+                        (
+                            "context_lines",
+                            "integer",
+                            "Lines of context to include around each match",
+                        ),
                         ("max_results", "integer", "Match cap"),
                     ],
                 ),
@@ -702,7 +707,15 @@ impl ToolRuntime {
             content.push_str(output.stderr.trim_end());
         }
 
-        let mut metadata = serde_json::to_value(output).expect("shell output must serialize");
+        // stdout/stderr already travel in `content`; repeating them here
+        // would double the tokens of every shell result the model reads.
+        let mut metadata = json!({
+            "exit_code": output.exit_code,
+            "program": output.program,
+            "stdout_truncated": output.stdout_truncated,
+            "stderr_truncated": output.stderr_truncated,
+            "max_output_bytes": output.max_output_bytes,
+        });
         let notes: Vec<String> = repair
             .note
             .iter()
@@ -795,18 +808,46 @@ impl ToolRuntime {
             optional_usize_arg(&call.arguments, &["max_results", "limit"]).unwrap_or(200);
         let max_file_bytes = optional_u64_arg(&call.arguments, &["max_file_bytes", "max_bytes"])
             .unwrap_or(1024 * 1024);
-        let result = FileTool::new(&self.workspace).search_text(
+        let context_lines =
+            optional_usize_arg(&call.arguments, &["context_lines", "context"]).unwrap_or(0);
+        let result = FileTool::new(&self.workspace).search_text_with_context(
             &path,
             &query,
             max_results,
             max_file_bytes,
+            context_lines,
         )?;
-        let content = result
-            .matches
-            .iter()
-            .map(|entry| format!("{}:{}:{}", entry.path, entry.line_number, entry.line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // An empty string reads as "did the search even run?" — say what
+        // happened instead (bench run5: the model met bare emptiness 8
+        // times while probing patterns).
+        let content = if result.matches.is_empty() {
+            format!(
+                "no matches for '{query}' (searched {} files)",
+                result.scanned_files
+            )
+        } else {
+            result
+                .matches
+                .iter()
+                .map(|entry| {
+                    // grep -n -C rendering: context lines use dashes, the
+                    // matching line uses colons.
+                    let mut block = String::new();
+                    for (number, text) in &entry.before {
+                        block.push_str(&format!("{}-{}-{}\n", entry.path, number, text));
+                    }
+                    block.push_str(&format!(
+                        "{}:{}:{}",
+                        entry.path, entry.line_number, entry.line
+                    ));
+                    for (number, text) in &entry.after {
+                        block.push_str(&format!("\n{}-{}-{}", entry.path, number, text));
+                    }
+                    block
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
 
         Ok(ToolCallResult {
             id: call.id,

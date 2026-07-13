@@ -556,3 +556,18 @@ paste support for text/images.
   '&&' natively); cmd gets a chcp 65001 UTF-8 prologue. Detection is one
   probe per process, cached, so the provider cache prefix stays stable.
   Probe data: scratchpad probe2/probe_shell.json.
+- 2026-07-13 (measured parameter schemas + bounded timeout): ToolSpec
+  gains `parameters` (JSON Schema) and all 13 advertised tools now declare
+  schemas built from the argument names the model sends unprompted in
+  combat probes (file_path, content, old_string/new_string, pattern,
+  source/destination) - advertising the dialect it already speaks, not
+  inventing one. The wire bodies (OpenAI chat, OpenAI Responses, Anthropic
+  Messages) carry the declared schema instead of the accept-anything stub;
+  additionalProperties stays true so the forgiving alias layer keeps
+  working. `timeout` is pinned to SECONDS in the schema; the timeout probe
+  (probe_timeout.json, 18 samples) showed the prior is split by context -
+  seconds 11/18 overall but milliseconds 5/6 in build phrasings - so as
+  the bounded-shell backstop any per-call timeout above 3600s clamps to
+  one hour with a memo teaching the unit ("120000 looked like
+  milliseconds"). Verified live: {"timeout": 120000} -> ok, repaired,
+  note names the clamp and the unit.

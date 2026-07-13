@@ -9,6 +9,10 @@ Linux/docker) and tells the model which dialect it is writing for — in the
 system prompt and in the tool description. Environments without any shell
 (distroless containers) simply don't advertise the shell tool.
 
+Every tool declares a JSON Schema for its arguments, using the argument
+names measured from model priors (`file_path`, `old_string`/`new_string`,
+`pattern`, …). Shell `timeout` is in seconds and is capped at 3600.
+
 ## Install and launch
 
 Install the short launcher into Cargo's bin directory:

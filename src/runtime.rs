@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::platform::ShellProfile;
 use crate::request::ToolSpec;
 use crate::tools::attachments::{AttachmentError, AttachmentTool};
 use crate::tools::files::{FileTool, ToolError, WriteMode};
@@ -116,6 +117,7 @@ pub trait ToolExecutor: Clone + Send + 'static {
 pub struct ToolRuntime {
     workspace: PathBuf,
     shell_timeout: Duration,
+    shell_profile: Option<ShellProfile>,
 }
 
 impl ToolRuntime {
@@ -123,6 +125,7 @@ impl ToolRuntime {
         Self {
             workspace: workspace.into(),
             shell_timeout: Duration::from_secs(30),
+            shell_profile: Some(ShellProfile::native()),
         }
     }
 
@@ -131,14 +134,34 @@ impl ToolRuntime {
         self
     }
 
+    /// Use the shell that detection actually found (or `None` when the
+    /// environment has no shell at all). Callers that skip this keep the
+    /// compile-time native default.
+    pub fn with_shell_profile(mut self, profile: Option<ShellProfile>) -> Self {
+        self.shell_profile = profile;
+        self
+    }
+
     /// Tools as advertised to the model: wire names follow the model's own
     /// priors (see [`wire_tool_name`]); the runtime keeps dotted canonical
-    /// names internally.
+    /// names internally. Assumes the compile-time native shell; prefer
+    /// [`ToolRuntime::tool_specs_with_shell`] with the detected profile.
     pub fn tool_specs() -> Vec<ToolSpec> {
+        Self::tool_specs_with_shell(Some(&ShellProfile::native()))
+    }
+
+    /// Tool specs with the shell tool described by (and gated on) the shell
+    /// that detection actually found. Shell probe 2026-07-13: the model
+    /// writes whichever dialect it is told about near-perfectly, and falls
+    /// back to cmd idioms when the interpreter is left unnamed — so the
+    /// dialect line rides on the tool description itself. `None` (no shell
+    /// in the environment) drops the tool instead of advertising a broken
+    /// capability.
+    pub fn tool_specs_with_shell(shell: Option<&ShellProfile>) -> Vec<ToolSpec> {
         let spec = |canonical: &str, description: &str| {
             ToolSpec::new(wire_tool_name(canonical), description)
         };
-        vec![
+        let mut specs = vec![
             spec(
                 "file.read",
                 "Read bounded UTF-8 text from a workspace-relative path.",
@@ -187,11 +210,17 @@ impl ToolRuntime {
                 "attachment.read",
                 "Read bounded clipboard/Codex attachment metadata and text content.",
             ),
-            spec(
-                "shell.exec",
-                "Run a native shell command in the workspace with timeout and bounded stdout/stderr.",
-            ),
-        ]
+        ];
+        if let Some(profile) = shell {
+            specs.push(ToolSpec::new(
+                wire_tool_name("shell.exec"),
+                format!(
+                    "Run a command via {} in the workspace, with timeout and bounded stdout/stderr.",
+                    profile.dialect_note()
+                ),
+            ));
+        }
+        specs
     }
 
     pub fn execute(&self, call: ToolCall) -> Result<ToolCallResult, RuntimeError> {
@@ -534,12 +563,22 @@ impl ToolRuntime {
                 .map(|seconds| Duration::from_secs(seconds.max(1)))
             })
             .unwrap_or(self.shell_timeout);
-        let is_powershell = crate::platform::ShellProfile::native()
-            .program()
-            .to_ascii_lowercase()
-            .contains("powershell");
+        let Some(profile) = self.shell_profile.clone() else {
+            return Ok(ToolCallResult {
+                id: call.id,
+                tool_name: "shell.exec".to_string(),
+                ok: false,
+                repaired: repaired_name,
+                content: "no shell is available in this environment; use the file tools instead"
+                    .to_string(),
+                metadata: json!({"shell": null}),
+            });
+        };
+        // `&&` chains and stale `cd` prefixes only break Windows PowerShell
+        // 5.1; pwsh 7 and the unix shells take them as-is.
+        let is_powershell = profile.kind() == crate::platform::ShellKind::WindowsPowerShell;
         let repair = repair_shell_command(&command, &self.workspace, is_powershell);
-        let output = ShellTool::native(&self.workspace, shell_timeout)
+        let output = ShellTool::with_profile(&self.workspace, shell_timeout, profile)
             .with_output_limit(max_output_bytes)
             .run(&repair.command)?;
 

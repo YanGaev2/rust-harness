@@ -157,6 +157,30 @@ fn replace_text_updates_first_literal_match_and_reports_lengths() {
 }
 
 #[test]
+fn replace_text_normalizes_line_endings_between_model_and_file() {
+    // Bench run6 (codefix_slug): the file on disk uses CRLF, the model
+    // sends old_string with LF — the text it asked to replace IS in the
+    // file, just with different line-ending bytes. Rejecting it is our
+    // strictness, not a model mistake.
+    let root = tempfile::tempdir().unwrap();
+    let tool = FileTool::new(root.path());
+    std::fs::write(root.path().join("win.py"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+    let result = tool
+        .replace_text("win.py", "alpha\nbeta", "first\nsecond", Some(1))
+        .unwrap();
+
+    assert_eq!(result.replacements, 1);
+    assert!(result.normalized_line_endings);
+    // The replacement is re-encoded to the file's CRLF so the file stays
+    // consistent instead of ending up with mixed endings.
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("win.py")).unwrap(),
+        "first\r\nsecond\r\ngamma\r\n"
+    );
+}
+
+#[test]
 fn replace_text_returns_error_without_writing_when_match_is_missing() {
     let root = tempfile::tempdir().unwrap();
     let tool = FileTool::new(root.path());

@@ -170,6 +170,64 @@ fn search_returns_context_lines_around_matches() {
 }
 
 #[test]
+fn edit_file_repairs_lf_old_string_against_crlf_file() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("app.py"), "one\r\ntwo\r\nthree\r\n").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "crlf",
+            "edit_file",
+            json!({"file_path": "app.py", "old_string": "one\ntwo", "new_string": "uno\ndos"}),
+        ))
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        result.repaired,
+        "normalization is a repair the model must see"
+    );
+    let note = result.metadata["repair_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("line endings"),
+        "note must teach the cause: {note}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("app.py")).unwrap(),
+        "uno\r\ndos\r\nthree\r\n"
+    );
+}
+
+#[test]
+fn silent_shell_success_reports_no_output_instead_of_emptiness() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Bench run6 (chain_calc): Set-Content produces no stdout; a bare ""
+    // makes the model re-verify with extra calls.
+    #[cfg(windows)]
+    let quiet = "$null = 1";
+    #[cfg(not(windows))]
+    let quiet = "true";
+    let result = runtime
+        .execute(ToolCall::new(
+            "quiet",
+            "run_shell_command",
+            json!({"command": quiet}),
+        ))
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(
+        result.content.contains("no output"),
+        "empty success must say so: {:?}",
+        result.content
+    );
+    assert!(result.content.contains('0'), "{:?}", result.content);
+}
+
+#[test]
 fn shell_metadata_does_not_duplicate_captured_output() {
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new(root.path());

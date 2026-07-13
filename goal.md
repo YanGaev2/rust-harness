@@ -541,3 +541,18 @@ paste support for text/images.
   live) and `show_hidden`; dot entries (.git/.claude) are hidden by
   default. Verified live: the failing trace scenario now passes on the
   first call with zero failed rounds.
+- 2026-07-13 (runtime shell detection): the shell probe showed the model
+  writes PowerShell 20/20 and cmd 18/20 when it KNOWS the interpreter, but
+  mixes cmd idioms into PowerShell when the dialect is unspecified (8/20
+  commands failed or silently lied). The compile-time shell assumption is
+  replaced by ShellProfile::detect(): pwsh 7 -> Windows PowerShell 5.1 ->
+  cmd.exe on Windows (a legacy 2.0 or broken powershell.exe falls back to
+  cmd), bash -> POSIX sh on unix (alpine/busybox images), and a shell-less
+  environment (distroless) drops run_shell_command from the advertised
+  tools entirely. One dialect line - dialect_note() - now rides on the
+  system prompt AND the tool description, and execution uses the same
+  detected profile, so what we say and what we run always agree. The
+  '&&' -> ';' repair applies only to Windows PowerShell (pwsh 7 supports
+  '&&' natively); cmd gets a chcp 65001 UTF-8 prologue. Detection is one
+  probe per process, cached, so the provider cache prefix stays stable.
+  Probe data: scratchpad probe2/probe_shell.json.

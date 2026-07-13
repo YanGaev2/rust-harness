@@ -3,6 +3,12 @@
 Lightweight Rust prototype for an LLM harness CLI focused on cache-friendly calls,
 provider onboarding, native shell execution profiles, and forgiving local tools.
 
+The shell tool detects the interpreter that actually exists on the machine
+(pwsh 7 → Windows PowerShell 5.1 → cmd.exe on Windows; bash → POSIX sh on
+Linux/docker) and tells the model which dialect it is writing for — in the
+system prompt and in the tool description. Environments without any shell
+(distroless containers) simply don't advertise the shell tool.
+
 ## Install and launch
 
 Install the short launcher into Cargo's bin directory:

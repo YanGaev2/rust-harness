@@ -457,21 +457,29 @@ impl ToolRuntime {
             Some(max_replacements),
         )?;
 
+        let mut metadata = json!({
+            "path": result.path,
+            "replacements": result.replacements,
+            "previous_len": result.previous_len,
+            "new_len": result.new_len,
+        });
+        if result.normalized_line_endings {
+            metadata["repair_note"] = serde_json::Value::String(
+                "old_string matched after normalizing line endings (the file uses different \
+                 line endings than the provided text)"
+                    .to_string(),
+            );
+        }
         Ok(ToolCallResult {
             id: call.id,
             tool_name: "file.replace".to_string(),
             ok: true,
-            repaired: repaired_name,
+            repaired: repaired_name || result.normalized_line_endings,
             content: format!(
                 "replaced {} occurrence(s) in {}",
                 result.replacements, result.path
             ),
-            metadata: json!({
-                "path": result.path,
-                "replacements": result.replacements,
-                "previous_len": result.previous_len,
-                "new_len": result.new_len,
-            }),
+            metadata,
         })
     }
 
@@ -705,6 +713,14 @@ impl ToolRuntime {
                 content.push('\n');
             }
             content.push_str(output.stderr.trim_end());
+        }
+        // Quiet commands (Set-Content, mkdir, …) succeed with zero output;
+        // a bare "" makes the model re-verify with extra calls (bench run6).
+        if content.trim().is_empty() {
+            content = match output.exit_code {
+                Some(code) => format!("(command exited with code {code}; no output)"),
+                None => "(command produced no output)".to_string(),
+            };
         }
 
         // stdout/stderr already travel in `content`; repeating them here

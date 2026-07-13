@@ -61,6 +61,9 @@ pub struct ReplaceResult {
     pub replacements: usize,
     pub previous_len: usize,
     pub new_len: usize,
+    /// The match only succeeded after re-encoding line endings to the
+    /// file's convention (LF-thinking model vs CRLF file, or vice versa).
+    pub normalized_line_endings: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,7 +322,34 @@ impl FileTool {
         let previous = fs::read_to_string(&target).map_err(ToolError::Io)?;
         let previous_len = previous.len();
         let limit = max_replacements.unwrap_or(usize::MAX).max(1);
-        let (next, replacements) = replace_limited(&previous, old_text, new_text, limit);
+        let (mut next, mut replacements) = replace_limited(&previous, old_text, new_text, limit);
+        let mut normalized_line_endings = false;
+
+        // Models think in LF while Windows files carry CRLF (and vice
+        // versa): the text they ask to replace IS in the file, just with
+        // different line-ending bytes. Retry with the search and the
+        // replacement re-encoded to the file's own convention so the file
+        // stays consistent.
+        if replacements == 0 && old_text.contains('\n') {
+            let to_file_endings = |text: &str| {
+                let unix = text.replace("\r\n", "\n");
+                if previous.contains("\r\n") {
+                    unix.replace('\n', "\r\n")
+                } else {
+                    unix
+                }
+            };
+            let old_normalized = to_file_endings(old_text);
+            if old_normalized != old_text {
+                (next, replacements) = replace_limited(
+                    &previous,
+                    &old_normalized,
+                    &to_file_endings(new_text),
+                    limit,
+                );
+                normalized_line_endings = replacements > 0;
+            }
+        }
 
         if replacements == 0 {
             return Err(ToolError::TextNotFound { path });
@@ -331,6 +361,7 @@ impl FileTool {
             replacements,
             previous_len,
             new_len: next.len(),
+            normalized_line_endings,
         })
     }
 

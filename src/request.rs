@@ -102,6 +102,12 @@ impl MessageToolCall {
 pub struct ToolSpec {
     name: String,
     description: String,
+    /// JSON Schema for the arguments, built from the argument names the
+    /// model was measured to send on its own (probe data) — advertising a
+    /// dialect it already speaks, not inventing one. `None` falls back to
+    /// an accept-anything stub on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parameters: Option<Value>,
 }
 
 impl ToolSpec {
@@ -109,7 +115,13 @@ impl ToolSpec {
         Self {
             name: name.into(),
             description: description.into(),
+            parameters: None,
         }
+    }
+
+    pub fn with_parameters(mut self, parameters: Value) -> Self {
+        self.parameters = Some(parameters);
+        self
     }
 
     pub fn name(&self) -> &str {
@@ -118,6 +130,10 @@ impl ToolSpec {
 
     pub fn description(&self) -> &str {
         &self.description
+    }
+
+    pub fn parameters(&self) -> Option<&Value> {
+        self.parameters.as_ref()
     }
 }
 

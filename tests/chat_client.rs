@@ -12,6 +12,59 @@ use harness_cli::request::{CacheMode, ChatMessage, RequestEnvelope, ToolSpec};
 use serde_json::Value;
 
 #[test]
+fn openai_chat_body_carries_declared_tool_parameter_schemas() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut stream);
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let json: Value = serde_json::from_str(body).unwrap();
+
+        // The declared schema replaces the accept-anything stub.
+        let parameters = &json["tools"][0]["function"]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(
+            parameters["properties"]["timeout"]["description"],
+            "Timeout in seconds"
+        );
+        assert_eq!(parameters["required"][0], "command");
+
+        let response_body = r#"{"choices": [{"message": {"role": "assistant", "content": "ok"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let provider = ProviderConfig::new("deepseek", format!("http://{addr}/v1"), "sk-test");
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "The command line to run"},
+            "timeout": {"type": "integer", "description": "Timeout in seconds"},
+        },
+        "required": ["command"],
+    });
+    let envelope = RequestEnvelope::new("deepseek", "deepseek-v4-pro")
+        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
+        .with_tools(vec![
+            ToolSpec::new("run_shell_command", "Run a command").with_parameters(schema),
+        ])
+        .with_messages(vec![ChatMessage::user("count files")]);
+
+    let response = OpenAiCompatibleChatClient::new(Duration::from_secs(2))
+        .send(&provider, &envelope)
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(response.content.as_deref(), Some("ok"));
+}
+
+#[test]
 fn chat_client_posts_cache_aware_request_and_parses_tool_calls() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

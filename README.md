@@ -13,6 +13,12 @@ Every tool declares a JSON Schema for its arguments, using the argument
 names measured from model priors (`file_path`, `old_string`/`new_string`,
 `pattern`, …). Shell `timeout` is in seconds and is capped at 3600.
 
+Tool results are token-lean and honest: empty searches say "no matches"
+instead of an empty string, shell metadata never repeats stdout/stderr,
+`grep_search` takes `context_lines` (grep `-C` style), and `read_file`
+decodes UTF-16 files (PowerShell `>` redirects) instead of silently
+returning empty content.
+
 ## Install and launch
 
 Install the short launcher into Cargo's bin directory:

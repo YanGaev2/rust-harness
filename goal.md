@@ -571,3 +571,19 @@ paste support for text/images.
   one hour with a memo teaching the unit ("120000 looked like
   milliseconds"). Verified live: {"timeout": 120000} -> ok, repaired,
   note names the clamp and the unit.
+- 2026-07-13 (trace-driven result optimizations, bench run5): run5 after
+  schemas+shell-detection scored 10/10 (one scorer false-FAIL on UTF-16)
+  with calls 101->55, rounds 38->28, failed calls 3->0, 114s->82s; the
+  schema effect is visible in niah_deep (42->7 calls: literal-substring
+  wording in the grep schema stopped the regex-alternation-then-read-
+  everything spiral). Four fixes from reading the traces byte-by-byte:
+  (1) empty grep results say "no matches for X (searched N files)" - the
+  model met bare emptiness 8 times; (2) shell metadata no longer repeats
+  stdout/stderr already in content (every shell result was double-token);
+  (3) grep_search takes context_lines (measured prior) with grep -n -C
+  rendering - niah_decoy had read 18 whole files (~30KB) just to see
+  around matches; (4) read_file sniffs UTF-16 LE/BE + UTF-8 BOMs:
+  PowerShell > redirects write UTF-16 whose longest valid UTF-8 prefix
+  is EMPTY, so reads returned ok=true with empty content (silent lie;
+  the model distrusted it and re-checked via Get-Content, wasting 2
+  calls). All verified live with the installed binary.

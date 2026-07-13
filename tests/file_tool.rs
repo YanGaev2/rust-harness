@@ -37,6 +37,32 @@ fn write_text_rejects_paths_outside_workspace() {
 }
 
 #[test]
+fn read_text_bounded_decodes_utf16_files_from_powershell_redirects() {
+    // PowerShell 5.1 `>` writes UTF-16 LE with a BOM. Bench run5: reading
+    // such a file returned ok with EMPTY content (the longest valid UTF-8
+    // prefix of "\xff\xfe..." is zero bytes) — the silent-lie failure mode.
+    let root = tempfile::tempdir().unwrap();
+    let tool = FileTool::new(root.path());
+
+    let mut le = vec![0xff, 0xfe];
+    le.extend("9926\r\n".encode_utf16().flat_map(u16::to_le_bytes));
+    std::fs::write(root.path().join("result.txt"), &le).unwrap();
+    let result = tool.read_text_bounded("result.txt", 4096).unwrap();
+    assert!(result.content.contains("9926"), "{:?}", result.content);
+
+    let mut be = vec![0xfe, 0xff];
+    be.extend("beacon".encode_utf16().flat_map(u16::to_be_bytes));
+    std::fs::write(root.path().join("be.txt"), &be).unwrap();
+    let result = tool.read_text_bounded("be.txt", 4096).unwrap();
+    assert!(result.content.contains("beacon"), "{:?}", result.content);
+
+    // A UTF-8 BOM is stripped rather than leaked into the content.
+    std::fs::write(root.path().join("sig.txt"), b"\xef\xbb\xbfplain").unwrap();
+    let result = tool.read_text_bounded("sig.txt", 4096).unwrap();
+    assert_eq!(result.content, "plain");
+}
+
+#[test]
 fn read_text_bounded_truncates_large_file_and_reports_metadata() {
     let root = tempfile::tempdir().unwrap();
     let tool = FileTool::new(root.path());

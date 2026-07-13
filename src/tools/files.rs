@@ -95,6 +95,10 @@ pub struct FileSearchMatch {
     pub path: String,
     pub line_number: usize,
     pub line: String,
+    /// Neighbouring lines (1-based number, text) when the caller asked for
+    /// grep `-C` style context; empty otherwise.
+    pub before: Vec<(usize, String)>,
+    pub after: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,11 +196,25 @@ impl FileTool {
             .read_to_end(&mut bytes)
             .map_err(ToolError::Io)?;
 
-        let end = utf8_prefix_len(&bytes, max_bytes.min(bytes.len()));
-        let content = std::str::from_utf8(&bytes[..end])
-            .map_err(|_| ToolError::InvalidUtf8 { path: path.clone() })?
-            .to_string();
-        let bytes_read = content.len();
+        // PowerShell `>` redirects write UTF-16 with a BOM; without sniffing
+        // the longest valid UTF-8 prefix of such bytes is EMPTY and the model
+        // receives ok + "" — a silent lie (seen live in bench run5).
+        let (content, bytes_read) = if bytes.starts_with(&[0xff, 0xfe]) {
+            (decode_utf16(&bytes[2..], u16::from_le_bytes), bytes.len())
+        } else if bytes.starts_with(&[0xfe, 0xff]) {
+            (decode_utf16(&bytes[2..], u16::from_be_bytes), bytes.len())
+        } else {
+            let start = if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+                3
+            } else {
+                0
+            };
+            let end = start + utf8_prefix_len(&bytes[start..], max_bytes.min(bytes.len() - start));
+            let content = std::str::from_utf8(&bytes[start..end])
+                .map_err(|_| ToolError::InvalidUtf8 { path: path.clone() })?
+                .to_string();
+            (content, end)
+        };
 
         Ok(ReadResult {
             path,
@@ -408,6 +426,20 @@ impl FileTool {
         max_results: usize,
         max_file_bytes: u64,
     ) -> Result<FileSearchResult, ToolError> {
+        self.search_text_with_context(requested_path, query, max_results, max_file_bytes, 0)
+    }
+
+    /// Like [`FileTool::search_text`], with `context_lines` neighbouring
+    /// lines captured around each match (grep `-C` style) so callers do not
+    /// have to read whole files just to see what surrounds a hit.
+    pub fn search_text_with_context(
+        &self,
+        requested_path: &str,
+        query: &str,
+        max_results: usize,
+        max_file_bytes: u64,
+        context_lines: usize,
+    ) -> Result<FileSearchResult, ToolError> {
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
         let target = resolve_existing_workspace_path_or_root(&root, requested_path)?;
         let mut files = Vec::new();
@@ -437,12 +469,20 @@ impl FileTool {
             };
             scanned_files += 1;
             let relative = workspace_relative_display(&root, &file)?;
-            for (index, line) in content.lines().enumerate() {
+            let lines: Vec<&str> = content.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
                 if line.contains(query) {
+                    let window = |range: std::ops::Range<usize>| {
+                        range
+                            .filter_map(|i| lines.get(i).map(|text| (i + 1, text.to_string())))
+                            .collect::<Vec<_>>()
+                    };
                     matches.push(FileSearchMatch {
                         path: relative.clone(),
                         line_number: index + 1,
                         line: line.to_string(),
+                        before: window(index.saturating_sub(context_lines)..index),
+                        after: window(index + 1..index + 1 + context_lines),
                     });
                     if matches.len() >= limit {
                         truncated = true;
@@ -745,6 +785,17 @@ fn replace_limited(
 
     output.push_str(remaining);
     (output, replacements)
+}
+
+/// Decode UTF-16 payload bytes (after the BOM) with the given byte order;
+/// a trailing odd byte from a bounded read is dropped, invalid pairs are
+/// replaced rather than failing.
+fn decode_utf16(bytes: &[u8], to_u16: fn([u8; 2]) -> u16) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| to_u16([pair[0], pair[1]]))
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 fn utf8_prefix_len(bytes: &[u8], max_len: usize) -> usize {

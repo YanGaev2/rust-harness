@@ -49,6 +49,54 @@ fn ok_result(id: &str, tool_name: &str, content: &str) -> ToolBatchResult {
     }
 }
 
+#[test]
+fn cost_command_reports_session_tokens_and_dated_estimate() {
+    let mut app = app(); // deepseek/deepseek-v4-pro — a priced preset
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::UsageUpdated(harness_cli::agent::UsageTotals {
+        requests: 2,
+        prompt_tokens: 1_000_000,
+        cached_tokens: 800_000,
+        completion_tokens: 50_000,
+    }));
+    app.set_busy(false);
+
+    let action = submit_message(&mut app, "/cost");
+    assert_eq!(action, ChatAction::Continue);
+
+    let (lines, _) = app.peek_scrollback(120);
+    let text = lines_text(&lines);
+    assert!(text.contains("1000000"), "prompt tokens: {text}");
+    assert!(text.contains("800000"), "cached tokens: {text}");
+    assert!(text.contains("50000"), "completion tokens: {text}");
+    // 200k fresh * 0.435 + 800k cached * 0.003625 + 50k out * 0.87 (per 1M)
+    // = 0.087 + 0.0029 + 0.0435 ≈ $0.1334
+    assert!(text.contains("$0.1334"), "estimate: {text}");
+    assert!(text.contains("2026-07-13"), "price date: {text}");
+}
+
+#[test]
+fn cost_command_without_pricing_still_reports_tokens() {
+    let mut app = ChatApp::new("local/custom-model", "C:/work/project");
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::UsageUpdated(harness_cli::agent::UsageTotals {
+        requests: 1,
+        prompt_tokens: 500,
+        cached_tokens: 0,
+        completion_tokens: 20,
+    }));
+    app.set_busy(false);
+
+    submit_message(&mut app, "/cost");
+    let (lines, _) = app.peek_scrollback(120);
+    let text = lines_text(&lines);
+    assert!(text.contains("500"), "{text}");
+    assert!(
+        text.contains("no built-in pricing"),
+        "must be honest about the missing price list: {text}"
+    );
+}
+
 // --- input handling ---
 
 #[test]

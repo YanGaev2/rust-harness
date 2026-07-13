@@ -735,9 +735,17 @@ where
     }
 
     if provider.models().is_empty() {
-        return Err(CliError::Usage(
-            "provider add requires --model MODEL or --add-all".to_string(),
-        ));
+        // Preset flow: default to the first (bench-verified) model.
+        let preset_model = BuiltinProvider::from_name(provider.name())
+            .and_then(|builtin| builtin.profile().model_hints.first().copied());
+        match preset_model {
+            Some(model) => provider = provider.with_model(model),
+            None => {
+                return Err(CliError::Usage(
+                    "provider add requires --model MODEL or --add-all".to_string(),
+                ));
+            }
+        }
     }
 
     save_provider(provider, config_path, output)
@@ -986,7 +994,15 @@ impl ProviderFlags {
 
     fn provider(&self) -> Result<ProviderConfig, CliError> {
         let name = required_flag(self.name.as_deref(), "--name")?;
-        let url = required_flag(self.url.as_deref(), "--url")?;
+        // Bench-verified presets carry their endpoint; everyone else must
+        // state --url explicitly rather than trust an untested default.
+        let preset_url = BuiltinProvider::from_name(&name)
+            .and_then(|builtin| builtin.profile().base_url)
+            .map(str::to_string);
+        let url = match self.url.as_deref() {
+            Some(url) => url.to_string(),
+            None => preset_url.ok_or_else(|| CliError::Usage("missing --url".to_string()))?,
+        };
         let key = self.key.clone().unwrap_or_default();
         let is_builtin = BuiltinProvider::from_name(&name).is_some();
         if key.is_empty() && self.key_env.as_deref().is_none_or(str::is_empty) && !is_builtin {

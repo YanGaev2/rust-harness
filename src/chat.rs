@@ -125,6 +125,11 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
         description: "start a fresh chat session",
     },
     ChatCommand {
+        name: "/cost",
+        usage: "/cost",
+        description: "show session token usage and estimated cost",
+    },
+    ChatCommand {
         name: "/help",
         usage: "/help",
         description: "show the command palette",
@@ -194,6 +199,12 @@ pub struct ChatApp {
     /// When the current run started, for the elapsed time next to `Working…`.
     busy_since: Option<Instant>,
     spinner_frame: usize,
+    /// Cumulative token usage across the whole REPL session (all runs),
+    /// updated from `AgentEvent::UsageUpdated`; shown by `/cost`.
+    session_usage: crate::agent::UsageTotals,
+    /// Usage at the start of the current run, so per-run deltas fold into
+    /// the session total without double-counting.
+    run_usage_base: crate::agent::UsageTotals,
 }
 
 impl ChatApp {
@@ -214,6 +225,8 @@ impl ChatApp {
             busy: false,
             busy_since: None,
             spinner_frame: 0,
+            session_usage: crate::agent::UsageTotals::default(),
+            run_usage_base: crate::agent::UsageTotals::default(),
         }
     }
 
@@ -224,8 +237,18 @@ impl ChatApp {
 
     /// Mark the agent as running (or finished) so the view can show a spinner.
     pub fn set_busy(&mut self, busy: bool) {
+        if busy {
+            // UsageUpdated events carry per-run cumulative totals; remember
+            // where this run starts so the session counter never double-counts.
+            self.run_usage_base = self.session_usage;
+        }
         self.busy = busy;
         self.busy_since = busy.then(Instant::now);
+    }
+
+    /// Session-wide token totals (all runs so far).
+    pub fn session_usage(&self) -> crate::agent::UsageTotals {
+        self.session_usage
     }
 
     pub fn busy(&self) -> bool {
@@ -477,6 +500,41 @@ impl ChatApp {
                 self.push_system_line(format!("active provider: {label}"));
                 ChatAction::Continue
             }
+            Some("cost") => {
+                let usage = self.session_usage;
+                self.push_system_line(format!(
+                    "session usage: {} request(s), prompt {} tok ({} cached), completion {} tok",
+                    usage.requests,
+                    usage.prompt_tokens,
+                    usage.cached_tokens,
+                    usage.completion_tokens
+                ));
+                // The label is "provider/model"; the model half may itself
+                // contain slashes, so split at the first one only.
+                let estimate = self
+                    .provider_label
+                    .split_once('/')
+                    .and_then(|(provider, model)| {
+                        crate::providers::builtin_pricing(provider, model)
+                    });
+                match estimate {
+                    Some(pricing) => {
+                        let cost = pricing.estimate_usd(
+                            usage.prompt_tokens,
+                            usage.cached_tokens,
+                            usage.completion_tokens,
+                        );
+                        self.push_system_line(format!(
+                            "estimated cost: ${cost:.4} (price list of {}; actual billing may differ)",
+                            pricing.as_of
+                        ));
+                    }
+                    None => {
+                        self.push_system_line("estimated cost: no built-in pricing for this model");
+                    }
+                }
+                ChatAction::Continue
+            }
             Some("model") => {
                 let provider = parts.next();
                 let model = parts.next();
@@ -580,6 +638,9 @@ impl ChatApp {
                     self.streaming_thinking = true;
                 }
                 self.streaming_assistant = false;
+            }
+            AgentEvent::UsageUpdated(totals) => {
+                self.session_usage = self.run_usage_base.combined(*totals);
             }
             AgentEvent::ToolRoundStarted { round, tool_calls } => {
                 // A single-call round would just duplicate its tool card; only

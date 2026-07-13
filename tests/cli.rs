@@ -280,6 +280,66 @@ fn provider_models_command_prints_add_all_and_sorted_models() {
 }
 
 #[test]
+fn provider_add_uses_verified_preset_without_url_and_model() {
+    // The preset flow: pick a bench-verified provider, paste only the key.
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("providers.json");
+    let mut output = Vec::new();
+
+    for (name, expected_url, expected_model) in [
+        ("deepseek", "https://api.deepseek.com/v1", "deepseek-v4-pro"),
+        ("glm", "https://api.z.ai/api/paas/v4", "glm-5.2"),
+    ] {
+        cli::run(
+            vec![
+                "harness-cli".to_string(),
+                "provider".to_string(),
+                "add".to_string(),
+                "--config".to_string(),
+                config_path.display().to_string(),
+                "--name".to_string(),
+                name.to_string(),
+                "--key-env".to_string(),
+                "TEST_KEY_ENV".to_string(),
+            ],
+            &mut output,
+        )
+        .unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        let provider = &saved["providers"][name];
+        assert_eq!(provider["base_url"], expected_url, "{name}");
+        assert_eq!(provider["models"][0], expected_model, "{name}");
+    }
+}
+
+#[test]
+fn provider_add_still_requires_url_for_unverified_families() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("providers.json");
+    let mut output = Vec::new();
+
+    let err = cli::run(
+        vec![
+            "harness-cli".to_string(),
+            "provider".to_string(),
+            "add".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--name".to_string(),
+            "kimi".to_string(),
+            "--key-env".to_string(),
+            "KIMI_API_KEY".to_string(),
+        ],
+        &mut output,
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("--url"), "{err}");
+}
+
+#[test]
 fn provider_add_command_can_save_all_discovered_models() {
     let base_url = spawn_model_server(r#"{"data":[{"id":"qwen3-coder"},{"id":"glm-4.5"}]}"#);
     let root = tempfile::tempdir().unwrap();

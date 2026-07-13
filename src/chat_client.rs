@@ -776,10 +776,7 @@ fn openai_chat_body(provider: &ProviderConfig, envelope: &RequestEnvelope) -> Va
                 "function": {
                     "name": api_tool_name(tool.name()),
                     "description": tool.description(),
-                    "parameters": {
-                        "type": "object",
-                        "additionalProperties": true,
-                    },
+                    "parameters": tool_parameters(tool),
                 },
             })
         })
@@ -833,10 +830,7 @@ fn openai_responses_body(envelope: &RequestEnvelope) -> Value {
                             "type": "function",
                             "name": api_tool_name(tool.name()),
                             "description": tool.description(),
-                            "parameters": {
-                                "type": "object",
-                                "additionalProperties": true,
-                            },
+                            "parameters": tool_parameters(tool),
                         })
                     })
                     .collect(),
@@ -967,10 +961,7 @@ fn anthropic_messages_body(provider: &ProviderConfig, envelope: &RequestEnvelope
                         json!({
                             "name": api_tool_name(tool.name()),
                             "description": tool.description(),
-                            "input_schema": {
-                                "type": "object",
-                                "additionalProperties": true,
-                            },
+                            "input_schema": tool_parameters(tool),
                         })
                     })
                     .collect(),
@@ -1010,6 +1001,17 @@ fn anthropic_message_body(message: &ChatMessage) -> Value {
     json!({
         "role": message.role(),
         "content": message.content(),
+    })
+}
+
+/// The declared argument schema, or the accept-anything stub for specs
+/// that never set one (older call sites, tests).
+fn tool_parameters(tool: &crate::request::ToolSpec) -> Value {
+    tool.parameters().cloned().unwrap_or_else(|| {
+        json!({
+            "type": "object",
+            "additionalProperties": true,
+        })
     })
 }
 

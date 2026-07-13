@@ -158,67 +158,165 @@ impl ToolRuntime {
     /// in the environment) drops the tool instead of advertising a broken
     /// capability.
     pub fn tool_specs_with_shell(shell: Option<&ShellProfile>) -> Vec<ToolSpec> {
-        let spec = |canonical: &str, description: &str| {
-            ToolSpec::new(wire_tool_name(canonical), description)
+        // Argument names below are the ones the model sends unprompted
+        // (combat probes 2026-07-12/13: file_path, content, old_string/
+        // new_string, pattern, source/destination), not our internal canon —
+        // the executors accept both.
+        const PATH: (&str, &str, &str) = (
+            "file_path",
+            "string",
+            "Path relative to the workspace root (absolute paths inside the workspace are accepted)",
+        );
+        const MAX_BYTES: (&str, &str, &str) =
+            ("max_bytes", "integer", "Byte cap for the returned content");
+        let spec = |canonical: &str, description: &str, schema: Value| {
+            ToolSpec::new(wire_tool_name(canonical), description).with_parameters(schema)
         };
         let mut specs = vec![
             spec(
                 "file.read",
                 "Read bounded UTF-8 text from a workspace-relative path.",
+                tool_schema(&[PATH], &[MAX_BYTES]),
             ),
             spec(
                 "file.write",
                 "Write UTF-8 text to a workspace-relative path without requiring a prior read.",
+                tool_schema(&[PATH, ("content", "string", "Full text to write")], &[]),
             ),
             spec(
                 "file.append",
                 "Append UTF-8 text to a workspace-relative path without requiring a prior read.",
+                tool_schema(&[PATH, ("content", "string", "Text to append")], &[]),
             ),
             spec(
                 "file.hash",
                 "Compute a streaming BLAKE3 hash for a workspace file without reading it into context.",
+                tool_schema(&[PATH], &[]),
             ),
             spec(
                 "file.stat",
                 "Read file or directory metadata without loading file content.",
+                tool_schema(
+                    &[("path", "string", "Workspace-relative file or directory")],
+                    &[],
+                ),
             ),
             spec(
                 "file.tail",
                 "Read a bounded UTF-8 suffix from a workspace file for logs and large outputs.",
+                tool_schema(
+                    &[PATH],
+                    &[
+                        ("lines", "integer", "Keep only the last N lines"),
+                        MAX_BYTES,
+                    ],
+                ),
             ),
             spec(
                 "file.replace",
                 "Replace literal UTF-8 text in a workspace file without shelling out.",
+                tool_schema(
+                    &[
+                        PATH,
+                        ("old_string", "string", "Exact literal text to find"),
+                        ("new_string", "string", "Replacement text"),
+                    ],
+                    &[],
+                ),
             ),
             spec(
                 "file.list",
                 "List workspace files recursively with bounded result count.",
+                tool_schema(
+                    &[],
+                    &[
+                        (
+                            "path",
+                            "string",
+                            "Directory to list (default: workspace root)",
+                        ),
+                        ("depth", "integer", "Recursion depth; 1 = top level only"),
+                        (
+                            "show_hidden",
+                            "boolean",
+                            "Include dot-directories like .git (default false)",
+                        ),
+                        ("max_results", "integer", "Entry cap (default 200)"),
+                    ],
+                ),
             ),
             spec(
                 "file.search",
                 "Search UTF-8 workspace files for a text pattern with bounded result count.",
+                tool_schema(
+                    &[(
+                        "pattern",
+                        "string",
+                        "Literal text to search for (substring match, not regex)",
+                    )],
+                    &[
+                        (
+                            "path",
+                            "string",
+                            "Directory to search (default: workspace root)",
+                        ),
+                        ("max_results", "integer", "Match cap"),
+                    ],
+                ),
             ),
             spec(
                 "file.delete",
                 "Delete a workspace-relative file or directory without shelling out.",
+                tool_schema(
+                    &[("path", "string", "Workspace-relative file or directory")],
+                    &[],
+                ),
             ),
             spec(
                 "file.move",
                 "Move or rename a workspace-relative file or directory without shelling out.",
+                tool_schema(
+                    &[
+                        ("source", "string", "Existing workspace-relative path"),
+                        ("destination", "string", "New workspace-relative path"),
+                    ],
+                    &[(
+                        "overwrite",
+                        "boolean",
+                        "Replace the destination if it exists (default false)",
+                    )],
+                ),
             ),
             spec(
                 "attachment.read",
                 "Read bounded clipboard/Codex attachment metadata and text content.",
+                tool_schema(
+                    &[("path", "string", "Attachment name or path")],
+                    &[MAX_BYTES],
+                ),
             ),
         ];
         if let Some(profile) = shell {
-            specs.push(ToolSpec::new(
-                wire_tool_name("shell.exec"),
-                format!(
-                    "Run a command via {} in the workspace, with timeout and bounded stdout/stderr.",
-                    profile.dialect_note()
-                ),
-            ));
+            specs.push(
+                ToolSpec::new(
+                    wire_tool_name("shell.exec"),
+                    format!(
+                        "Run a command via {} in the workspace, with timeout and bounded stdout/stderr.",
+                        profile.dialect_note()
+                    ),
+                )
+                .with_parameters(tool_schema(
+                    &[("command", "string", "The command line to run")],
+                    &[
+                        ("timeout", "integer", "Timeout in seconds"),
+                        (
+                            "max_output_bytes",
+                            "integer",
+                            "Cap for captured stdout/stderr",
+                        ),
+                    ],
+                )),
+            );
         }
         specs
     }
@@ -563,6 +661,17 @@ impl ToolRuntime {
                 .map(|seconds| Duration::from_secs(seconds.max(1)))
             })
             .unwrap_or(self.shell_timeout);
+        // Shell calls must stay bounded. Timeout probe 2026-07-13: in build
+        // contexts the model sends milliseconds ("timeout": 120000), which
+        // read as seconds would hold the agent for 33 hours.
+        const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(3600);
+        let timeout_note = (shell_timeout > MAX_SHELL_TIMEOUT).then(|| {
+            format!(
+                "timeout clamped to 3600 seconds (the maximum); `timeout` is in seconds — {} looked like milliseconds",
+                shell_timeout.as_secs()
+            )
+        });
+        let shell_timeout = shell_timeout.min(MAX_SHELL_TIMEOUT);
         let Some(profile) = self.shell_profile.clone() else {
             return Ok(ToolCallResult {
                 id: call.id,
@@ -594,15 +703,23 @@ impl ToolRuntime {
         }
 
         let mut metadata = serde_json::to_value(output).expect("shell output must serialize");
-        if let Some(note) = &repair.note {
-            metadata["repair_note"] = serde_json::Value::String(note.clone());
+        let notes: Vec<String> = repair
+            .note
+            .iter()
+            .chain(timeout_note.iter())
+            .cloned()
+            .collect();
+        if !notes.is_empty() {
+            metadata["repair_note"] = serde_json::Value::String(notes.join("; "));
+        }
+        if repair.note.is_some() {
             metadata["original_command"] = serde_json::Value::String(command.clone());
         }
         Ok(ToolCallResult {
             id: call.id,
             tool_name: "shell.exec".to_string(),
             ok,
-            repaired: repaired_name || repair.note.is_some(),
+            repaired: repaired_name || !notes.is_empty(),
             content,
             metadata,
         })
@@ -1367,6 +1484,28 @@ fn batch_timeout_result(call: &ToolCall) -> ToolBatchResult {
         error: Some("tool batch timed out".to_string()),
         hint: None,
     }
+}
+
+/// JSON Schema for a tool's arguments: `(name, type, description)` triples.
+/// `additionalProperties` stays true — the forgiving runtime accepts alias
+/// names, and a strict schema would make validating providers reject them.
+fn tool_schema(
+    required: &[(&str, &str, &str)],
+    optional: &[(&str, &str, &str)],
+) -> serde_json::Value {
+    let mut properties = serde_json::Map::new();
+    for (name, kind, description) in required.iter().chain(optional) {
+        properties.insert(
+            name.to_string(),
+            json!({"type": kind, "description": description}),
+        );
+    }
+    json!({
+        "type": "object",
+        "properties": properties,
+        "required": required.iter().map(|(name, _, _)| *name).collect::<Vec<_>>(),
+        "additionalProperties": true,
+    })
 }
 
 /// The canonical argument shape for each tool, used to build a repair memo.

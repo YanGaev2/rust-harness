@@ -27,6 +27,88 @@ fn shell_tool_description_names_the_detected_dialect() {
 }
 
 #[test]
+fn tool_specs_declare_measured_parameter_schemas() {
+    // Probes 2026-07-12/13: the model guesses argument names when the spec
+    // is silent. The schemas advertise the exact names it already sends in
+    // combat (file_path, pattern, old_string/new_string) and pin the
+    // timeout unit to seconds — the one place its priors are split.
+    let specs = ToolRuntime::tool_specs();
+    let schema_of = |name: &str| {
+        specs
+            .iter()
+            .find(|spec| spec.name() == name)
+            .unwrap_or_else(|| panic!("missing {name}"))
+            .parameters()
+            .unwrap_or_else(|| panic!("{name} must declare a schema"))
+            .clone()
+    };
+
+    let shell = schema_of("run_shell_command");
+    assert_eq!(shell["type"], "object");
+    assert!(
+        shell["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("command"))
+    );
+    let timeout_desc = shell["properties"]["timeout"]["description"]
+        .as_str()
+        .unwrap();
+    assert!(
+        timeout_desc.to_lowercase().contains("seconds"),
+        "the split prior needs the unit spelled out: {timeout_desc}"
+    );
+
+    let read = schema_of("read_file");
+    assert!(read["properties"]["file_path"].is_object());
+    assert!(
+        read["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("file_path"))
+    );
+
+    let grep = schema_of("grep_search");
+    assert!(grep["properties"]["pattern"].is_object());
+
+    let edit = schema_of("edit_file");
+    assert!(edit["properties"]["old_string"].is_object());
+    assert!(edit["properties"]["new_string"].is_object());
+
+    // Every advertised tool carries a schema — no silent gaps.
+    for spec in &specs {
+        assert!(
+            spec.parameters().is_some(),
+            "{} is advertised without a schema",
+            spec.name()
+        );
+    }
+}
+
+#[test]
+fn shell_timeout_is_clamped_to_the_bounded_maximum() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Timeout probe 2026-07-13: in build contexts the model sends
+    // milliseconds (120000). Read as seconds that is 33 hours — the shell
+    // must stay bounded, so oversized values clamp to one hour with a memo.
+    let result = runtime
+        .execute(ToolCall::new(
+            "clamp",
+            "run_shell_command",
+            json!({"command": "echo ok", "timeout": 120000}),
+        ))
+        .unwrap();
+
+    assert!(result.ok, "{result:?}");
+    assert!(result.repaired, "clamping is a repair the model must see");
+    let note = result.metadata["repair_note"].as_str().unwrap_or_default();
+    assert!(note.contains("3600"), "note must teach the bound: {note}");
+    assert!(note.to_lowercase().contains("seconds"));
+}
+
+#[test]
 fn shell_tool_is_not_advertised_when_no_shell_exists() {
     let specs = ToolRuntime::tool_specs_with_shell(None);
 

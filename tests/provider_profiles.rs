@@ -1,6 +1,57 @@
 ﻿use harness_cli::providers::{
     AuthScheme, BuiltinProvider, CachePolicy, ChatApiFormat, ProviderConfig, ProviderRegistry,
+    builtin_pricing,
 };
+
+#[test]
+fn verified_presets_carry_base_url_and_bench_tested_default_model() {
+    // The user picks a provider in setup, pastes only an API key, and
+    // everything else comes from the preset. Only bench-verified models
+    // are defaulted: deepseek-v4-pro and glm-5.2 (26-task bench, 2026-07-13).
+    let deepseek = BuiltinProvider::DeepSeek.profile();
+    assert_eq!(deepseek.base_url, Some("https://api.deepseek.com/v1"));
+    assert_eq!(deepseek.model_hints.first(), Some(&"deepseek-v4-pro"));
+
+    let glm = BuiltinProvider::Glm.profile();
+    assert_eq!(glm.base_url, Some("https://api.z.ai/api/paas/v4"));
+    assert_eq!(glm.model_hints.first(), Some(&"glm-5.2"));
+
+    // Families we have not bench-verified ship no base_url yet — the user
+    // must pass --url explicitly rather than trust an untested default.
+    assert_eq!(BuiltinProvider::Kimi.profile().base_url, None);
+}
+
+#[test]
+fn builtin_pricing_covers_verified_models_with_a_dated_price_list() {
+    let glm = builtin_pricing("glm", "glm-5.2").expect("glm-5.2 pricing");
+    assert_eq!(glm.input_per_mtok, 1.40);
+    assert_eq!(glm.cached_input_per_mtok, 0.26);
+    assert_eq!(glm.output_per_mtok, 4.40);
+    assert_eq!(glm.as_of, "2026-07-13");
+
+    let pro = builtin_pricing("deepseek", "deepseek-v4-pro").expect("v4-pro pricing");
+    assert_eq!(pro.input_per_mtok, 0.435);
+    assert_eq!(pro.cached_input_per_mtok, 0.003625);
+    assert_eq!(pro.output_per_mtok, 0.87);
+
+    // Unknown model → honest None, not a guessed price.
+    assert!(builtin_pricing("deepseek", "deepseek-unknown").is_none());
+    assert!(builtin_pricing("acme", "mystery-1").is_none());
+}
+
+#[test]
+fn pricing_estimates_a_session_cost_from_cache_aware_token_counts() {
+    let pricing = builtin_pricing("glm", "glm-5.2").unwrap();
+
+    // 1M prompt tokens of which 800k cached, 100k output:
+    // 200k * $1.40 + 800k * $0.26 + 100k * $4.40 (per 1M each).
+    let cost = pricing.estimate_usd(1_000_000, 800_000, 100_000);
+    assert!((cost - (0.2 * 1.40 + 0.8 * 0.26 + 0.1 * 4.40)).abs() < 1e-9);
+
+    // Cached counts above prompt tokens must not go negative.
+    let cost = pricing.estimate_usd(100, 500, 0);
+    assert!(cost >= 0.0);
+}
 
 #[test]
 fn builtin_subscription_profiles_include_requested_families_and_deepseek_cache_hints() {

@@ -19,6 +19,9 @@ fn canned_trace() -> AgentTrace {
         model: "deepseek-chat".to_string(),
         workspace: "F:\\rust-harness".to_string(),
         user_message: "почини тест".to_string(),
+        usage: harness_cli::agent::UsageTotals::default(),
+        estimated_cost_usd: None,
+        pricing_as_of: None,
         events: vec![
             AgentTraceEvent::Thinking {
                 content: "смотрю на падающий тест".to_string(),

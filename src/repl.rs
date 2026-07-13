@@ -746,6 +746,8 @@ pub fn render_agent_event<W: Write>(event: &AgentEvent, output: &mut W) -> io::R
         AgentEvent::FinalContentDelta(delta) => {
             write!(output, "{delta}")?;
         }
+        // Line mode keeps quiet about usage; the totals live in the trace.
+        AgentEvent::UsageUpdated(_) => {}
     }
     output.flush()
 }

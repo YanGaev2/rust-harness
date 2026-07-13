@@ -11,6 +11,82 @@ use harness_cli::request::ChatMessage;
 use serde_json::Value;
 
 #[test]
+fn agent_run_accumulates_cache_aware_usage_and_estimates_cost() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut first_stream, _) = listener.accept().unwrap();
+        read_http_request(&mut first_stream);
+        respond(
+            &mut first_stream,
+            r#"{
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "u-1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"file_path\":\"a.txt\",\"content\":\"x\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 10,
+                          "total_tokens": 1010,
+                          "prompt_cache_hit_tokens": 600,
+                          "prompt_cache_miss_tokens": 400}
+            }"#,
+        );
+
+        let (mut second_stream, _) = listener.accept().unwrap();
+        read_http_request(&mut second_stream);
+        respond(
+            &mut second_stream,
+            r#"{
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 2000, "completion_tokens": 20,
+                          "total_tokens": 2020,
+                          "prompt_cache_hit_tokens": 1800,
+                          "prompt_cache_miss_tokens": 200}
+            }"#,
+        );
+    });
+
+    // Named after a verified preset so the built-in price list applies.
+    let provider = ProviderConfig::new("deepseek", format!("http://{addr}/v1"), "sk-agent");
+    let runner = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_max_tool_rounds(3);
+
+    let mut usage_events = 0;
+    let result = runner
+        .run_with_events("write a.txt", |event| {
+            if matches!(event, AgentEvent::UsageUpdated(_)) {
+                usage_events += 1;
+            }
+        })
+        .unwrap();
+    server.join().unwrap();
+
+    let usage = &result.trace.usage;
+    assert_eq!(usage.requests, 2);
+    assert_eq!(usage.prompt_tokens, 3000);
+    assert_eq!(usage.cached_tokens, 2400);
+    assert_eq!(usage.completion_tokens, 30);
+    assert_eq!(usage_events, 2, "one usage event per round");
+
+    // 600 fresh * $0.435 + 2400 cached * $0.003625 + 30 out * $0.87, per 1M.
+    let cost = result.trace.estimated_cost_usd.expect("priced model");
+    assert!((cost - 0.0002958).abs() < 1e-9, "cost={cost}");
+    assert_eq!(result.trace.pricing_as_of.as_deref(), Some("2026-07-13"));
+}
+
+#[test]
 fn agent_runner_executes_tool_calls_and_continues_until_final_answer() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -230,6 +306,8 @@ fn agent_runner_emits_events_for_tool_rounds_results_and_final_content() {
     server.join().unwrap();
 
     assert_eq!(result.final_content.as_deref(), Some("streamed final"));
+    // Usage bookkeeping events interleave; this test asserts the UI stream.
+    events.retain(|event| !matches!(event, AgentEvent::UsageUpdated(_)));
     assert!(matches!(
         events[0],
         AgentEvent::ToolRoundStarted {
@@ -292,6 +370,7 @@ fn agent_emits_thinking_event_when_provider_returns_reasoning() {
     server.join().unwrap();
 
     assert_eq!(result.final_content.as_deref(), Some("final answer"));
+    events.retain(|event| !matches!(event, AgentEvent::UsageUpdated(_)));
     assert_eq!(
         events[0],
         AgentEvent::Thinking("Let me weigh the options first.".to_string())

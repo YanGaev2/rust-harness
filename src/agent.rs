@@ -179,6 +179,9 @@ impl AgentRunner {
                 return Err(Self::cancelled(trace));
             }
 
+            trace.record_usage(&response.usage);
+            on_event(AgentEvent::UsageUpdated(trace.usage));
+
             if let Some(reasoning) = response
                 .reasoning
                 .as_deref()
@@ -304,6 +307,42 @@ pub enum AgentEvent {
     },
     ToolResult(ToolBatchResult),
     FinalContentDelta(String),
+    /// Cumulative session usage after each model request, so UIs can show
+    /// live token/cost counters without re-parsing the trace.
+    UsageUpdated(UsageTotals),
+}
+
+/// Token totals across all requests of a run, cache-aware: `cached_tokens`
+/// is the part of `prompt_tokens` billed at the provider's cached rate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+impl UsageTotals {
+    /// Fold another total in (e.g. a finished run into a session counter).
+    pub fn combined(self, other: Self) -> Self {
+        Self {
+            requests: self.requests + other.requests,
+            prompt_tokens: self.prompt_tokens + other.prompt_tokens,
+            cached_tokens: self.cached_tokens + other.cached_tokens,
+            completion_tokens: self.completion_tokens + other.completion_tokens,
+        }
+    }
+
+    fn add(&mut self, usage: &crate::chat_client::TokenUsage) {
+        self.requests += 1;
+        self.prompt_tokens += usage.prompt_tokens.unwrap_or(0);
+        self.completion_tokens += usage.completion_tokens.unwrap_or(0);
+        // cache_report unifies both wire schemes (DeepSeek hit/miss fields
+        // and OpenAI-style cached_tokens).
+        if let Some(report) = usage.cache_report() {
+            self.cached_tokens += report.hit_tokens;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -323,6 +362,11 @@ pub struct AgentTrace {
     pub model: String,
     pub workspace: String,
     pub user_message: String,
+    pub usage: UsageTotals,
+    /// Estimate from the built-in dated price list; absent for models we
+    /// have no verified pricing for. Never a substitute for the invoice.
+    pub estimated_cost_usd: Option<f64>,
+    pub pricing_as_of: Option<String>,
     pub events: Vec<AgentTraceEvent>,
 }
 
@@ -333,7 +377,22 @@ impl AgentTrace {
             model,
             workspace,
             user_message,
+            usage: UsageTotals::default(),
+            estimated_cost_usd: None,
+            pricing_as_of: None,
             events: Vec::new(),
+        }
+    }
+
+    fn record_usage(&mut self, usage: &crate::chat_client::TokenUsage) {
+        self.usage.add(usage);
+        if let Some(pricing) = crate::providers::builtin_pricing(&self.provider, &self.model) {
+            self.estimated_cost_usd = Some(pricing.estimate_usd(
+                self.usage.prompt_tokens,
+                self.usage.cached_tokens,
+                self.usage.completion_tokens,
+            ));
+            self.pricing_as_of = Some(pricing.as_of.to_string());
         }
     }
 

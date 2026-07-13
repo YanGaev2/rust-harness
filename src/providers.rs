@@ -1,4 +1,4 @@
-﻿use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -263,6 +263,7 @@ impl BuiltinProvider {
                 auth_scheme: AuthScheme::Subscription,
                 cache_policy: CachePolicy::default(),
                 chat_api: ChatApiFormat::OpenAiCodexResponses,
+                base_url: None,
             },
             Self::Xiaomi => ProviderProfile {
                 name: self.name(),
@@ -271,14 +272,16 @@ impl BuiltinProvider {
                 auth_scheme: AuthScheme::Subscription,
                 cache_policy: CachePolicy::default(),
                 chat_api: ChatApiFormat::OpenAiCompatible,
+                base_url: None,
             },
             Self::Glm => ProviderProfile {
                 name: self.name(),
                 key_env: "GLM_API_KEY",
-                model_hints: &["glm-4.5", "glm-4.5-air"],
+                model_hints: &["glm-5.2"],
                 auth_scheme: AuthScheme::Subscription,
                 cache_policy: CachePolicy::default(),
                 chat_api: ChatApiFormat::OpenAiCompatible,
+                base_url: Some("https://api.z.ai/api/paas/v4"),
             },
             Self::Kimi => ProviderProfile {
                 name: self.name(),
@@ -287,6 +290,7 @@ impl BuiltinProvider {
                 auth_scheme: AuthScheme::Subscription,
                 cache_policy: CachePolicy::default(),
                 chat_api: ChatApiFormat::OpenAiCompatible,
+                base_url: None,
             },
             Self::Claude => ProviderProfile {
                 name: self.name(),
@@ -297,6 +301,7 @@ impl BuiltinProvider {
                 },
                 cache_policy: CachePolicy::AnthropicAutomatic { ttl: None },
                 chat_api: ChatApiFormat::AnthropicMessages,
+                base_url: None,
             },
             Self::DeepSeek => ProviderProfile {
                 name: self.name(),
@@ -308,6 +313,7 @@ impl BuiltinProvider {
                     miss_tokens_field: "prompt_cache_miss_tokens".to_string(),
                 },
                 chat_api: ChatApiFormat::OpenAiCompatible,
+                base_url: Some("https://api.deepseek.com/v1"),
             },
         }
     }
@@ -321,6 +327,64 @@ pub struct ProviderProfile {
     pub auth_scheme: AuthScheme,
     pub cache_policy: CachePolicy,
     pub chat_api: ChatApiFormat,
+    /// Endpoint for the preset flow (pick provider → paste key → done).
+    /// Only bench-verified families carry one; the rest require --url.
+    pub base_url: Option<&'static str>,
+}
+
+/// USD per 1M tokens, from the provider's official price page on `as_of`.
+/// Estimates only — prices change; overrides belong in providers.json.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelPricing {
+    pub input_per_mtok: f64,
+    pub cached_input_per_mtok: f64,
+    pub output_per_mtok: f64,
+    pub as_of: &'static str,
+}
+
+impl ModelPricing {
+    /// Cache-aware cost estimate: cached prompt tokens bill at the cached
+    /// rate, the remainder at the full input rate.
+    pub fn estimate_usd(
+        &self,
+        prompt_tokens: u64,
+        cached_tokens: u64,
+        completion_tokens: u64,
+    ) -> f64 {
+        let cached = cached_tokens.min(prompt_tokens) as f64;
+        let fresh = prompt_tokens.saturating_sub(cached_tokens) as f64;
+        (fresh * self.input_per_mtok
+            + cached * self.cached_input_per_mtok
+            + completion_tokens as f64 * self.output_per_mtok)
+            / 1_000_000.0
+    }
+}
+
+/// Built-in price list for the bench-verified models. Unknown models get
+/// an honest `None` rather than a guess.
+pub fn builtin_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
+    let family = BuiltinProvider::from_name(provider)?;
+    match (family, model) {
+        (BuiltinProvider::Glm, "glm-5.2") => Some(ModelPricing {
+            input_per_mtok: 1.40,
+            cached_input_per_mtok: 0.26,
+            output_per_mtok: 4.40,
+            as_of: "2026-07-13",
+        }),
+        (BuiltinProvider::DeepSeek, "deepseek-v4-pro") => Some(ModelPricing {
+            input_per_mtok: 0.435,
+            cached_input_per_mtok: 0.003625,
+            output_per_mtok: 0.87,
+            as_of: "2026-07-13",
+        }),
+        (BuiltinProvider::DeepSeek, "deepseek-v4-flash" | "deepseek-chat") => Some(ModelPricing {
+            input_per_mtok: 0.14,
+            cached_input_per_mtok: 0.0028,
+            output_per_mtok: 0.28,
+            as_of: "2026-07-13",
+        }),
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Default)]

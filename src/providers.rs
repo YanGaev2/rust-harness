@@ -18,6 +18,12 @@ pub struct ProviderConfig {
     chat_api: ChatApiFormat,
     #[serde(default)]
     key_env: Option<String>,
+    /// Proxy for this provider's requests: an `http://[user:pass@]host:port`
+    /// URL, `"env"` (use HTTP_PROXY/HTTPS_PROXY from the environment), or
+    /// `"none"` (force direct even when a global proxy is configured).
+    /// `None` inherits the config-level proxy, defaulting to direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy: Option<String>,
 }
 
 impl ProviderConfig {
@@ -35,6 +41,7 @@ impl ProviderConfig {
             cache_policy: CachePolicy::default(),
             chat_api: ChatApiFormat::default(),
             key_env: None,
+            proxy: None,
         }
     }
 
@@ -48,6 +55,7 @@ impl ProviderConfig {
             cache_policy: CachePolicy::default(),
             chat_api: ChatApiFormat::default(),
             key_env: None,
+            proxy: None,
         }
     }
 
@@ -126,6 +134,17 @@ impl ProviderConfig {
 
     pub fn chat_api(&self) -> ChatApiFormat {
         self.chat_api
+    }
+
+    pub fn with_proxy(mut self, proxy: impl Into<String>) -> Self {
+        self.proxy = Some(proxy.into());
+        self
+    }
+
+    /// Proxy directive for this provider (URL, "env", or "none"); `None`
+    /// means "inherit the global config proxy, default direct".
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
     }
 
     pub fn key_env(&self) -> Option<&str> {

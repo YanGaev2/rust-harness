@@ -97,6 +97,12 @@ where
         [scope, command, rest @ ..] if scope == "clipboard" && command == "paste" => {
             clipboard_paste(rest, output)
         }
+        [scope, command, rest @ ..] if scope == "proxy" && command == "set" => {
+            proxy_set(rest, output)
+        }
+        [scope, command, rest @ ..] if scope == "proxy" && command == "show" => {
+            proxy_show(rest, output)
+        }
         [command, rest @ ..] if command == "diagnostics" => diagnostics_command(rest, output),
         [command, rest @ ..] if command == "repl" => repl(rest, output),
         [] => default_launch(&command_name, input, output),
@@ -702,6 +708,72 @@ fn repl<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     Ok(())
 }
 
+/// `harness proxy set URL|env|none [--config PATH]` — the config-wide proxy
+/// every provider without its own `proxy` field inherits.
+fn proxy_set<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
+    let (value, config_path) = proxy_command_args(args, "proxy set")?;
+    let Some(value) = value else {
+        return Err(CliError::Usage(
+            "usage: harness proxy set URL|env|none [--config PATH]".to_string(),
+        ));
+    };
+    ConfigStore::new(&config_path).set_proxy(&value)?;
+    if value.trim().is_empty() {
+        writeln!(output, "global proxy cleared")?;
+    } else {
+        writeln!(output, "global proxy set to {value}")?;
+    }
+    Ok(())
+}
+
+fn proxy_show<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
+    let (extra, config_path) = proxy_command_args(args, "proxy show")?;
+    if extra.is_some() {
+        return Err(CliError::Usage(
+            "usage: harness proxy show [--config PATH]".to_string(),
+        ));
+    }
+    let config = ConfigStore::new(&config_path).load()?;
+    match config.proxy() {
+        Some(proxy) => writeln!(output, "global proxy: {proxy}")?,
+        None => writeln!(output, "global proxy: (none — requests go direct)")?,
+    }
+    for provider in config.providers() {
+        if let Some(proxy) = provider.proxy() {
+            writeln!(output, "  {}: {proxy}", provider.name())?;
+        }
+    }
+    Ok(())
+}
+
+/// Parse `[VALUE] [--config PATH]` shared by the proxy subcommands.
+fn proxy_command_args(
+    args: &[String],
+    command: &str,
+) -> Result<(Option<String>, PathBuf), CliError> {
+    let mut value = None;
+    let mut config = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--config" => {
+                config = Some(PathBuf::from(required_value(args, index, "--config")?));
+                index += 2;
+            }
+            other if !other.starts_with("--") && value.is_none() => {
+                value = Some(other.to_string());
+                index += 1;
+            }
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown option for {command}: {other}"
+                )));
+            }
+        }
+    }
+    Ok((value, config.unwrap_or_else(default_config_path)))
+}
+
 fn diagnostics_command<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     let flags = DiagnosticsFlags::parse(args)?;
     let report = diagnostics::collect(flags.options()?)?;
@@ -899,6 +971,7 @@ struct ProviderFlags {
     cache_miss_field: Option<String>,
     cache_ttl: Option<String>,
     models: Vec<String>,
+    proxy: Option<String>,
     add_all: bool,
     interactive: bool,
     timeout: Option<Duration>,
@@ -968,6 +1041,10 @@ impl ProviderFlags {
                     flags.cache_ttl = Some(required_value(args, index, "--cache-ttl")?);
                     index += 2;
                 }
+                "--proxy" => {
+                    flags.proxy = Some(required_value(args, index, "--proxy")?);
+                    index += 2;
+                }
                 "--model" => {
                     flags.models.push(required_value(args, index, "--model")?);
                     index += 2;
@@ -1029,6 +1106,10 @@ impl ProviderFlags {
         }
         if let Some(cache_policy) = self.cache_policy()? {
             provider = provider.with_cache_policy(cache_policy);
+        }
+
+        if let Some(proxy) = &self.proxy {
+            provider = provider.with_proxy(proxy);
         }
 
         Ok(match self.chat_api {
@@ -1700,8 +1781,10 @@ fn help(command_name: &str) -> String {
         ),
         format!("  {command_name} provider add --interactive --config PATH [--timeout-ms N]"),
         format!(
-            "  {command_name} provider add --config PATH --name NAME --url URL (--key KEY | --key-env ENV) [--auth SCHEME] [--chat-api FORMAT] [--cache POLICY] [--timeout-ms N] (--model MODEL | --add-all)"
+            "  {command_name} provider add --config PATH --name NAME --url URL (--key KEY | --key-env ENV) [--auth SCHEME] [--chat-api FORMAT] [--cache POLICY] [--proxy URL|env|none] [--timeout-ms N] (--model MODEL | --add-all)"
         ),
+        format!("  {command_name} proxy set URL|env|none [--config PATH]"),
+        format!("  {command_name} proxy show [--config PATH]"),
         format!(
             "  {command_name} chat once --config PATH --provider NAME --model MODEL --message TEXT [--timeout-ms N]"
         ),

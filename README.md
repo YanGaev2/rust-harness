@@ -1,23 +1,78 @@
 ﻿# harness-cli
 
-Lightweight Rust prototype for an LLM harness CLI focused on cache-friendly calls,
-provider onboarding, native shell execution profiles, and forgiving local tools.
+A lightweight LLM agent harness in Rust (Windows + Linux) whose tools are
+**tuned to what each model actually learned in training** — measured, not
+guessed.
+
+## Why this harness
+
+### Tiny and fast
+
+The harness itself is invisible next to the model it drives:
+
+| Metric | Measured |
+|---|---|
+| Binary size | **4.2 MB** (single static exe, no runtime deps) |
+| Process RSS | **5.6 MB** |
+| Cold start | **~34 ms** |
+
+No async runtime, no tokio, no ratatui — blocking `ureq`, `std::thread`,
+and an in-repo terminal UI library (`crates/harness-tui`) whose only
+dependencies are two unicode crates.
+
+### Tools are fitted to the model, not the other way around
+
+Before a model family is marked supported, we run a probe suite against it:
+free-form completions at several temperatures, "list your tools" prompts,
+and live function-calling rounds with empty schemas — extracting which tool
+names, argument names, and value conventions the model absorbed in training
+(`read_file` vs `file_read`, `old_string` vs `old_str`, timeout in seconds
+vs milliseconds). Then the harness declares exactly those names and JSON
+Schemas, and a 26-task agent benchmark (×2 repeats, real API) must pass
+before the pair ships as a preset. Measured effect: renaming tools to the
+model's own priors cut tool calls on the benchmark from 101 to 55 on
+deepseek-v4-pro with zero repairs.
 
 The shell tool detects the interpreter that actually exists on the machine
 (pwsh 7 → Windows PowerShell 5.1 → cmd.exe on Windows; bash → POSIX sh on
-Linux/docker) and tells the model which dialect it is writing for — in the
-system prompt and in the tool description. Environments without any shell
-(distroless containers) simply don't advertise the shell tool.
+Linux/docker) and tells the model which dialect it is writing for.
+Environments without any shell (distroless containers) simply don't
+advertise the shell tool.
 
-Every tool declares a JSON Schema for its arguments, using the argument
-names measured from model priors (`file_path`, `old_string`/`new_string`,
-`pattern`, …). Shell `timeout` is in seconds and is capped at 3600.
+### Self-repairing tool calls
+
+Models make sloppy calls; the harness fixes them instead of failing them.
+Unknown-but-recognizable tool names (`grep`, `ls`, `write_file`, `str_replace`)
+are resolved to canonical tools, string arguments are coerced into structured
+ones, `"lines": "2"` becomes a number, CRLF/LF mismatches in edits are
+re-encoded to the file's convention — and every repaired call returns
+`repaired: true` plus a short memo so the model can self-correct next round.
+A malformed call costs zero extra round-trips instead of a failed tool +
+retry + wasted tokens. On the 26×2 benchmark across three model families:
+**598 tool calls, 0 failed, 0 unrepaired**.
 
 Tool results are token-lean and honest: empty searches say "no matches"
 instead of an empty string, shell metadata never repeats stdout/stderr,
-`grep_search` takes `context_lines` (grep `-C` style), and `read_file`
-decodes UTF-16 files (PowerShell `>` redirects) instead of silently
-returning empty content.
+and `read_file` decodes UTF-16 files (PowerShell `>` redirects) instead of
+silently returning empty content.
+
+### Cache-first request design
+
+Every request keeps a byte-stable prefix (system prompt ~700 tokens, tool
+schemas, provider metadata) so provider-side prompt caches hit on every
+agent round. The request model exposes two BLAKE3 keys (`cache_prefix_key`,
+`full_request_key`) and the session cost tracker prices cached and fresh
+tokens separately. Measured on the benchmark and live sessions:
+
+| Model | Bench (26×2) | Agent-loop cache behaviour | $/1M in / cached / out |
+|---|---|---|---|
+| deepseek-v4-pro | 51/52 | 64-token blocks, hits from the 2nd request | 0.435 / 0.0036 / 0.87 |
+| glm-5.2 | 52/52 | ~85% hit from round 2 (704/828 tok), 97% on prefix repeat | 1.40 / 0.26 / 4.40 |
+| qwen3.7-max | 50/52 | hits only past a 2048-token prefix (30% overall) | vendor pricing not verified |
+
+A live glm-5.2 session (2 requests, 3 371 prompt tokens of which 1 600
+cached, 35 completion) cost **$0.0030**; `/cost` in the REPL shows the same
+numbers per session, cache-aware.
 
 ## Install and launch
 
@@ -91,6 +146,20 @@ Save a provider whose API expects a custom auth header:
 ```powershell
 harness provider add --config .harness/providers.json --name header-gateway --url https://api.example.com/v1 --key-env HEADER_GATEWAY_API_KEY --auth header --auth-header x-api-key --add-all
 ```
+
+Route traffic through a proxy — **strictly config opt-in**. Ambient
+`HTTP_PROXY`/`HTTPS_PROXY` environment variables are ignored unless the
+config says `env`, so the environment can never silently reroute requests:
+
+```powershell
+harness proxy set http://user:pass@127.0.0.1:8080     # config-wide proxy
+harness proxy set env                                  # opt into HTTP(S)_PROXY env vars
+harness proxy show                                     # global + per-provider view
+harness provider add --config .harness/providers.json --name behind-proxy --url https://api.example.com/v1 --key-env KEY --model m --proxy http://127.0.0.1:8080
+```
+
+A per-provider `--proxy` (URL, `env`, or `none`) overrides the global one;
+`none` forces that provider direct even when a global proxy is set.
 
 Save a custom provider that exposes DeepSeek-style automatic cache metrics:
 

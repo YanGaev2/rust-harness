@@ -19,14 +19,25 @@ impl OpenAiCompatibleModelClient {
         provider: &ProviderConfig,
     ) -> Result<ModelDiscovery, ModelClientError> {
         let url = format!("{}/models", provider.base_url().trim_end_matches('/'));
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent.get(&url).set("Accept", "application/json");
+        // Same proxy policy as the chat client: config opt-in only, ambient
+        // env proxies are ignored.
+        let proxy = match provider.proxy().map(str::trim) {
+            None | Some("") | Some("none") => None,
+            Some("env") => ureq::Proxy::try_from_env(),
+            Some(proxy_url) => ureq::Proxy::new(proxy_url).ok(),
+        };
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_global(Some(self.timeout))
+            .proxy(proxy)
+            .build()
+            .into();
+        let mut request = agent.get(&url).header("Accept", "application/json");
         if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
+            request = request.header(&name, &value);
         }
 
         let response = request.call()?;
-        let raw = response.into_string().map_err(ModelClientError::Io)?;
+        let raw = response.into_body().read_to_string()?;
         Ok(ModelDiscovery::from_openai_compatible_response(
             provider, &raw,
         )?)

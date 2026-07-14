@@ -641,3 +641,15 @@ ust-harness\README.md` - the absolute
   cached (agent-loop hit 30% overall vs DeepSeek ~85%; short 2-request runs get
   0). enable_thinking:false disables thinking in probes (thinking is on by
   default, temperature>1 accepted).
+
+- Interactive model picker (2026-07-14): bare /model in the chat TUI now opens
+  a selector under the editor (reference-agent style) instead of printing
+  transcript lines: rows are "-> model [provider]" with a check mark on the
+  active pair, a (K/N) counter, Up/Down navigation, type-to-filter, Enter
+  switches, Esc closes; the cursor starts on the active pair. Verified live in
+  tmux (WSL): open -> 2x Down -> Enter produced "switched to glm/glm-5.2" and
+  the status row updated. The user-visible "only one model" confusion was the
+  per-location config: the global default %APPDATA%/harness-cli/providers.json
+  only had deepseek while glm/qwen lived in the repo-local .harness config -
+  both were added to the global file (keys inline, file lives outside any
+  repo). Line-mode REPL keeps the printed numbered list.

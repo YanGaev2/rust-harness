@@ -245,18 +245,85 @@ fn catalog_app() -> ChatApp {
 }
 
 #[test]
-fn slash_model_no_args_lists_numbered_menu() {
+fn slash_model_no_args_opens_interactive_picker() {
     let mut app = catalog_app();
     let action = submit_message(&mut app, "/model");
     assert_eq!(action, ChatAction::Continue);
-    let transcript = app.transcript_text();
-    assert!(transcript.contains("[1] deepseek/deepseek-v4-pro"));
-    assert!(transcript.contains("[2] deepseek/deepseek-v4-flash"));
-    assert!(transcript.contains("[3] glm/glm-5.2"));
-    // The active pair is marked so the menu doubles as a status view.
-    assert!(transcript.contains("[1] deepseek/deepseek-v4-pro (active)"));
-    // The hint teaches every accepted form.
-    assert!(transcript.contains("/model N"));
+    assert!(app.model_picker_visible());
+    let panel = lines_text(&app.panel_lines(100, 30));
+    // Cursor starts on the active pair, which also carries the check mark.
+    assert!(panel.contains("→ deepseek-v4-pro [deepseek] ✓"));
+    assert!(panel.contains("deepseek-v4-flash [deepseek]"));
+    assert!(panel.contains("glm-5.2 [glm]"));
+    assert!(panel.contains("(1/3)"));
+}
+
+#[test]
+fn picker_cursor_starts_on_active_pair() {
+    let mut app = ChatApp::new("glm/glm-5.2", "C:/work/project").with_catalog(vec![
+        (
+            "deepseek".to_string(),
+            vec![
+                "deepseek-v4-pro".to_string(),
+                "deepseek-v4-flash".to_string(),
+            ],
+        ),
+        ("glm".to_string(), vec!["glm-5.2".to_string()]),
+    ]);
+    submit_message(&mut app, "/model");
+    let panel = lines_text(&app.panel_lines(100, 30));
+    assert!(panel.contains("→ glm-5.2 [glm] ✓"));
+    assert!(panel.contains("(3/3)"));
+}
+
+#[test]
+fn picker_down_enter_switches_to_highlighted_model() {
+    let mut app = catalog_app();
+    submit_message(&mut app, "/model");
+    app.handle_key(key(KeyCode::Down));
+    let action = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "deepseek".to_string(),
+            model: "deepseek-v4-flash".to_string(),
+        }
+    );
+    assert!(!app.model_picker_visible());
+}
+
+#[test]
+fn picker_esc_closes_without_switching() {
+    let mut app = catalog_app();
+    submit_message(&mut app, "/model");
+    let action = app.handle_key(key(KeyCode::Esc));
+    assert_eq!(action, ChatAction::Continue);
+    assert!(!app.model_picker_visible());
+    // Keys return to the editor afterwards.
+    app.handle_key(key(KeyCode::Char('x')));
+    assert_eq!(app.input(), "x");
+}
+
+#[test]
+fn picker_typing_filters_and_enter_picks_the_match() {
+    let mut app = catalog_app();
+    submit_message(&mut app, "/model");
+    for ch in "glm".chars() {
+        app.handle_key(key(KeyCode::Char(ch)));
+    }
+    let panel = lines_text(&app.panel_lines(100, 30));
+    assert!(panel.contains("(1/1)"));
+    // Picker rows tag the provider in brackets; the filtered-out deepseek
+    // rows are gone (the status row still shows the active deepseek label).
+    assert!(!panel.contains("[deepseek]"));
+    let action = app.handle_key(key(KeyCode::Enter));
+    assert_eq!(
+        action,
+        ChatAction::SwitchModel {
+            provider: "glm".to_string(),
+            model: "glm-5.2".to_string(),
+        }
+    );
 }
 
 #[test]

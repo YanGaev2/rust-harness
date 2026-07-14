@@ -167,12 +167,15 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   the menu with the saved provider/model pairs themselves.
   Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/history QUERY`,
   `/clear`, `/new`, `/cost`, `/help`, `/exit`.
-- **Model picker**: `/model` alone lists every saved provider/model as a numbered
-  menu (`[1] deepseek/deepseek-v4-pro (active)` …); switch with `/model 2`, a bare
-  model or provider name, or the full pair. A model name the config has never
-  seen switches to it AND saves it to the provider (`model X saved to provider
-  Y`), so typing a brand-new model is enough to add it. `/provider` lists all
-  saved providers with their models.
+- **Interactive model picker**: `/model` alone opens a selector under the
+  input — `→ deepseek-v4-pro [deepseek] ✓` rows (cursor arrow, dimmed provider,
+  check on the active pair) with a `(K/N)` counter; Up/Down move, typing
+  filters, Enter switches, Esc closes. `/model 2`, a bare model or provider
+  name, or the full pair still switch directly. A model name the config has
+  never seen switches to it AND saves it to the provider (`model X saved to
+  provider Y`), so typing a brand-new model is enough to add it. `/provider`
+  lists all saved providers with their models. (The line-mode REPL prints the
+  same list as numbered text.)
 - **Resumes the last chat on launch**: the conversation is persisted per
   workspace and reloaded at startup (a `resumed session … (N messages)` notice
   appears in the transcript). `/new` abandons it and starts a fresh session.

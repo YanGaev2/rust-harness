@@ -218,6 +218,37 @@ pub struct ChatApp {
     /// switching, and argument completions. Empty when the host never
     /// attached one (tests, bare sessions) — `/model` then shows usage only.
     catalog: Vec<(String, Vec<String>)>,
+    /// Interactive model picker opened by bare `/model` (arrow keys +
+    /// type-to-filter, like the reference agents' model selectors).
+    model_picker: Option<ModelPicker>,
+}
+
+/// State of the interactive `/model` picker: the full pair list, the cursor
+/// position inside the *filtered* view, and the type-to-filter text.
+struct ModelPicker {
+    pairs: Vec<(String, String)>,
+    cursor: usize,
+    filter: String,
+}
+
+impl ModelPicker {
+    /// Pairs surviving the current filter (case-insensitive substring match
+    /// against the provider, the model, or `provider/model`).
+    fn filtered(&self) -> Vec<(String, String)> {
+        if self.filter.is_empty() {
+            return self.pairs.clone();
+        }
+        let needle = self.filter.to_ascii_lowercase();
+        self.pairs
+            .iter()
+            .filter(|(provider, model)| {
+                format!("{provider}/{model}")
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 impl ChatApp {
@@ -241,7 +272,13 @@ impl ChatApp {
             session_usage: crate::agent::UsageTotals::default(),
             run_usage_base: crate::agent::UsageTotals::default(),
             catalog: Vec::new(),
+            model_picker: None,
         }
+    }
+
+    /// Whether the interactive `/model` picker is open.
+    pub fn model_picker_visible(&self) -> bool {
+        self.model_picker.is_some()
     }
 
     /// Attach the saved provider/model catalog that `/model` and `/provider`
@@ -389,6 +426,11 @@ impl ChatApp {
         if self.help_visible {
             self.help_visible = false;
             return ChatAction::Continue;
+        }
+
+        // The interactive model picker owns the keyboard while it is open.
+        if self.model_picker.is_some() {
+            return self.handle_picker_key(key);
         }
 
         let completion_open = self.completion_visible();
@@ -646,7 +688,7 @@ impl ChatApp {
                     }
                     (Some(arg), None) => self.switch_model_shorthand(arg),
                     (None, None) => {
-                        self.show_model_menu();
+                        self.open_model_picker();
                         ChatAction::Continue
                     }
                     _ => {
@@ -684,8 +726,10 @@ impl ChatApp {
         }
     }
 
-    /// Print the numbered provider/model menu that `/model N` indexes into.
-    fn show_model_menu(&mut self) {
+    /// Open the interactive model picker (bare `/model`): arrow keys move,
+    /// Enter switches, Esc closes, typing filters. The cursor starts on the
+    /// active pair so Enter with no navigation is a harmless no-op switch.
+    fn open_model_picker(&mut self) {
         let pairs = self.model_menu_pairs();
         if pairs.is_empty() {
             self.push_system_line(
@@ -694,22 +738,60 @@ impl ChatApp {
             return;
         }
         let active = self.provider_label.clone();
-        self.push_system_line("available models:");
-        for (index, (provider, model)) in pairs.iter().enumerate() {
-            let marker = if format!("{provider}/{model}") == active {
-                " (active)"
-            } else {
-                ""
-            };
-            self.transcript.push(ChatEntry::System(format!(
-                "  [{}] {provider}/{model}{marker}",
-                index + 1
-            )));
+        let cursor = pairs
+            .iter()
+            .position(|(provider, model)| format!("{provider}/{model}") == active)
+            .unwrap_or(0);
+        self.model_picker = Some(ModelPicker {
+            pairs,
+            cursor,
+            filter: String::new(),
+        });
+    }
+
+    /// Keyboard handling while the model picker is open.
+    fn handle_picker_key(&mut self, key: KeyEvent) -> ChatAction {
+        match key.code {
+            KeyCode::Esc => {
+                self.model_picker = None;
+                ChatAction::Continue
+            }
+            KeyCode::Enter => {
+                let choice = self.model_picker.take().and_then(|picker| {
+                    let filtered = picker.filtered();
+                    if filtered.is_empty() {
+                        return None;
+                    }
+                    let index = picker.cursor.min(filtered.len() - 1);
+                    Some(filtered[index].clone())
+                });
+                match choice {
+                    Some((provider, model)) => ChatAction::SwitchModel { provider, model },
+                    None => ChatAction::Continue,
+                }
+            }
+            _ => {
+                if let Some(picker) = self.model_picker.as_mut() {
+                    match key.code {
+                        KeyCode::Up => picker.cursor = picker.cursor.saturating_sub(1),
+                        KeyCode::Down => {
+                            let last = picker.filtered().len().saturating_sub(1);
+                            picker.cursor = (picker.cursor + 1).min(last);
+                        }
+                        KeyCode::Backspace => {
+                            picker.filter.pop();
+                            picker.cursor = 0;
+                        }
+                        KeyCode::Char(ch) if !key.mods.ctrl => {
+                            picker.filter.push(ch);
+                            picker.cursor = 0;
+                        }
+                        _ => {}
+                    }
+                }
+                ChatAction::Continue
+            }
         }
-        self.transcript.push(ChatEntry::System(
-            "switch: /model N, /model MODEL, /model PROVIDER MODEL (new model names are saved)"
-                .to_string(),
-        ));
     }
 
     /// `/model ARG` with a single token: menu number, provider name, model
@@ -937,7 +1019,9 @@ impl ChatApp {
         let editor_rows = self.editor.render(width.saturating_sub(2), EDITOR_MAX_ROWS);
         lines.extend(framed_lines(editor_rows, width));
 
-        if self.completion_visible() {
+        if let Some(picker) = &self.model_picker {
+            lines.extend(model_picker_lines(picker, &self.provider_label));
+        } else if self.completion_visible() {
             let items: Vec<MenuItem> = self
                 .completion_matches()
                 .into_iter()
@@ -1064,7 +1148,9 @@ impl ChatApp {
                 Span::styled(format!(" · {}", self.workspace.display()), dim_style()),
             ],
         };
-        let hint = if self.completion_visible() {
+        let hint = if self.model_picker.is_some() {
+            "↑↓ select · Enter switch · type to filter · Esc close "
+        } else if self.completion_visible() {
             "↑↓ select · Tab complete · Esc close "
         } else {
             "Enter send · Alt+Enter newline · / commands · Ctrl+V paste · Esc exit "
@@ -1074,6 +1160,64 @@ impl ChatApp {
         };
         status_line(width, left, right)
     }
+}
+
+/// Maximum picker rows shown at once; the window scrolls to keep the cursor
+/// visible and a `(K/N)` counter reports the position in the full list.
+const PICKER_MAX_ROWS: usize = 10;
+
+/// Render the interactive model picker: `→` marks the cursor row, `✓` the
+/// active pair, `[provider]` is dimmed, and the footer shows `(K/N)` plus
+/// the type-to-filter text.
+fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
+    let filtered = picker.filtered();
+    let mut lines = Vec::new();
+    if filtered.is_empty() {
+        lines.push(styled_line(
+            format!("  no models match '{}' (Esc to close)", picker.filter),
+            dim_style(),
+        ));
+        return lines;
+    }
+    let cursor = picker.cursor.min(filtered.len() - 1);
+    let start = if cursor >= PICKER_MAX_ROWS {
+        cursor + 1 - PICKER_MAX_ROWS
+    } else {
+        0
+    };
+    for (index, (provider, model)) in filtered
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(PICKER_MAX_ROWS)
+    {
+        let is_cursor = index == cursor;
+        let is_active = format!("{provider}/{model}") == active_label;
+        let marker = if is_cursor { "→ " } else { "  " };
+        let name_style = if is_cursor {
+            fg_style(CYAN)
+        } else {
+            Style::default()
+        };
+        let mut spans = vec![
+            Span::styled(format!("{marker}{model} "), name_style),
+            Span::styled(format!("[{provider}]"), dim_style()),
+        ];
+        if is_active {
+            spans.push(Span::styled(" ✓", fg_style(GREEN)));
+        }
+        lines.push(Line { spans });
+    }
+    let filter_note = if picker.filter.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", picker.filter)
+    };
+    lines.push(styled_line(
+        format!("  ({}/{}){filter_note}", cursor + 1, filtered.len()),
+        dim_style(),
+    ));
+    lines
 }
 
 /// Last byte offset right after a blank line that sits outside any

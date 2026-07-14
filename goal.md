@@ -192,9 +192,9 @@ paste support for text/images.
     repair), `tests/tool_scheduler.rs` (memo on repaired batch results), and
     `tests/agent_loop.rs` (memo reaches the model in the next request body and
     uses the callable wire name).
-- Re-validated end-to-end against the official DeepSeek v4-pro API using the key
-  found in `the local env` (loaded into `DEEPSEEK_API_KEY`; never
-  written into `providers.json`, which stores only `key_env`).
+- Re-validated end-to-end against the official DeepSeek v4-pro API using a live
+  key from the local environment (`DEEPSEEK_API_KEY`; never written into
+  `providers.json`, which stores only `key_env`).
   - Live trace shows the memo working as intended: round 1 the model called
     `file_search {pattern: ...}`, got the memo, and round 2 switched to the
     canonical `file_search {query: ...}` on its own. Of 8 tool results only the
@@ -653,3 +653,24 @@ ust-harness\README.md` - the absolute
   only had deepseek while glm/qwen lived in the repo-local .harness config -
   both were added to the global file (keys inline, file lives outside any
   repo). Line-mode REPL keeps the printed numbered list.
+
+- ureq 3 migration + response-body errors (2026-07-14): OpenRouter returned a
+  bare 403 through the harness while curl passed; the blocker chain was (a)
+  ChatClientError hid the response body - now Status{code,url,body} carries
+  the provider's own error text ("Access denied by security policy"), and (b)
+  the sandbox/system HTTP(S)_PROXY env vars: ureq 2 ignored them, ureq 3
+  honors them by default, which also silently rerouted every localhost mock
+  test and produced "Peer disconnected"/hangs. Migrated chat_client and
+  model_client to ureq 3 (config_builder, http_status_as_error(false),
+  header/send/into_body APIs); non-2xx never reaches the From<ureq::Error>
+  path anymore.
+- Config-driven proxy (2026-07-14): proxying is opt-in via the harness config
+  only. providers.json gains a config-wide "proxy" plus per-provider "proxy"
+  (URL | env | none; per-provider wins, "none" forces direct);
+  HarnessConfig::resolved_provider folds the global value in. The HTTP agents
+  ignore ambient HTTP_PROXY/HTTPS_PROXY unless the config says "env" - the
+  exact failure mode that broke the mock tests is now a regression test
+  (tests/proxy.rs: env vars poisoned, request must still go direct; plus a
+  CONNECT-tunnel mock proving a configured proxy is used). CLI: provider add
+  --proxy, harness proxy set|show. WSL verification now uses cargo vendor
+  (146MB, gitignored) because WSL currently has no network access.

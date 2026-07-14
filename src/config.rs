@@ -31,12 +31,27 @@ impl ConfigStore {
         config
             .providers
             .insert(provider.name().to_string(), provider);
+        self.save(&config)
+    }
 
+    /// Set (or clear with `None`) the config-wide proxy that providers
+    /// without their own `proxy` field inherit.
+    pub fn set_proxy(&self, proxy: impl Into<String>) -> Result<(), ConfigError> {
+        let mut config = self.load()?;
+        let proxy = proxy.into();
+        config.proxy = if proxy.trim().is_empty() {
+            None
+        } else {
+            Some(proxy)
+        };
+        self.save(&config)
+    }
+
+    fn save(&self, config: &HarnessConfig) -> Result<(), ConfigError> {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent).map_err(ConfigError::Io)?;
         }
-
-        let raw = serde_json::to_string_pretty(&config)?;
+        let raw = serde_json::to_string_pretty(config)?;
         fs::write(&self.path, raw).map_err(ConfigError::Io)
     }
 }
@@ -44,6 +59,10 @@ impl ConfigStore {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HarnessConfig {
     providers: BTreeMap<String, ProviderConfig>,
+    /// Config-wide proxy (URL, "env", or "none") inherited by every provider
+    /// that does not set its own. Absent = all requests go direct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proxy: Option<String>,
 }
 
 impl HarnessConfig {
@@ -53,6 +72,21 @@ impl HarnessConfig {
 
     pub fn providers(&self) -> impl Iterator<Item = &ProviderConfig> {
         self.providers.values()
+    }
+
+    pub fn proxy(&self) -> Option<&str> {
+        self.proxy.as_deref()
+    }
+
+    /// The provider with the global proxy folded in: a provider without its
+    /// own `proxy` inherits the config-wide one (an explicit per-provider
+    /// value, including "none", always wins).
+    pub fn resolved_provider(&self, name: &str) -> Option<ProviderConfig> {
+        let provider = self.providers.get(name)?.clone();
+        Some(match (provider.proxy(), self.proxy.as_deref()) {
+            (None, Some(global)) => provider.with_proxy(global),
+            _ => provider,
+        })
     }
 }
 

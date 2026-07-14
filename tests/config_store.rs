@@ -128,3 +128,58 @@ fn config_store_round_trips_openai_codex_responses_chat_api_metadata() {
 
     assert_eq!(stored.chat_api(), ChatApiFormat::OpenAiCodexResponses);
 }
+
+#[test]
+fn config_store_round_trips_provider_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(root.path().join("providers.json"));
+
+    let provider = ProviderConfig::new("openrouter", "https://openrouter.ai/api/v1", "sk-or")
+        .with_proxy("http://user:pass@127.0.0.1:8080");
+    store.save_provider(provider).unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.provider("openrouter").unwrap().proxy(),
+        Some("http://user:pass@127.0.0.1:8080")
+    );
+}
+
+#[test]
+fn config_store_round_trips_global_proxy_and_resolves_into_providers() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(root.path().join("providers.json"));
+
+    store
+        .save_provider(ProviderConfig::new("a", "https://a.example/v1", "k"))
+        .unwrap();
+    store
+        .save_provider(ProviderConfig::new("b", "https://b.example/v1", "k").with_proxy("none"))
+        .unwrap();
+    store.set_proxy("http://127.0.0.1:9999").unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(loaded.proxy(), Some("http://127.0.0.1:9999"));
+    // Global proxy flows into providers that did not set their own...
+    assert_eq!(
+        loaded.resolved_provider("a").unwrap().proxy(),
+        Some("http://127.0.0.1:9999")
+    );
+    // ...while an explicit per-provider "none" keeps that provider direct.
+    assert_eq!(loaded.resolved_provider("b").unwrap().proxy(), Some("none"));
+}
+
+#[test]
+fn config_store_loads_legacy_files_without_proxy_fields() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("providers.json");
+    std::fs::write(
+        &path,
+        r#"{"providers":{"old":{"name":"old","base_url":"https://x.example/v1","api_key":"k","models":[]}}}"#,
+    )
+    .unwrap();
+
+    let loaded = ConfigStore::new(&path).load().unwrap();
+    assert_eq!(loaded.proxy(), None);
+    assert_eq!(loaded.provider("old").unwrap().proxy(), None);
+}

@@ -1961,3 +1961,77 @@ fn read_http_request(stream: &mut TcpStream) -> String {
 fn find_header_end(buffer: &[u8]) -> Option<usize> {
     buffer.windows(4).position(|window| window == b"\r\n\r\n")
 }
+
+#[test]
+fn provider_add_accepts_proxy_flag() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("providers.json");
+
+    let mut output = Vec::new();
+    cli::run(
+        vec![
+            "harness-cli".to_string(),
+            "provider".to_string(),
+            "add".to_string(),
+            "--config".to_string(),
+            config_path.to_string_lossy().into_owned(),
+            "--name".to_string(),
+            "openrouter".to_string(),
+            "--url".to_string(),
+            "https://openrouter.ai/api/v1".to_string(),
+            "--model".to_string(),
+            "openai/gpt-5.6-luna".to_string(),
+            "--key-env".to_string(),
+            "OPENROUTER_API_KEY".to_string(),
+            "--proxy".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+        ],
+        &mut output,
+    )
+    .unwrap();
+
+    let config = ConfigStore::new(&config_path).load().unwrap();
+    assert_eq!(
+        config.provider("openrouter").unwrap().proxy(),
+        Some("http://127.0.0.1:8080")
+    );
+}
+
+#[test]
+fn proxy_set_and_show_manage_the_global_proxy() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("providers.json");
+    let config_flag = config_path.to_string_lossy().into_owned();
+
+    let mut output = Vec::new();
+    cli::run(
+        vec![
+            "harness-cli".to_string(),
+            "proxy".to_string(),
+            "set".to_string(),
+            "http://user:pass@127.0.0.1:8080".to_string(),
+            "--config".to_string(),
+            config_flag.clone(),
+        ],
+        &mut output,
+    )
+    .unwrap();
+
+    let config = ConfigStore::new(&config_path).load().unwrap();
+    assert_eq!(config.proxy(), Some("http://user:pass@127.0.0.1:8080"));
+
+    let mut output = Vec::new();
+    cli::run(
+        vec![
+            "harness-cli".to_string(),
+            "proxy".to_string(),
+            "show".to_string(),
+            "--config".to_string(),
+            config_flag,
+        ],
+        &mut output,
+    )
+    .unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("http://user:pass@127.0.0.1:8080"));
+}

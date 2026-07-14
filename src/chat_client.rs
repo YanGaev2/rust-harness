@@ -11,6 +11,80 @@ use serde_json::{Map, Value, json};
 use crate::providers::{CachePolicy, ChatApiFormat, ProviderConfig};
 use crate::request::{ChatMessage, RequestEnvelope};
 
+/// Build the blocking HTTP agent. Non-2xx statuses come back as regular
+/// responses (`http_status_as_error(false)`) so callers can surface the
+/// provider's own error body instead of a bare status code.
+///
+/// Proxying is strictly opt-in via the harness config: `None`/"none" go
+/// direct (ambient HTTP_PROXY/HTTPS_PROXY are deliberately ignored so the
+/// environment can never silently reroute traffic), `"env"` opts into the
+/// environment variables, anything else is a proxy URL.
+fn http_agent(timeout: Duration, proxy: Option<&str>) -> ureq::Agent {
+    let proxy = match proxy.map(str::trim) {
+        None | Some("") | Some("none") => None,
+        Some("env") => ureq::Proxy::try_from_env(),
+        Some(url) => ureq::Proxy::new(url).ok(),
+    };
+    ureq::Agent::config_builder()
+        .timeout_global(Some(timeout))
+        .http_status_as_error(false)
+        .proxy(proxy)
+        .build()
+        .into()
+}
+
+/// Cache and auth headers a provider wants on every chat request.
+fn provider_headers(
+    provider: &ProviderConfig,
+    envelope: &RequestEnvelope,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    if let Some(header) = provider.cache_header(&envelope.cache_prefix_key()) {
+        headers.push(header);
+    }
+    if let Some(header) = provider.auth_header() {
+        headers.push(header);
+    }
+    headers
+}
+
+/// POST a JSON body; a non-2xx reply becomes [`ChatClientError::Status`]
+/// carrying up to 400 chars of the response body.
+fn post_json(
+    timeout: Duration,
+    proxy: Option<&str>,
+    url: &str,
+    accept: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<ureq::http::Response<ureq::Body>, ChatClientError> {
+    let agent = http_agent(timeout, proxy);
+    let mut request = agent
+        .post(url)
+        .header("Accept", accept)
+        .header("Content-Type", "application/json");
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    let mut response = request.send(body)?;
+    let code = response.status().as_u16();
+    if (200..300).contains(&code) {
+        return Ok(response);
+    }
+    let body = response.body_mut().read_to_string().unwrap_or_default();
+    let body = body.trim().chars().take(400).collect::<String>();
+    Err(ChatClientError::Status {
+        code,
+        url: url.to_string(),
+        body,
+    })
+}
+
+/// Read a successful response's whole body as UTF-8 text.
+fn response_text(response: ureq::http::Response<ureq::Body>) -> Result<String, ChatClientError> {
+    Ok(response.into_body().read_to_string()?)
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderChatClient {
     timeout: Duration,
@@ -156,22 +230,15 @@ impl OpenAiCompatibleChatClient {
             provider.base_url().trim_end_matches('/')
         );
         let body = openai_chat_body(provider, envelope);
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent
-            .post(&url)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json");
-        if let Some((name, value)) = provider.cache_header(&envelope.cache_prefix_key()) {
-            request = request.set(&name, &value);
-        }
-        if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
-        }
-
-        let response = request
-            .send_string(&body.to_string())?
-            .into_string()
-            .map_err(ChatClientError::Io)?;
+        let response = post_json(
+            self.timeout,
+            provider.proxy(),
+            &url,
+            "application/json",
+            &provider_headers(provider, envelope),
+            &body.to_string(),
+        )?;
+        let response = response_text(response)?;
         let raw: OpenAiChatCompletionResponse = serde_json::from_str(&response)?;
         raw.into_chat_response()
     }
@@ -190,20 +257,15 @@ impl OpenAiCompatibleChatClient {
             provider.base_url().trim_end_matches('/')
         );
         let body = openai_stream_body(provider, envelope);
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent
-            .post(&url)
-            .set("Accept", "text/event-stream")
-            .set("Content-Type", "application/json");
-        if let Some((name, value)) = provider.cache_header(&envelope.cache_prefix_key()) {
-            request = request.set(&name, &value);
-        }
-        if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
-        }
-
-        let response = request.send_string(&body.to_string())?;
-        read_openai_stream(response.into_reader(), on_delta)
+        let response = post_json(
+            self.timeout,
+            provider.proxy(),
+            &url,
+            "text/event-stream",
+            &provider_headers(provider, envelope),
+            &body.to_string(),
+        )?;
+        read_openai_stream(response.into_body().into_reader(), on_delta)
     }
 
     /// Stream a full turn (content, reasoning, and tool calls), emitting each
@@ -222,20 +284,19 @@ impl OpenAiCompatibleChatClient {
             provider.base_url().trim_end_matches('/')
         );
         let body = openai_stream_body(provider, envelope);
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent
-            .post(&url)
-            .set("Accept", "text/event-stream")
-            .set("Content-Type", "application/json");
-        if let Some((name, value)) = provider.cache_header(&envelope.cache_prefix_key()) {
-            request = request.set(&name, &value);
-        }
-        if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
-        }
-
-        let response = request.send_string(&body.to_string())?;
-        read_openai_stream_full(response.into_reader(), on_delta, self.cancel.as_deref())
+        let response = post_json(
+            self.timeout,
+            provider.proxy(),
+            &url,
+            "text/event-stream",
+            &provider_headers(provider, envelope),
+            &body.to_string(),
+        )?;
+        read_openai_stream_full(
+            response.into_body().into_reader(),
+            on_delta,
+            self.cancel.as_deref(),
+        )
     }
 }
 
@@ -277,22 +338,15 @@ impl OpenAiResponsesClient {
             endpoint.trim_start_matches('/')
         );
         let body = openai_responses_body(envelope);
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent
-            .post(&url)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json");
-        if let Some((name, value)) = provider.cache_header(&envelope.cache_prefix_key()) {
-            request = request.set(&name, &value);
-        }
-        if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
-        }
-
-        let response = request
-            .send_string(&body.to_string())?
-            .into_string()
-            .map_err(ChatClientError::Io)?;
+        let response = post_json(
+            self.timeout,
+            provider.proxy(),
+            &url,
+            "application/json",
+            &provider_headers(provider, envelope),
+            &body.to_string(),
+        )?;
+        let response = response_text(response)?;
         let raw: OpenAiResponsesResponse = serde_json::from_str(&response)?;
         Ok(raw.into_chat_response())
     }
@@ -315,23 +369,17 @@ impl AnthropicMessagesChatClient {
     ) -> Result<ChatResponse, ChatClientError> {
         let url = format!("{}/messages", provider.base_url().trim_end_matches('/'));
         let body = anthropic_messages_body(provider, envelope);
-        let agent = ureq::AgentBuilder::new().timeout(self.timeout).build();
-        let mut request = agent
-            .post(&url)
-            .set("Accept", "application/json")
-            .set("Content-Type", "application/json")
-            .set("anthropic-version", "2023-06-01");
-        if let Some((name, value)) = provider.cache_header(&envelope.cache_prefix_key()) {
-            request = request.set(&name, &value);
-        }
-        if let Some((name, value)) = provider.auth_header() {
-            request = request.set(&name, &value);
-        }
-
-        let response = request
-            .send_string(&body.to_string())?
-            .into_string()
-            .map_err(ChatClientError::Io)?;
+        let mut headers = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
+        headers.extend(provider_headers(provider, envelope));
+        let response = post_json(
+            self.timeout,
+            provider.proxy(),
+            &url,
+            "application/json",
+            &headers,
+            &body.to_string(),
+        )?;
+        let response = response_text(response)?;
         let raw: AnthropicMessagesResponse = serde_json::from_str(&response)?;
         raw.into_chat_response()
     }
@@ -466,6 +514,13 @@ impl<'de> Deserialize<'de> for TokenUsage {
 #[derive(Debug)]
 pub enum ChatClientError {
     Http(Box<ureq::Error>),
+    /// Non-2xx reply, with the provider's own error body preserved — a bare
+    /// "status code 403" is undiagnosable (moderation? credits? auth?).
+    Status {
+        code: u16,
+        url: String,
+        body: String,
+    },
     Io(std::io::Error),
     Json(serde_json::Error),
 }
@@ -474,6 +529,13 @@ impl fmt::Display for ChatClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(err) => write!(f, "chat request failed: {err}"),
+            Self::Status { code, url, body } => {
+                write!(f, "chat request failed: {url}: status {code}")?;
+                if !body.is_empty() {
+                    write!(f, ": {body}")?;
+                }
+                Ok(())
+            }
             Self::Io(err) => write!(f, "chat response read failed: {err}"),
             Self::Json(err) => write!(f, "invalid chat response: {err}"),
         }
@@ -484,6 +546,7 @@ impl Error for ChatClientError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Http(err) => Some(err.as_ref()),
+            Self::Status { .. } => None,
             Self::Io(err) => Some(err),
             Self::Json(err) => Some(err),
         }
@@ -492,6 +555,9 @@ impl Error for ChatClientError {
 
 impl From<ureq::Error> for ChatClientError {
     fn from(value: ureq::Error) -> Self {
+        // Non-2xx never reaches here: the agent is built with
+        // `http_status_as_error(false)` and `post_json` converts those to
+        // `Status` with the response body attached.
         Self::Http(Box::new(value))
     }
 }

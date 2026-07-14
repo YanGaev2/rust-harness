@@ -1,4 +1,4 @@
-﻿use std::io::{Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Duration;
@@ -62,6 +62,43 @@ fn openai_chat_body_carries_declared_tool_parameter_schemas() {
     server.join().unwrap();
 
     assert_eq!(response.content.as_deref(), Some("ok"));
+}
+
+#[test]
+fn http_error_status_message_includes_the_response_body() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        let response_body = r#"{"error":{"message":"Key limit exceeded: add credits","code":403}}"#;
+        let response = format!(
+            "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let provider = ProviderConfig::new("openrouter", format!("http://{addr}/v1"), "sk-test");
+    let envelope = RequestEnvelope::new("openrouter", "openai/gpt-5.6-luna")
+        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
+        .with_messages(vec![ChatMessage::user("ping")]);
+
+    let err = OpenAiCompatibleChatClient::new(Duration::from_secs(2))
+        .send(&provider, &envelope)
+        .unwrap_err();
+    server.join().unwrap();
+
+    let message = err.to_string();
+    // A bare "status code 403" is undiagnosable; the provider's own error
+    // text must reach the user.
+    assert!(message.contains("403"), "message: {message}");
+    assert!(
+        message.contains("Key limit exceeded: add credits"),
+        "message: {message}"
+    );
 }
 
 #[test]

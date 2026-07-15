@@ -170,6 +170,25 @@ fn config_store_round_trips_global_proxy_and_resolves_into_providers() {
 }
 
 #[test]
+fn config_store_round_trips_provider_extra_body() {
+    let root = tempfile::tempdir().unwrap();
+    let store = ConfigStore::new(root.path().join("providers.json"));
+
+    let extra = serde_json::json!({
+        "provider": {"only": ["wandb"], "allow_fallbacks": false},
+    });
+    let provider = ProviderConfig::new("openrouter", "https://openrouter.ai/api/v1", "sk-or")
+        .with_extra_body(extra.clone());
+    store.save_provider(provider).unwrap();
+
+    let loaded = store.load().unwrap();
+    assert_eq!(
+        loaded.provider("openrouter").unwrap().extra_body(),
+        Some(&extra)
+    );
+}
+
+#[test]
 fn config_store_loads_legacy_files_without_proxy_fields() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("providers.json");

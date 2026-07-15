@@ -24,6 +24,13 @@ pub struct ProviderConfig {
     /// `None` inherits the config-level proxy, defaulting to direct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     proxy: Option<String>,
+    /// Provider-specific JSON object merged into the top level of every
+    /// request body (OpenAI-compatible format only), e.g. OpenRouter's
+    /// `{"provider": {"only": ["wandb"]}}` routing or DashScope's
+    /// `{"enable_thinking": false}`. Core fields (model, messages, tools,
+    /// stream) always win on key collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    extra_body: Option<serde_json::Value>,
 }
 
 impl ProviderConfig {
@@ -42,6 +49,7 @@ impl ProviderConfig {
             chat_api: ChatApiFormat::default(),
             key_env: None,
             proxy: None,
+            extra_body: None,
         }
     }
 
@@ -56,6 +64,7 @@ impl ProviderConfig {
             chat_api: ChatApiFormat::default(),
             key_env: None,
             proxy: None,
+            extra_body: None,
         }
     }
 
@@ -145,6 +154,17 @@ impl ProviderConfig {
     /// means "inherit the global config proxy, default direct".
     pub fn proxy(&self) -> Option<&str> {
         self.proxy.as_deref()
+    }
+
+    pub fn with_extra_body(mut self, extra_body: serde_json::Value) -> Self {
+        self.extra_body = Some(extra_body);
+        self
+    }
+
+    /// Extra JSON merged into the top level of OpenAI-compatible request
+    /// bodies; core fields win on key collision.
+    pub fn extra_body(&self) -> Option<&serde_json::Value> {
+        self.extra_body.as_ref()
     }
 
     pub fn key_env(&self) -> Option<&str> {

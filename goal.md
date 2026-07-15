@@ -674,3 +674,13 @@ ust-harness\README.md` - the absolute
   CONNECT-tunnel mock proving a configured proxy is used). CLI: provider add
   --proxy, harness proxy set|show. WSL verification now uses cargo vendor
   (146MB, gitignored) because WSL currently has no network access.
+- Per-provider extra_body (2026-07-15): providers.json accepts an "extra_body"
+  JSON object merged into the top level of every OpenAI-compatible request
+  body; core fields (model, messages, tools, stream) win on key collision so
+  a config typo cannot silently replace them. Motivation: OpenRouter provider
+  pinning ({"provider": {"only": ["wandb"], "allow_fallbacks": false}}) for
+  clean single-backend benchmarks - the :slug model suffix is silently
+  ignored by OpenRouter (request landed on Parasail), so the routing object
+  is the only reliable pin. Also covers vendor switches like DashScope's
+  enable_thinking. Tests: config round-trip + a mock server asserting the
+  routing fields reach the wire and cannot clobber the model.

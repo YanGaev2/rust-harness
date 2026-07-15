@@ -65,6 +65,49 @@ fn openai_chat_body_carries_declared_tool_parameter_schemas() {
 }
 
 #[test]
+fn provider_extra_body_fields_are_merged_into_the_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = read_http_request(&mut stream);
+        let body = request.split("\r\n\r\n").nth(1).unwrap();
+        let json: Value = serde_json::from_str(body).unwrap();
+
+        // Provider-specific routing fields reach the wire...
+        assert_eq!(json["provider"]["only"][0], "wandb");
+        assert_eq!(json["provider"]["allow_fallbacks"], false);
+        // ...but extra_body must not clobber core request fields.
+        assert_eq!(json["model"], "qwen/qwen3.6-35b-a3b");
+
+        let response_body = r#"{"choices": [{"message": {"role": "assistant", "content": "ok"}}]}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let provider = ProviderConfig::new("openrouter", format!("http://{addr}/v1"), "sk-test")
+        .with_extra_body(serde_json::json!({
+            "provider": {"only": ["wandb"], "allow_fallbacks": false},
+            "model": "must-not-override",
+        }));
+    let envelope = RequestEnvelope::new("openrouter", "qwen/qwen3.6-35b-a3b")
+        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
+        .with_messages(vec![ChatMessage::user("ping")]);
+
+    let response = OpenAiCompatibleChatClient::new(Duration::from_secs(2))
+        .send(&provider, &envelope)
+        .unwrap();
+    server.join().unwrap();
+
+    assert_eq!(response.content.as_deref(), Some("ok"));
+}
+
+#[test]
 fn http_error_status_message_includes_the_response_body() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();

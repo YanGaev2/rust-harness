@@ -848,11 +848,21 @@ fn openai_chat_body(provider: &ProviderConfig, envelope: &RequestEnvelope) -> Va
         })
         .collect::<Vec<_>>();
 
-    json!({
+    let mut body = json!({
         "model": envelope.model(),
         "messages": messages,
         "tools": tools,
-    })
+    });
+    // Provider-specific fields (OpenRouter routing, vendor switches) ride
+    // along at the top level; core fields win on key collision so a config
+    // typo cannot silently replace the model or messages.
+    if let (Value::Object(object), Some(Value::Object(extra))) = (&mut body, provider.extra_body())
+    {
+        for (key, value) in extra {
+            object.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    body
 }
 
 fn openai_stream_body(provider: &ProviderConfig, envelope: &RequestEnvelope) -> Value {

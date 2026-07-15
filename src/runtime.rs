@@ -992,7 +992,16 @@ where
             return Vec::new();
         }
 
-        let max_concurrency = self.max_concurrency.min(total);
+        // A batch that touches one path from two calls (with at least one
+        // mutation) degrades to sequential execution in input order:
+        // concurrent read-modify-write edits of the same file otherwise
+        // clobber each other while every call still reports ok=true.
+        let max_concurrency = if batch_mutates_shared_paths(&calls) {
+            1
+        } else {
+            self.max_concurrency
+        }
+        .min(total);
         let originals = calls.clone();
         let mut pending = calls.into_iter().enumerate();
         let (tx, rx) = mpsc::channel();
@@ -1073,6 +1082,81 @@ where
             })
             .collect()
     }
+}
+
+/// True when two calls in the batch touch the same workspace path and at
+/// least one of them mutates it. Shell commands are opaque (no paths), so
+/// they never participate; unparsable arguments contribute nothing and fail
+/// later in the executor instead.
+fn batch_mutates_shared_paths(calls: &[ToolCall]) -> bool {
+    let touched: Vec<(Vec<String>, bool)> = calls.iter().map(call_conflict_paths).collect();
+    for (index, (paths, mutates)) in touched.iter().enumerate() {
+        for (other_paths, other_mutates) in touched.iter().skip(index + 1) {
+            if (*mutates || *other_mutates) && paths.iter().any(|path| other_paths.contains(path)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// The workspace paths a call will touch (normalized for comparison) and
+/// whether it mutates them. Alias lists mirror the executors'.
+fn call_conflict_paths(call: &ToolCall) -> (Vec<String>, bool) {
+    const PATH_ALIASES: &[&str] = &[
+        "path",
+        "file",
+        "filename",
+        "file_path",
+        "filepath",
+        "target_file",
+    ];
+    const MOVE_SOURCE_ALIASES: &[&str] = &["source", "from", "path", "file", "src", "source_path"];
+    const MOVE_TARGET_ALIASES: &[&str] = &[
+        "target",
+        "to",
+        "destination",
+        "dest",
+        "target_path",
+        "destination_path",
+    ];
+
+    let Ok(resolution) = ToolResolution::from_name(&call.name) else {
+        return (Vec::new(), false);
+    };
+    let lookup = |aliases: &[&str]| -> Option<String> {
+        let object = call.arguments.as_object()?;
+        aliases
+            .iter()
+            .find_map(|name| Some(normalize_conflict_path(object.get(*name)?.as_str()?)))
+    };
+
+    match resolution.canonical.as_str() {
+        "file.write" | "file.append" | "file.replace" | "file.delete" => {
+            (lookup(PATH_ALIASES).into_iter().collect(), true)
+        }
+        "file.move" => (
+            lookup(MOVE_SOURCE_ALIASES)
+                .into_iter()
+                .chain(lookup(MOVE_TARGET_ALIASES))
+                .collect(),
+            true,
+        ),
+        "file.read" | "file.tail" | "file.hash" | "file.stat" => {
+            (lookup(PATH_ALIASES).into_iter().collect(), false)
+        }
+        _ => (Vec::new(), false),
+    }
+}
+
+/// Comparison form for conflict detection: forward slashes, no leading
+/// "./", case-folded (Windows filesystems are case-insensitive; folding on
+/// Linux merely over-serializes, which is safe).
+fn normalize_conflict_path(raw: &str) -> String {
+    raw.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .to_ascii_lowercase()
 }
 
 #[derive(Debug)]

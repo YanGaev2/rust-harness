@@ -1,6 +1,6 @@
 # harness-cli
 
-> **793 tool calls across 4 model families. 0 failed. 0 repairs needed.**
+> **1007 tool calls across 5 model families. 0 failed. 0 repairs needed.**
 
 A **4 MB** Rust agent harness (Windows + Linux) that speaks your model's
 native tool dialect: tool names, argument shapes, and schemas are
@@ -35,11 +35,15 @@ real APIs, real filesystem):
 |---|---|---|---|---|
 | glm-5.2 | **52/52** | 185 | 0 / 0 | ~85% |
 | deepseek-v4-pro | 51/52 | 218 | 0 / 0 | ~85% (64-token blocks) |
+| qwen3.6-35b-a3b | 51/52 | 214 | 0 / 0 | 54% |
 | qwen3.7-max | 50/52 | 195 | 0 / 0 | 30% (2048-token minimum) |
 | gpt-5.6-luna | 48/52 | 195 | 0 / 0 | 44% |
 
-Every benchmark miss is model-side (mental arithmetic, safety refusals) —
-**across 793 real tool calls the tools themselves never broke once**.
+Every benchmark miss is model-side (mental arithmetic, safety refusals) or
+a transient upstream error — **across 1007 real tool calls the tools
+themselves never broke once**. The bench also audits the harness itself:
+one run exposed a scheduler race that silently dropped two of three
+same-file edits, now fixed and covered by deterministic regression tests.
 
 <details>
 <summary><b>How tools get fitted to a model</b></summary>

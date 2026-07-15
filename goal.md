@@ -684,3 +684,14 @@ ust-harness\README.md` - the absolute
   is the only reliable pin. Also covers vendor switches like DashScope's
   enable_thinking. Tests: config round-trip + a mock server asserting the
   routing fields reach the wire and cannot clobber the model.
+- Same-file batch race fix (2026-07-15): the qwen3.6-35b bench (51/52) exposed
+  the worst failure class - silent loss. A single round carrying three
+  edit_file calls for one file ran them concurrently; each did
+  read-modify-write, the last writer won, two edits vanished while all three
+  reported ok=true. The identical batch shape explains the one DeepSeek
+  multi_edit failure previously misfiled as "model variance". ToolScheduler
+  now scans each batch: if two calls touch the same normalized workspace path
+  and at least one mutates it (write/append/replace/delete/move), the whole
+  batch degrades to sequential execution in input order; disjoint paths and
+  pure reads keep full parallelism. Deterministic regression tests observe
+  max in-flight concurrency instead of racing the filesystem.

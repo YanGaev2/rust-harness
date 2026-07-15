@@ -155,6 +155,144 @@ fn scheduler_marks_unfinished_calls_when_batch_timeout_expires() {
     }));
 }
 
+#[test]
+fn scheduler_serializes_calls_that_mutate_the_same_file() {
+    let state = Arc::new(Mutex::new(ConcurrencyState {
+        running: 0,
+        max_seen: 0,
+    }));
+    let scheduler = ToolScheduler::new(ObservedExecutor {
+        state: Arc::clone(&state),
+    })
+    .with_max_concurrency(4);
+
+    // Three edits of one file in a single round — the multi_edit bench batch
+    // that silently lost two of three changes to a read-modify-write race.
+    // Alias spellings and "./" prefixes must not defeat the conflict check.
+    let results = scheduler.execute_batch(vec![
+        ToolCall::new(
+            "first",
+            "edit_file",
+            json!({"file_path": "app.ini", "old_string": "port = 5432", "new_string": "port = 6543"}),
+        ),
+        ToolCall::new(
+            "second",
+            "edit_file",
+            json!({"path": "./app.ini", "old_string": "ttl = 60", "new_string": "ttl = 300"}),
+        ),
+        ToolCall::new(
+            "third",
+            "edit_file",
+            json!({"file": "APP.INI", "old_string": "rate_limit = 100", "new_string": "rate_limit = 250"}),
+        ),
+    ]);
+
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second", "third"]
+    );
+    let max_seen = state.lock().unwrap().max_seen;
+    assert_eq!(
+        max_seen, 1,
+        "same-file mutations must run sequentially, saw {max_seen} in flight"
+    );
+}
+
+#[test]
+fn scheduler_serializes_a_read_racing_a_write_of_the_same_file() {
+    let state = Arc::new(Mutex::new(ConcurrencyState {
+        running: 0,
+        max_seen: 0,
+    }));
+    let scheduler = ToolScheduler::new(ObservedExecutor {
+        state: Arc::clone(&state),
+    })
+    .with_max_concurrency(4);
+
+    scheduler.execute_batch(vec![
+        ToolCall::new("read", "read_file", json!({"file_path": "notes.md"})),
+        ToolCall::new(
+            "write",
+            "write_file",
+            json!({"file_path": "notes.md", "content": "new"}),
+        ),
+    ]);
+
+    assert_eq!(state.lock().unwrap().max_seen, 1);
+}
+
+#[test]
+fn scheduler_keeps_parallelism_for_disjoint_files_and_pure_reads() {
+    let state = Arc::new(Mutex::new(ConcurrencyState {
+        running: 0,
+        max_seen: 0,
+    }));
+    let scheduler = ToolScheduler::new(ObservedExecutor {
+        state: Arc::clone(&state),
+    })
+    .with_max_concurrency(4);
+
+    // Mutations of different files plus two reads of one shared file: no
+    // write/write or read/write overlap, so concurrency must survive.
+    scheduler.execute_batch(vec![
+        ToolCall::new(
+            "a",
+            "edit_file",
+            json!({"file_path": "a.txt", "old_string": "x", "new_string": "y"}),
+        ),
+        ToolCall::new(
+            "b",
+            "edit_file",
+            json!({"file_path": "b.txt", "old_string": "x", "new_string": "y"}),
+        ),
+        ToolCall::new("r1", "read_file", json!({"file_path": "shared.md"})),
+        ToolCall::new("r2", "read_file", json!({"file_path": "shared.md"})),
+    ]);
+
+    let max_seen = state.lock().unwrap().max_seen;
+    assert!(
+        max_seen > 1,
+        "disjoint calls should still run in parallel, saw {max_seen}"
+    );
+}
+
+#[test]
+fn concurrent_edits_of_one_file_all_apply() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("app.ini"),
+        "port = 5432\nttl = 60\nrate_limit = 100\n",
+    )
+    .unwrap();
+    let scheduler = ToolScheduler::new(harness_cli::runtime::ToolRuntime::new(root.path()))
+        .with_max_concurrency(4);
+
+    let results = scheduler.execute_batch(vec![
+        ToolCall::new(
+            "first",
+            "edit_file",
+            json!({"file_path": "app.ini", "old_string": "port = 5432", "new_string": "port = 6543"}),
+        ),
+        ToolCall::new(
+            "second",
+            "edit_file",
+            json!({"file_path": "app.ini", "old_string": "ttl = 60", "new_string": "ttl = 300"}),
+        ),
+        ToolCall::new(
+            "third",
+            "edit_file",
+            json!({"file_path": "app.ini", "old_string": "rate_limit = 100", "new_string": "rate_limit = 250"}),
+        ),
+    ]);
+
+    assert!(results.iter().all(|result| result.ok));
+    let content = std::fs::read_to_string(root.path().join("app.ini")).unwrap();
+    assert_eq!(content, "port = 6543\nttl = 300\nrate_limit = 250\n");
+}
+
 #[derive(Debug, Clone)]
 struct ObservedExecutor {
     state: Arc<Mutex<ConcurrencyState>>,

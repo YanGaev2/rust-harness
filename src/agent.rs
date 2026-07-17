@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::chat_client::{ChatClientError, ChatToolCall, ProviderChatClient, StreamDelta};
+use crate::failover::{FailureAction, classify};
 use crate::guardrails::{GuardrailController, GuardrailDecision};
 use crate::prompt::agent_system_prompt;
 use crate::providers::ProviderConfig;
@@ -26,6 +27,9 @@ pub struct AgentRunner {
     stream: bool,
     history: Vec<ChatMessage>,
     cancel: Option<Arc<AtomicBool>>,
+    /// Цепочка (провайдер, модель) на случай quota/5xx у текущего бэкенда;
+    /// порядок = приоритет. Пустая цепочка = поведение как раньше.
+    fallback: Vec<(ProviderConfig, String)>,
 }
 
 impl AgentRunner {
@@ -45,7 +49,16 @@ impl AgentRunner {
             stream: false,
             history: Vec::new(),
             cancel: None,
+            fallback: Vec::new(),
         }
+    }
+
+    /// Fallback-цепочка: при классифицированной как «переключаемой» ошибке
+    /// (quota, 5xx, overloaded — см. failover.rs) запрос уходит к следующей
+    /// паре провайдер/модель. Auth и context-overflow не переключают.
+    pub fn with_fallback(mut self, fallback: Vec<(ProviderConfig, String)>) -> Self {
+        self.fallback = fallback;
+        self
     }
 
     /// Cooperative cancellation (Esc/Ctrl+C in the UI): the flag is checked
@@ -140,6 +153,11 @@ impl AgentRunner {
         let mut tool_rounds = 0;
         // Per-run: детект повторяющихся бесплодных вызовов (см. guardrails.rs).
         let mut guardrails = GuardrailController::new();
+        // Активный бэкенд: начинается с primary, продвигается по fallback-цепочке
+        // на переключаемых ошибках. Индекс не сбрасывается в рамках одного run.
+        let mut current_provider = self.provider.clone();
+        let mut current_model = self.model.clone();
+        let mut fallback_index = 0usize;
         let mut trace = AgentTrace::new(
             self.provider.name().to_string(),
             self.model.clone(),
@@ -151,29 +169,92 @@ impl AgentRunner {
             if self.is_cancelled() {
                 return Err(Self::cancelled(trace));
             }
-            let envelope = RequestEnvelope::new(self.provider.name(), &self.model)
-                .with_system_prompt(&system_prompt)
-                .with_cache_mode(CacheMode::ProviderPrefix)
-                .with_tools(ToolRuntime::tool_specs_with_shell(shell))
-                .with_messages(messages.clone());
             // When streaming, thinking and answer fragments are emitted live as
             // they arrive; the flags below stop us re-emitting the full text again.
             let mut reasoning_streamed = false;
             let mut content_streamed = false;
-            let response = if self.stream {
-                client.stream_chat(&self.provider, &envelope, |delta| match delta {
-                    StreamDelta::Reasoning(chunk) if !chunk.is_empty() => {
-                        reasoning_streamed = true;
-                        on_event(AgentEvent::Thinking(chunk.to_string()));
+            // До двух повторов на месте при коротком Retry-After; счётчик
+            // обнуляется при переключении на следующий бэкенд цепочки.
+            let mut retries_in_place = 0u32;
+            let response = loop {
+                // Envelope пересобирается на каждую попытку: после переключения
+                // provider/model меняют и cache-prefix, и тело запроса.
+                let envelope = RequestEnvelope::new(current_provider.name(), &current_model)
+                    .with_system_prompt(&system_prompt)
+                    .with_cache_mode(CacheMode::ProviderPrefix)
+                    .with_tools(ToolRuntime::tool_specs_with_shell(shell))
+                    .with_messages(messages.clone());
+                let attempt = if self.stream {
+                    client.stream_chat(&current_provider, &envelope, |delta| match delta {
+                        StreamDelta::Reasoning(chunk) if !chunk.is_empty() => {
+                            reasoning_streamed = true;
+                            on_event(AgentEvent::Thinking(chunk.to_string()));
+                        }
+                        StreamDelta::Content(chunk) if !chunk.is_empty() => {
+                            content_streamed = true;
+                            on_event(AgentEvent::FinalContentDelta(chunk.to_string()));
+                        }
+                        _ => {}
+                    })
+                } else {
+                    client.send(&current_provider, &envelope)
+                };
+                let err = match attempt {
+                    Ok(response) => break response,
+                    Err(err) => err,
+                };
+
+                let classified = classify(&err);
+                let wants_switch = match classified.action {
+                    FailureAction::RetrySameProvider { after_seconds } => {
+                        if retries_in_place < 2 {
+                            retries_in_place += 1;
+                            std::thread::sleep(Duration::from_secs(after_seconds.min(10)));
+                            if self.is_cancelled() {
+                                return Err(Self::cancelled(trace));
+                            }
+                            continue;
+                        }
+                        // Ретраи не помогли — трактуем как переключаемую.
+                        true
                     }
-                    StreamDelta::Content(chunk) if !chunk.is_empty() => {
-                        content_streamed = true;
-                        on_event(AgentEvent::FinalContentDelta(chunk.to_string()));
+                    FailureAction::SwitchProvider => true,
+                    FailureAction::Fail => false,
+                };
+                if wants_switch {
+                    // Пропускаем записи, совпадающие с только что упавшим
+                    // бэкендом: падать в него же — зациклить отказ.
+                    let next = loop {
+                        let Some((provider, model)) = self.fallback.get(fallback_index) else {
+                            break None;
+                        };
+                        fallback_index += 1;
+                        if provider.name() == current_provider.name() && *model == current_model {
+                            continue;
+                        }
+                        break Some((provider.clone(), model.clone()));
+                    };
+                    if let Some((next_provider, next_model)) = next {
+                        let reason = format!("{:?}", classified.reason);
+                        on_event(AgentEvent::ProviderSwitched {
+                            from_provider: current_provider.name().to_string(),
+                            from_model: current_model.clone(),
+                            to_provider: next_provider.name().to_string(),
+                            to_model: next_model.clone(),
+                            reason: reason.clone(),
+                        });
+                        trace.events.push(AgentTraceEvent::ProviderSwitched {
+                            from: format!("{}/{current_model}", current_provider.name()),
+                            to: format!("{}/{next_model}", next_provider.name()),
+                            reason,
+                        });
+                        current_provider = next_provider;
+                        current_model = next_model;
+                        retries_in_place = 0;
+                        continue;
                     }
-                    _ => {}
-                })?
-            } else {
-                client.send(&self.provider, &envelope)?
+                }
+                return Err(err.into());
             };
 
             // Esc during a streamed answer: the client already stopped reading
@@ -357,6 +438,16 @@ pub enum AgentEvent {
     /// Cumulative session usage after each model request, so UIs can show
     /// live token/cost counters without re-parsing the trace.
     UsageUpdated(UsageTotals),
+    /// The active backend changed mid-run (fallback chain rescued a
+    /// quota/5xx failure); UIs surface it so the user knows which model
+    /// actually produced the answer.
+    ProviderSwitched {
+        from_provider: String,
+        from_model: String,
+        to_provider: String,
+        to_model: String,
+        reason: String,
+    },
 }
 
 /// Token totals across all requests of a run, cache-aware: `cached_tokens`
@@ -477,6 +568,11 @@ pub enum AgentTraceEvent {
     ToolResult {
         round: usize,
         result: ToolBatchResult,
+    },
+    ProviderSwitched {
+        from: String,
+        to: String,
+        reason: String,
     },
     FinalContent {
         content: Option<String>,

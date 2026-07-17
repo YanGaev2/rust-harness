@@ -920,6 +920,19 @@ impl ChatApp {
                 self.streaming_assistant = false;
                 self.streaming_thinking = false;
             }
+            AgentEvent::ProviderSwitched {
+                from_provider,
+                from_model,
+                to_provider,
+                to_model,
+                reason,
+            } => {
+                self.transcript.push(ChatEntry::System(format!(
+                    "⚠ provider switch: {from_provider}/{from_model} → {to_provider}/{to_model} ({reason})"
+                )));
+                self.streaming_assistant = false;
+                self.streaming_thinking = false;
+            }
             AgentEvent::FinalContentDelta(delta) => {
                 self.streaming_thinking = false;
                 match (self.streaming_assistant, self.transcript.last_mut()) {

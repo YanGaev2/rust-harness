@@ -13,6 +13,7 @@ use crate::clipboard::{
 };
 use crate::config::{ConfigError, ConfigStore};
 use crate::diagnostics::{self, DiagnosticsOptions};
+use crate::failover::{FailoverError, FallbackChain};
 use crate::model_client::{ModelClientError, OpenAiCompatibleModelClient};
 use crate::prompt::DEFAULT_SYSTEM_PROMPT;
 use crate::providers::{
@@ -554,6 +555,7 @@ fn chat_stream<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError
 
 fn agent_run<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
     let flags = AgentRunFlags::parse(args)?;
+    let fallback_path = flags.config_path.with_file_name("fallback.json");
     let config = ConfigStore::new(flags.config_path).load()?;
     let provider = config
         .provider(&flags.provider_name)
@@ -570,6 +572,24 @@ fn agent_run<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> 
     }
     if let Some(tool_timeout) = flags.tool_timeout {
         runner = runner.with_tool_batch_timeout(tool_timeout);
+    }
+    // fallback.json рядом с providers.json: цепочка (провайдер, модель) на
+    // случай quota/5xx. Неизвестные провайдеры пропускаются с предупреждением,
+    // битый JSON — ошибка (молча терять конфиг пользователя нельзя).
+    if let Some(chain) = FallbackChain::load(&fallback_path)? {
+        let mut entries = Vec::new();
+        for entry in &chain.entries {
+            match config.provider(&entry.provider) {
+                Some(provider) => entries.push((provider.clone(), entry.model.clone())),
+                None => eprintln!(
+                    "warning: fallback entry {}/{} skipped: unknown provider",
+                    entry.provider, entry.model
+                ),
+            }
+        }
+        if !entries.is_empty() {
+            runner = runner.with_fallback(entries);
+        }
     }
 
     let result = match runner.run(flags.message) {
@@ -1867,6 +1887,7 @@ fn key_source_label(provider: &ProviderConfig) -> String {
 pub enum CliError {
     Usage(String),
     Config(ConfigError),
+    Failover(FailoverError),
     Model(ModelClientError),
     Chat(ChatClientError),
     Agent(AgentError),
@@ -1883,6 +1904,7 @@ impl fmt::Display for CliError {
         match self {
             Self::Usage(msg) => write!(f, "{msg}"),
             Self::Config(err) => write!(f, "{err}"),
+            Self::Failover(err) => write!(f, "{err}"),
             Self::Model(err) => write!(f, "{err}"),
             Self::Chat(err) => write!(f, "{err}"),
             Self::Agent(err) => write!(f, "{err}"),
@@ -1901,6 +1923,7 @@ impl Error for CliError {
         match self {
             Self::Usage(_) => None,
             Self::Config(err) => Some(err),
+            Self::Failover(err) => Some(err),
             Self::Model(err) => Some(err),
             Self::Chat(err) => Some(err),
             Self::Agent(err) => Some(err),
@@ -1917,6 +1940,12 @@ impl Error for CliError {
 impl From<ConfigError> for CliError {
     fn from(value: ConfigError) -> Self {
         Self::Config(value)
+    }
+}
+
+impl From<FailoverError> for CliError {
+    fn from(value: FailoverError) -> Self {
+        Self::Failover(value)
     }
 }
 

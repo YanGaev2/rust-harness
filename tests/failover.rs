@@ -133,3 +133,45 @@ fn timeout_408_switches() {
     assert_eq!(c.reason, FailureReason::Timeout);
     assert_eq!(c.action, FailureAction::SwitchProvider);
 }
+
+// ---------------------------------------------------------------- цепочка
+
+use harness_cli::failover::FallbackChain;
+
+#[test]
+fn missing_fallback_file_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(
+        FallbackChain::load(&dir.path().join("fallback.json"))
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn fallback_file_parses_chain_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fallback.json");
+    std::fs::write(
+        &path,
+        r#"{"chain":[
+            {"provider":"mimo","model":"mimo-v2.5-pro"},
+            {"provider":"deepseek","model":"deepseek-chat"}
+        ]}"#,
+    )
+    .unwrap();
+    let chain = FallbackChain::load(&path).unwrap().unwrap();
+    assert_eq!(chain.entries.len(), 2);
+    assert_eq!(chain.entries[0].provider, "mimo");
+    assert_eq!(chain.entries[0].model, "mimo-v2.5-pro");
+    assert_eq!(chain.entries[1].provider, "deepseek");
+    assert_eq!(chain.entries[1].model, "deepseek-chat");
+}
+
+#[test]
+fn malformed_fallback_file_is_error_not_silent_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fallback.json");
+    std::fs::write(&path, "{oops").unwrap();
+    assert!(FallbackChain::load(&path).is_err());
+}

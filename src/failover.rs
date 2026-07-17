@@ -5,6 +5,12 @@
 //! следующую модель цепочки) vs наши собственные ошибки (fail-fast:
 //! переключение их только маскирует — auth, context overflow, битый парс).
 
+use std::error::Error;
+use std::fmt;
+use std::path::Path;
+
+use serde::Deserialize;
+
 use crate::chat_client::ChatClientError;
 
 /// Дольше этого ждать на месте не имеет смысла — при наличии цепочки
@@ -86,6 +92,58 @@ pub fn classify(err: &ChatClientError) -> ClassifiedError {
             reason: FailureReason::ResponseFormat,
             action: FailureAction::Fail,
         },
+    }
+}
+
+/// Одна запись цепочки: провайдер из providers.json + имя модели.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FallbackEntry {
+    pub provider: String,
+    pub model: String,
+}
+
+/// Цепочка переключения из `fallback.json` (лежит рядом с providers.json).
+/// Отсутствие файла — не ошибка (конвенция ConfigStore: missing = empty);
+/// битый JSON — ошибка, молча терять конфиг пользователя нельзя.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct FallbackChain {
+    #[serde(rename = "chain")]
+    pub entries: Vec<FallbackEntry>,
+}
+
+impl FallbackChain {
+    pub fn load(path: &Path) -> Result<Option<Self>, FailoverError> {
+        let raw = match std::fs::read_to_string(path) {
+            Ok(raw) => raw,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(FailoverError::Io(err)),
+        };
+        let chain: Self = serde_json::from_str(&raw).map_err(FailoverError::Parse)?;
+        Ok(Some(chain))
+    }
+}
+
+#[derive(Debug)]
+pub enum FailoverError {
+    Io(std::io::Error),
+    Parse(serde_json::Error),
+}
+
+impl fmt::Display for FailoverError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(err) => write!(f, "fallback config read failed: {err}"),
+            Self::Parse(err) => write!(f, "fallback config is not valid JSON: {err}"),
+        }
+    }
+}
+
+impl Error for FailoverError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Io(err) => Some(err),
+            Self::Parse(err) => Some(err),
+        }
     }
 }
 

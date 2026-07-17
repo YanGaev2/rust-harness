@@ -828,6 +828,18 @@ pub fn render_agent_event<W: Write>(event: &AgentEvent, output: &mut W) -> io::R
         }
         // Line mode keeps quiet about usage; the totals live in the trace.
         AgentEvent::UsageUpdated(_) => {}
+        AgentEvent::ProviderSwitched {
+            from_provider,
+            from_model,
+            to_provider,
+            to_model,
+            reason,
+        } => {
+            writeln!(
+                output,
+                "⚠ provider switch: {from_provider}/{from_model} → {to_provider}/{to_model} ({reason})"
+            )?;
+        }
     }
     output.flush()
 }

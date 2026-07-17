@@ -1495,3 +1495,45 @@ fn runtime_coerces_string_boolean_for_file_move_overwrite() {
         "new"
     );
 }
+
+#[test]
+fn camelcase_tool_name_resolves_with_repair_flag() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Приор MiMo/hermes: часть моделей шлёт CamelCase-имена (ReadFile,
+    // GrepSearch) — это ремонтируемый диалект, не ошибка.
+    let result = runtime
+        .execute(ToolCall::new("c1", "ReadFile", json!({"path": "a.txt"})))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired, "CamelCase is a repaired alias");
+    assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn tool_suffix_is_stripped() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // hermes-agent repair_tool_call: суффикс _tool срезается (дважды max).
+    for name in ["read_file_tool", "ReadFileTool"] {
+        let result = runtime
+            .execute(ToolCall::new("c1", name, json!({"path": "a.txt"})))
+            .unwrap();
+        assert_eq!(result.tool_name, "file.read", "{name}");
+        assert!(result.repaired, "{name} must be flagged repaired");
+        assert!(result.ok, "{name}: {result:?}");
+    }
+    let result = runtime
+        .execute(ToolCall::new(
+            "c2",
+            "grep_search_tool",
+            json!({"pattern": "hello"}),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.search");
+    assert!(result.repaired);
+}

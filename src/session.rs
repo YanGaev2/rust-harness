@@ -239,7 +239,9 @@ impl Session {
                         })?;
                     }
                 }
-                AgentTraceEvent::Error { .. } => {}
+                // Метаданные хода, а не реплики диалога: в реплей провайдеру
+                // не попадают.
+                AgentTraceEvent::Error { .. } | AgentTraceEvent::ProviderSwitched { .. } => {}
             }
         }
         Ok(())

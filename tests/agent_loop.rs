@@ -228,8 +228,10 @@ fn agent_runner_returns_tool_errors_to_model_and_continues() {
     });
 
     let provider = ProviderConfig::new("local", format!("http://{addr}/v1"), "sk-agent");
+    // 10s: под полным параллельным прогоном 2s клиентского таймаута хватало
+    // не всегда — клиент рвал соединение, мок падал на недочитанном запросе.
     let runner = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
-        .with_timeout(Duration::from_secs(2))
+        .with_timeout(Duration::from_secs(10))
         .with_max_tool_rounds(3);
 
     let result = runner.run("try a tool");
@@ -612,6 +614,102 @@ fn agent_runner_replays_history_before_new_user_message() {
 }
 
 #[test]
+fn agent_switches_to_fallback_on_quota_429() {
+    let listener_a = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_a = listener_a.local_addr().unwrap();
+    let listener_b = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr_b = listener_b.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let server_a = thread::spawn(move || {
+        let (mut stream, _) = listener_a.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        let body = r#"{"error":{"message":"You exceeded your current quota"}}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+    let server_b = thread::spawn(move || {
+        let (mut stream, _) = listener_b.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        respond(
+            &mut stream,
+            r#"{
+                "choices": [{"message": {"role": "assistant", "content": "switched ok"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            }"#,
+        );
+    });
+
+    let provider_a = ProviderConfig::new("a", format!("http://{addr_a}/v1"), "sk-a");
+    let provider_b = ProviderConfig::new("b", format!("http://{addr_b}/v1"), "sk-b");
+    let runner = AgentRunner::new(provider_a, "model-a", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_fallback(vec![(provider_b, "model-b".to_string())]);
+
+    let mut events = Vec::new();
+    let result = runner
+        .run_with_events("hello", |event| events.push(event))
+        .expect("fallback should rescue the run");
+    server_a.join().unwrap();
+    server_b.join().unwrap();
+
+    assert_eq!(result.final_content.as_deref(), Some("switched ok"));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ProviderSwitched { to_provider, to_model, .. }
+                if to_provider == "b" && to_model == "model-b"
+        )),
+        "events: {events:?}"
+    );
+    assert!(
+        result.trace.events.iter().any(|event| matches!(
+            event,
+            harness_cli::agent::AgentTraceEvent::ProviderSwitched { .. }
+        )),
+        "trace: {:?}",
+        result.trace.events
+    );
+}
+
+#[test]
+fn agent_does_not_switch_on_auth_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let fallback_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let fallback_addr = fallback_listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        let body = r#"{"error":"invalid api key"}"#;
+        let response = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let provider = ProviderConfig::new("a", format!("http://{addr}/v1"), "sk-bad");
+    let fallback = ProviderConfig::new("b", format!("http://{fallback_addr}/v1"), "sk-b");
+    let runner = AgentRunner::new(provider, "model-a", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_fallback(vec![(fallback, "model-b".to_string())]);
+
+    let err = runner.run("hello").unwrap_err();
+    server.join().unwrap();
+    // Auth-ошибка доносится как есть — цепочка её не маскирует, fallback-мок
+    // не получает ни одного запроса (join не нужен: listener просто дропнется).
+    assert!(err.to_string().contains("401"), "err: {err}");
+}
+
+#[test]
 fn agent_blocks_looping_identical_failing_call() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -712,7 +810,13 @@ fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
 
     loop {
         match listener.accept() {
-            Ok((stream, _)) => return stream,
+            Ok((stream, _)) => {
+                // На Windows принятый сокет наследует nonblocking от
+                // listener'а: без сброса read() может вернуть WouldBlock
+                // и уронить мок до прихода полного запроса.
+                stream.set_nonblocking(false).unwrap();
+                return stream;
+            }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 assert!(
                     Instant::now() < deadline,

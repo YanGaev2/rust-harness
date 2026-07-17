@@ -8,6 +8,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::chat_client::{ChatClientError, ChatToolCall, ProviderChatClient, StreamDelta};
+use crate::guardrails::{GuardrailController, GuardrailDecision};
 use crate::prompt::agent_system_prompt;
 use crate::providers::ProviderConfig;
 use crate::request::{CacheMode, ChatMessage, MessageToolCall, RequestEnvelope};
@@ -137,6 +138,8 @@ impl AgentRunner {
         messages.push(ChatMessage::user(user_message.clone()));
         let mut tool_results = Vec::new();
         let mut tool_rounds = 0;
+        // Per-run: детект повторяющихся бесплодных вызовов (см. guardrails.rs).
+        let mut guardrails = GuardrailController::new();
         let mut trace = AgentTrace::new(
             self.provider.name().to_string(),
             self.model.clone(),
@@ -263,13 +266,57 @@ impl AgentRunner {
                 scheduler = scheduler.with_timeout(tool_batch_timeout);
             }
 
-            let batch_results = scheduler.execute_batch(
+            // id -> (wire-имя, аргументы): нужно, чтобы после исполнения
+            // сообщить guardrail'у исход именно того вызова.
+            let call_index: std::collections::HashMap<String, (String, serde_json::Value)> =
                 response
                     .tool_calls
-                    .into_iter()
-                    .map(|call| ToolCall::new(call.id, call.name, call.arguments))
-                    .collect(),
-            );
+                    .iter()
+                    .map(|call| (call.id.clone(), (call.name.clone(), call.arguments.clone())))
+                    .collect();
+
+            let mut to_execute = Vec::new();
+            let mut synthetic = Vec::new();
+            let mut warn_notes: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for call in response.tool_calls.into_iter() {
+                match guardrails.check(&call.name, &call.arguments) {
+                    GuardrailDecision::Block(text) => synthetic.push(ToolBatchResult {
+                        id: call.id.clone(),
+                        tool_name: call.name.clone(),
+                        ok: false,
+                        repaired: false,
+                        content: text,
+                        metadata: serde_json::json!({"guardrail": "blocked"}),
+                        error: None,
+                        hint: None,
+                    }),
+                    GuardrailDecision::Warn(text) => {
+                        warn_notes.insert(call.id.clone(), text);
+                        to_execute.push(ToolCall::new(call.id, call.name, call.arguments));
+                    }
+                    GuardrailDecision::Allow => {
+                        to_execute.push(ToolCall::new(call.id, call.name, call.arguments));
+                    }
+                }
+            }
+
+            let mut batch_results = scheduler.execute_batch(to_execute);
+            for result in &mut batch_results {
+                if let Some((name, args)) = call_index.get(&result.id) {
+                    guardrails.record(name, args, result.ok, &result.content);
+                }
+                if let Some(note) = warn_notes.remove(&result.id) {
+                    match result.metadata.as_object_mut() {
+                        Some(map) => {
+                            map.insert("guardrail".into(), serde_json::Value::String(note));
+                        }
+                        // metadata упавших вызовов бывает Null — не терять метку.
+                        None => result.metadata = serde_json::json!({"guardrail": note}),
+                    }
+                }
+            }
+            batch_results.extend(synthetic);
 
             for result in batch_results {
                 let tool_call_id = result.id.clone();

@@ -1537,3 +1537,96 @@ fn tool_suffix_is_stripped() {
     assert_eq!(result.tool_name, "file.search");
     assert!(result.repaired);
 }
+
+#[test]
+fn trailing_comma_in_raw_arguments_is_repaired() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // hermes message_sanitization: GLM/llama.cpp шлют JSON с висячей запятой.
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "read_file",
+            json!(r#"{"path": "a.txt",}"#),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired, "trailing comma is a repair");
+    assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn unclosed_braces_are_repaired() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // hermes: обрезанный стримом JSON без закрывающей скобки.
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "read_file",
+            json!(r#"{"path": "a.txt""#),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired, "brace completion is a repair");
+    assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn parameters_envelope_with_json_string_is_unwrapped() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Зонд Qwen3.6-35B 2026-07-15: аргументы завёрнуты в
+    // {"parameters": "<JSON-строка>"} — детерминированно на t=0.0 и 0.8.
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "read_file",
+            json!({"parameters": "{\"path\": \"a.txt\"}"}),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.repaired, "envelope unwrap is a repair");
+    assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn arguments_envelope_with_object_is_unwrapped() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "read_file",
+            json!({"arguments": {"path": "a.txt"}}),
+        ))
+        .unwrap();
+    assert!(result.repaired);
+    assert!(result.ok, "{result:?}");
+}
+
+#[test]
+fn envelope_key_alongside_real_args_is_not_unwrapped() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.txt"), "hello").unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // Не конверт: parameters — просто лишний ключ среди настоящих аргументов.
+    let result = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "read_file",
+            json!({"path": "a.txt", "parameters": "x"}),
+        ))
+        .unwrap();
+    assert_eq!(result.tool_name, "file.read");
+    assert!(result.ok, "path must arrive untouched: {result:?}");
+}

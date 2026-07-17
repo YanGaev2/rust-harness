@@ -1,4 +1,4 @@
-﻿use std::io::{Read, Write};
+use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -609,6 +609,77 @@ fn agent_runner_replays_history_before_new_user_message() {
     expected.push(ChatMessage::user("follow-up"));
     expected.push(ChatMessage::assistant("second answer"));
     assert_eq!(result.messages, expected);
+}
+
+#[test]
+fn agent_blocks_looping_identical_failing_call() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let looped_call = r#"{
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "loop-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"missing.txt\"}"
+                    }
+                }]
+            }
+        }],
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+    }"#;
+
+    let server = thread::spawn(move || {
+        // Модель «зациклилась»: 7 одинаковых вызовов несуществующего файла.
+        for _ in 0..7 {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_http_request(&mut stream);
+            respond(&mut stream, looped_call);
+        }
+        let (mut stream, _) = listener.accept().unwrap();
+        read_http_request(&mut stream);
+        respond(
+            &mut stream,
+            r#"{
+                "choices": [{"message": {"role": "assistant", "content": "done"}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}
+            }"#,
+        );
+    });
+
+    let provider = ProviderConfig::new("local", format!("http://{addr}/v1"), "sk-agent");
+    let runner = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_max_tool_rounds(10);
+
+    let result = runner.run("loop please").unwrap();
+    server.join().unwrap();
+
+    // Первые 5 вызовов исполнены (ok=false: файла нет), последние 2 —
+    // заблокированы guardrail'ом синтетическим результатом без исполнения.
+    let blocked: Vec<_> = result
+        .tool_results
+        .iter()
+        .filter(|r| {
+            r.metadata.get("guardrail").and_then(Value::as_str) == Some("blocked")
+                && r.content.contains("blocked")
+        })
+        .collect();
+    assert_eq!(blocked.len(), 2, "expected 2 blocked calls");
+    // Warn-метки появились раньше блока (после 2-й неудачи).
+    let warned = result
+        .tool_results
+        .iter()
+        .filter(|r| r.metadata.get("guardrail").is_some() && !r.content.contains("blocked"))
+        .count();
+    assert_eq!(warned, 3, "rounds 3-5 carry warn metadata");
+    assert_eq!(result.final_content.as_deref(), Some("done"));
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {

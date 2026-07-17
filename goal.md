@@ -695,3 +695,17 @@ ust-harness\README.md` - the absolute
   batch degrades to sequential execution in input order; disjoint paths and
   pure reads keep full parallelism. Deterministic regression tests observe
   max in-flight concurrency instead of racing the filesystem.
+- MiMo v2.5 Pro fitted and benched (2026-07-17): probe battery (~230 requests,
+  Anthropic Messages transport, thinking disabled) shows the same tool-name
+  family as DeepSeek/GLM/Qwen (read_file/path, old_str+old_string,
+  grep pattern-or-query, timeout unit ambiguous, cmd idioms when the shell is
+  unnamed - our "PowerShell 5.1" schema note cures it in combat). Bench v3
+  extends the suite to 50 tasks (26 legacy untouched for cross-model
+  comparability + 24 new: yaml/env/json edits, sort/dedup/merge, regex counts,
+  cross-file search/replace, ext rename, sha256, deep paths with spaces,
+  neutral-phrasing NIAH, 2 codefixes, csv filter). Result: 100/100 runs,
+  371 tool calls, 0 repairs, 0 failed calls, clean PowerShell throughout;
+  legacy 26x2 subset 52/52 (192 calls) added to the README table. Endpoint
+  quirks: temperature up to 1.3 accepted, thinking block arrives AFTER the
+  text block, cache_read_input_tokens reported by the raw API but 0% via the
+  harness (provider saved without Anthropic cache markers - open item).

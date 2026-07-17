@@ -34,13 +34,14 @@ real APIs, real filesystem):
 | Model | Bench | Tool calls | Repairs / failures | Agent-loop cache hit |
 |---|---|---|---|---|
 | glm-5.2 | **52/52** | 185 | 0 / 0 | ~85% |
+| mimo-v2.5-pro | **52/52** | 192 | 0 / 0 | 0% (no cache markers yet) |
 | deepseek-v4-pro | 51/52 | 218 | 0 / 0 | ~85% (64-token blocks) |
 | qwen3.6-35b-a3b | 51/52 | 214 | 0 / 0 | 54% |
 | qwen3.7-max | 50/52 | 195 | 0 / 0 | 30% (2048-token minimum) |
 | gpt-5.6-luna | 48/52 | 195 | 0 / 0 | 44% |
 
 Every benchmark miss is model-side (mental arithmetic, safety refusals) or
-a transient upstream error — **across 1007 real tool calls the tools
+a transient upstream error — **across 1199 real tool calls the tools
 themselves never broke once**. The bench also audits the harness itself:
 one run exposed a scheduler race that silently dropped two of three
 same-file edits, now fixed and covered by deterministic regression tests.

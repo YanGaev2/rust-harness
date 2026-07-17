@@ -229,6 +229,28 @@ Save a full JSON trace and a separate tool-error report for an agent run:
 harness agent run --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --message "write notes.txt" --trace artifacts/agent-trace.json --tool-errors artifacts/tool-errors.json
 ```
 
+Chain fallback models for `agent run` by dropping a `fallback.json` next to
+`providers.json` — on an error classified as switchable (quota-exhausted 429,
+402, 5xx, overloaded, network) the run continues on the next provider/model
+pair, with a `⚠ provider switch` line in the UI and a `provider_switched`
+event in the trace. Auth failures, context overflow, and content-policy
+errors never switch (a fallback would only mask them); short rate-limit
+waits (`Retry-After` ≤ 10s) retry in place first:
+
+```json
+{
+  "chain": [
+    { "provider": "mimo", "model": "mimo-v2.5-pro" },
+    { "provider": "deepseek", "model": "deepseek-chat" }
+  ]
+}
+```
+
+Loop guardrails watch every agent run: a tool call repeated verbatim after
+failing (or returning byte-identical read-only results) first gets a warning
+attached to its result, then is blocked with a synthetic result telling the
+model to diagnose instead of retrying — the run itself keeps going.
+
 Network-backed `provider models`, `provider add --add-all`,
 `provider add --interactive`, `chat once`, `chat stream`, `agent run`, and
 `repl` commands accept `--timeout-ms N` to tighten request timeouts when needed.

@@ -4,7 +4,8 @@ use std::thread;
 use std::time::Duration;
 
 use harness_cli::chat_client::{
-    AnthropicMessagesChatClient, OpenAiCompatibleChatClient, ProviderChatClient, StreamDelta,
+    AnthropicMessagesChatClient, ChatClientError, OpenAiCompatibleChatClient, ProviderChatClient,
+    StreamDelta,
 };
 use harness_cli::prompt::DEFAULT_SYSTEM_PROMPT;
 use harness_cli::providers::{AuthScheme, CachePolicy, ChatApiFormat, ProviderConfig};
@@ -142,6 +143,46 @@ fn http_error_status_message_includes_the_response_body() {
         message.contains("Key limit exceeded: add credits"),
         "message: {message}"
     );
+}
+
+#[test]
+fn status_error_captures_retry_after_seconds() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        let response_body = r#"{"error":"rate limited"}"#;
+        let response = format!(
+            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 7\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream.write_all(response.as_bytes()).unwrap();
+    });
+
+    let provider = ProviderConfig::new("openrouter", format!("http://{addr}/v1"), "sk-test");
+    let envelope = RequestEnvelope::new("openrouter", "openai/gpt-5.6-luna")
+        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
+        .with_messages(vec![ChatMessage::user("ping")]);
+
+    let err = OpenAiCompatibleChatClient::new(Duration::from_secs(2))
+        .send(&provider, &envelope)
+        .unwrap_err();
+    server.join().unwrap();
+
+    match err {
+        ChatClientError::Status {
+            code,
+            retry_after_seconds,
+            ..
+        } => {
+            assert_eq!(code, 429);
+            assert_eq!(retry_after_seconds, Some(7));
+        }
+        other => panic!("expected Status, got {other:?}"),
+    }
 }
 
 #[test]

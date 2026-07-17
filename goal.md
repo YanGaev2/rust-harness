@@ -709,3 +709,23 @@ ust-harness\README.md` - the absolute
   quirks: temperature up to 1.3 accepted, thinking block arrives AFTER the
   text block, cache_read_input_tokens reported by the raw API but 0% via the
   harness (provider saved without Anthropic cache markers - open item).
+- Guardrails + failover + repair extensions (2026-07-17, plan
+  docs/superpowers/plans/2026-07-17-guardrails-failover-repair.md, ideas
+  scouted from hermes-agent): (1) per-run loop guardrails - three signatures
+  (identical failing call: warn at 2 / block at 5; any-args same-tool
+  failures: block at 8; byte-identical read-only results: warn 2 / block 5),
+  block returns a synthetic tool result with diagnose-first guidance instead
+  of aborting, mutating tools exempt from no-progress (two identical
+  file.replace calls are legitimate - one occurrence per call). (2) Error
+  classifier reason->action (failover.rs): quota/billing/5xx/overloaded/
+  network switch, auth/context-overflow/policy/parse fail fast, 429 with
+  Retry-After <=10s retries in place (2 attempts); Retry-After now captured
+  in ChatClientError::Status. Fallback chain in fallback.json next to
+  providers.json, skip-same-backend dedup, ProviderSwitched in AgentEvent +
+  trace (session replay excludes it). (3) Name repair: CamelCase->snake,
+  _tool/tool suffix strip (twice max); argument repair: near-JSON fixer
+  (control-chars escape, trailing commas, bounded brace completion) and
+  single-key envelope unwrap {"parameters"/"arguments"/"args"/"input":
+  object-or-JSON-string} - the Qwen3.6-35B probe trap. Test count 313->340;
+  flaky agent_loop mock fixed (accepted socket inherited nonblocking from
+  listener on Windows + 2s client timeout too tight under parallel load).

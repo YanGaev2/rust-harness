@@ -71,12 +71,18 @@ fn post_json(
     if (200..300).contains(&code) {
         return Ok(response);
     }
+    let retry_after_seconds = response
+        .headers()
+        .get("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok());
     let body = response.body_mut().read_to_string().unwrap_or_default();
     let body = body.trim().chars().take(400).collect::<String>();
     Err(ChatClientError::Status {
         code,
         url: url.to_string(),
         body,
+        retry_after_seconds,
     })
 }
 
@@ -520,6 +526,10 @@ pub enum ChatClientError {
         code: u16,
         url: String,
         body: String,
+        /// `Retry-After` в секундах, если провайдер его прислал числом
+        /// (HTTP-date формы игнорируются). Питает классификатор failover:
+        /// короткое ожидание — повторить на месте, длинное — переключиться.
+        retry_after_seconds: Option<u64>,
     },
     Io(std::io::Error),
     Json(serde_json::Error),
@@ -529,10 +539,18 @@ impl fmt::Display for ChatClientError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Http(err) => write!(f, "chat request failed: {err}"),
-            Self::Status { code, url, body } => {
+            Self::Status {
+                code,
+                url,
+                body,
+                retry_after_seconds,
+            } => {
                 write!(f, "chat request failed: {url}: status {code}")?;
                 if !body.is_empty() {
                     write!(f, ": {body}")?;
+                }
+                if let Some(seconds) = retry_after_seconds {
+                    write!(f, ", retry after {seconds}s")?;
                 }
                 Ok(())
             }

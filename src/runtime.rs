@@ -1251,42 +1251,95 @@ struct ToolResolution {
     repaired: bool,
 }
 
+/// Snake-case для CamelCase-имён (`ReadFile` -> `read_file`): часть моделей
+/// (приор hermes/MiMo-семьи) шлёт имена тулов в CamelCase.
+fn camel_to_snake(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, ch) in name.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if index > 0 {
+                out.push('_');
+            }
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+fn canonical_tool_for(alias: &str) -> Option<&'static str> {
+    Some(match alias {
+        "file.write" | "file_write" | "write_file" => "file.write",
+        "file.append" | "file_append" | "append_file" | "append_text" | "add_to_file" => {
+            "file.append"
+        }
+        "file.replace" | "file_replace" | "file.edit" | "file_edit" | "replace_file"
+        | "replace_text" | "edit_file" | "search_replace" | "edit_and_apply"
+        | "replace_in_file" | "str_replace" => "file.replace",
+        "file.read" | "file_read" | "read_file" => "file.read",
+        "file.hash" | "file_hash" | "hash_file" | "checksum" | "checksum_file" => "file.hash",
+        "file.stat" | "file_stat" | "stat_file" | "file.metadata" | "file_metadata"
+        | "metadata" | "stat" | "get_file_info" => "file.stat",
+        "file.tail" | "file_tail" | "tail_file" | "tail" => "file.tail",
+        "file.list" | "file_list" | "list_file" | "list_files" | "ls" => "file.list",
+        "file.search" | "file_search" | "search_file" | "search_files" | "grep" | "grep_search" => {
+            "file.search"
+        }
+        "file.delete" | "file_delete" | "delete_file" | "remove_file" | "rm" => "file.delete",
+        "file.move" | "file_move" | "move_file" | "rename_file" | "mv" => "file.move",
+        "attachment.read" | "attachment_read" | "read_attachment" | "open_attachment"
+        | "image.read" | "image_read" | "inspect_image" | "read_image" | "get_image" => {
+            "attachment.read"
+        }
+        "shell.exec" | "shell_exec" | "run_command" | "shell" | "run_shell_command"
+        | "run_shell" => "shell.exec",
+        _ => return None,
+    })
+}
+
 impl ToolResolution {
     fn from_name(name: &str) -> Result<Self, RuntimeError> {
-        let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-        let canonical = match normalized.as_str() {
-            "file.write" | "file_write" | "write_file" => "file.write",
-            "file.append" | "file_append" | "append_file" | "append_text" | "add_to_file" => {
-                "file.append"
+        // CamelCase сплющивается ДО lowercase — иначе информация о границах
+        // слов (`ReadFile`) теряется безвозвратно.
+        let normalized = camel_to_snake(name.trim())
+            .to_ascii_lowercase()
+            .replace(['-', ' '], "_");
+
+        // Прямое имя, затем со срезанным суффиксом `_tool`/`tool` (дважды
+        // максимум — hermes-канон: `read_file_tool` -> `read_file`).
+        let mut candidate = normalized.clone();
+        let mut canonical = canonical_tool_for(&candidate);
+        for _ in 0..2 {
+            if canonical.is_some() {
+                break;
             }
-            "file.replace" | "file_replace" | "file.edit" | "file_edit" | "replace_file"
-            | "replace_text" | "edit_file" | "search_replace" | "edit_and_apply"
-            | "replace_in_file" | "str_replace" => "file.replace",
-            "file.read" | "file_read" | "read_file" => "file.read",
-            "file.hash" | "file_hash" | "hash_file" | "checksum" | "checksum_file" => "file.hash",
-            "file.stat" | "file_stat" | "stat_file" | "file.metadata" | "file_metadata"
-            | "metadata" | "stat" | "get_file_info" => "file.stat",
-            "file.tail" | "file_tail" | "tail_file" | "tail" => "file.tail",
-            "file.list" | "file_list" | "list_file" | "list_files" | "ls" => "file.list",
-            "file.search" | "file_search" | "search_file" | "search_files" | "grep"
-            | "grep_search" => "file.search",
-            "file.delete" | "file_delete" | "delete_file" | "remove_file" | "rm" => "file.delete",
-            "file.move" | "file_move" | "move_file" | "rename_file" | "mv" => "file.move",
-            "attachment.read" | "attachment_read" | "read_attachment" | "open_attachment"
-            | "image.read" | "image_read" | "inspect_image" | "read_image" | "get_image" => {
-                "attachment.read"
+            let stripped = candidate
+                .strip_suffix("_tool")
+                .or_else(|| candidate.strip_suffix("tool"))
+                .map(|rest| rest.trim_end_matches('_').to_string());
+            match stripped {
+                Some(rest) if !rest.is_empty() => {
+                    candidate = rest;
+                    canonical = canonical_tool_for(&candidate);
+                }
+                _ => break,
             }
-            "shell.exec" | "shell_exec" | "run_command" | "shell" | "run_shell_command"
-            | "run_shell" => "shell.exec",
-            _ => return Err(RuntimeError::UnknownTool(name.to_string())),
+        }
+        let Some(canonical) = canonical else {
+            return Err(RuntimeError::UnknownTool(name.to_string()));
         };
 
         // Tools are advertised to the model under their prior-aligned wire
         // name (`read_file`, `grep_search`, …). Calling that name is exactly
         // what was offered and is NOT a repair; only a genuinely different
-        // alias (e.g. `file_read`, `grep`, `ls`) counts as one.
+        // alias (e.g. `file_read`, `grep`, `ReadFile`, `read_file_tool`)
+        // counts as one. The comparison uses the RAW lowercase form, so a
+        // CamelCase or suffixed original is visible as a repair even after
+        // normalization resolved it.
+        let raw_normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
         let wire = wire_tool_name(canonical);
-        let repaired = normalized != canonical && normalized != wire;
+        let repaired = raw_normalized != canonical && raw_normalized != wire;
 
         Ok(Self {
             canonical: canonical.to_string(),

@@ -5,6 +5,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod config;
 pub mod diagnostics;
+pub mod failover;
 pub mod guardrails;
 pub mod model_client;
 pub mod platform;

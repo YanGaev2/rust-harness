@@ -729,3 +729,18 @@ ust-harness\README.md` - the absolute
   object-or-JSON-string} - the Qwen3.6-35B probe trap. Test count 313->340;
   flaky agent_loop mock fixed (accepted socket inherited nonblocking from
   listener on Windows + 2s client timeout too tight under parallel load).
+- Chat TUI UX pass (user report: panel stuck at the top, single Esc killed the
+  session, big pastes flooded the editor). (1) Opt-in bottom-anchored Screen
+  mode (set_bottom_anchor): chat panel pinned to the bottom edge, content
+  accumulates above it, resize/clear repin to the bottom; setup TUI keeps the
+  flow-from-top layout. Welcome banner (harness vX / model / workspace / key
+  hints) pushed into the transcript at startup. (2) Two-step Esc exit in chat
+  and both setup apps: first Esc arms "Press Esc again to exit" in the status
+  row, any other key disarms, Ctrl+C stays immediate; Esc inside the provider
+  wizard now closes the dialog (as its hints always promised) instead of
+  exiting harness. (3) Paste collapse: pastes >=3 lines or >=700 chars become
+  a "[Pasted text #N +L lines]" placeholder in the editor and expand back into
+  the submitted message; transcript/history keep the marker; Ctrl+V clipboard
+  captures go through the same path. Test count 340->351 (Windows), tmux
+  smoke-verified on Linux (banner+bottom panel, armed hint, placeholder,
+  clean double-Esc exit).

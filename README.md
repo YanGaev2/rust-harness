@@ -289,14 +289,25 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
 - **Resumes the last chat on launch**: the conversation is persisted per
   workspace and reloaded at startup (a `resumed session … (N messages)` notice
   appears in the transcript). `/new` abandons it and starts a fresh session.
+- **Bottom-anchored layout with a welcome banner**: the input panel is pinned to
+  the bottom edge of the terminal (like the reference agent CLIs) and a startup
+  banner (`harness vX`, active model, workspace, key hints) is printed into the
+  transcript just above it; conversation content accumulates upward from the
+  panel into native scrollback.
 - **Esc or Ctrl+C interrupts a running agent** (an `Interrupted by user` notice
   appears; the partial trace is still saved). Streaming stops between tokens,
   tool loops stop before the next round; the session stays open — when idle,
-  Esc/Ctrl+C exit as before.
+  **exit is two-step**: the first Esc shows `Press Esc again to exit` in the
+  status row (any other key disarms it), the second Esc exits; Ctrl+C still
+  exits immediately. The setup TUI follows the same contract, and Esc inside
+  the provider wizard closes the dialog instead of killing the program.
 - Has a **multi-line prompt** (Alt+Enter or Ctrl+J inserts a newline; Left/Right/
   Home/End move the caret) and **paste that never auto-submits** — pasted newlines
   stay literal even on the legacy Windows console (a burst of key events is
-  coalesced into one paste).
+  coalesced into one paste). A paste of 3+ lines (or 700+ chars) **collapses to a
+  `[Pasted text #1 +184 lines]` placeholder** in the editor; the full text is
+  substituted back in when the message is sent, while the transcript and history
+  keep the compact marker.
 - Captures **Ctrl+V** from the system clipboard: text is inserted at the caret, a
   PNG image is saved to `.harness/attachments` and referenced in the prompt.
 - Recalls prompt history with Up/Down. The transcript scrolls with the terminal's

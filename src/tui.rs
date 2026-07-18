@@ -51,6 +51,9 @@ pub struct TuiApp {
     input: String,
     status_message: String,
     dialog: Option<TuiDialog>,
+    /// True after a first Esc press at the top level: the next Esc
+    /// exits, anything else disarms.
+    exit_armed: bool,
 }
 
 impl TuiApp {
@@ -67,6 +70,7 @@ impl TuiApp {
             status_message: "Type /provider add to configure a provider inside this interface."
                 .to_string(),
             dialog: None,
+            exit_armed: false,
         }
     }
 
@@ -83,7 +87,18 @@ impl TuiApp {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TuiAction {
+        if key.code != KeyCode::Esc {
+            self.exit_armed = false;
+        }
+
         if let Some(dialog) = &mut self.dialog {
+            // Esc closes the dialog (as its own hints promise) instead of
+            // killing the whole program.
+            if key.code == KeyCode::Esc {
+                self.dialog = None;
+                self.status_message = "Provider setup closed.".to_string();
+                return TuiAction::Continue;
+            }
             let action = dialog.handle_key(key);
             if matches!(action, TuiAction::SaveProvider(_) | TuiAction::Exit) {
                 self.dialog = None;
@@ -97,8 +112,14 @@ impl TuiApp {
                 TuiAction::Exit
             }
             KeyCode::Esc => {
-                self.status_message = "Setup cancelled.".to_string();
-                TuiAction::Exit
+                // Two-step exit: a stray Esc must not end the setup.
+                if self.exit_armed {
+                    self.status_message = "Setup cancelled.".to_string();
+                    return TuiAction::Exit;
+                }
+                self.exit_armed = true;
+                self.status_message = "Press Esc again to exit.".to_string();
+                TuiAction::Continue
             }
             KeyCode::Enter => self.submit_command(),
             KeyCode::Backspace => {
@@ -235,8 +256,9 @@ impl ProviderWizard {
     }
 
     fn handle_provider_key(&mut self, key: KeyEvent) -> TuiAction {
+        // Esc never reaches the wizard: TuiApp::handle_key closes the
+        // dialog before dispatching here.
         match key.code {
-            KeyCode::Esc => TuiAction::Exit,
             KeyCode::Up => {
                 if self.selected_provider == 0 {
                     self.selected_provider = BUILTIN_PROVIDER_NAMES.len() - 1;
@@ -261,7 +283,6 @@ impl ProviderWizard {
 
     fn handle_text_key(&mut self, key: KeyEvent, target: TextTarget) -> TuiAction {
         match key.code {
-            KeyCode::Esc => TuiAction::Exit,
             KeyCode::Enter => {
                 if !self.active_text(target).trim().is_empty() {
                     self.step = match target {
@@ -290,7 +311,6 @@ impl ProviderWizard {
 
     fn handle_model_key(&mut self, key: KeyEvent) -> TuiAction {
         match key.code {
-            KeyCode::Esc => TuiAction::Exit,
             KeyCode::Backspace => {
                 self.model_edited = true;
                 self.model.pop();
@@ -482,6 +502,8 @@ pub struct SetupTuiApp {
     workspace: PathBuf,
     input: String,
     status_message: String,
+    /// Two-step Esc exit, same contract as `TuiApp`/`ChatApp`.
+    exit_armed: bool,
 }
 
 impl SetupTuiApp {
@@ -497,6 +519,7 @@ impl SetupTuiApp {
             input: String::new(),
             status_message: "Type /provider add to configure a provider inside this interface."
                 .to_string(),
+            exit_armed: false,
         }
     }
 
@@ -509,14 +532,22 @@ impl SetupTuiApp {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> SetupTuiAction {
+        if key.code != KeyCode::Esc {
+            self.exit_armed = false;
+        }
         match key.code {
             KeyCode::Char('c') if key.mods.ctrl => {
                 self.status_message = "Setup cancelled.".to_string();
                 SetupTuiAction::Exit
             }
             KeyCode::Esc => {
-                self.status_message = "Setup cancelled.".to_string();
-                SetupTuiAction::Exit
+                if self.exit_armed {
+                    self.status_message = "Setup cancelled.".to_string();
+                    return SetupTuiAction::Exit;
+                }
+                self.exit_armed = true;
+                self.status_message = "Press Esc again to exit.".to_string();
+                SetupTuiAction::Continue
             }
             KeyCode::Enter => self.submit_command(),
             KeyCode::Backspace => {
@@ -806,7 +837,7 @@ fn footer_line(width: usize) -> Line {
     status_line(
         width,
         Line::default(),
-        styled_line("Esc/Ctrl+C exit", hint_style()),
+        styled_line("Esc Esc / Ctrl+C exit", hint_style()),
     )
 }
 

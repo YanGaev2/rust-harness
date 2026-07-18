@@ -9,7 +9,7 @@
 //! ([`ChatApp::panel_lines`]) shows only the live tail, the editor, and the
 //! status row.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use harness_tui::components::editor::Editor;
@@ -221,7 +221,27 @@ pub struct ChatApp {
     /// Interactive model picker opened by bare `/model` (arrow keys +
     /// type-to-filter, like the reference agents' model selectors).
     model_picker: Option<ModelPicker>,
+    /// True after a first Esc press: the status row asks for a second
+    /// Esc to confirm the exit; any other input disarms it.
+    exit_armed: bool,
+    /// Collapsed pastes awaiting submit: the editor shows only the
+    /// `[Pasted text #N …]` placeholder, the full text lives here.
+    pasted_blocks: Vec<PastedBlock>,
+    /// Monotonic paste counter feeding the `#N` in placeholders.
+    paste_seq: usize,
 }
+
+/// A collapsed paste: the placeholder inserted into the editor and the
+/// full text substituted back in when the message is submitted.
+struct PastedBlock {
+    placeholder: String,
+    text: String,
+}
+
+/// Pastes at or above either bound collapse into a placeholder instead
+/// of flooding the editor (the reference-harness `[Pasted …]` UX).
+const PASTE_COLLAPSE_MIN_LINES: usize = 3;
+const PASTE_COLLAPSE_MIN_CHARS: usize = 700;
 
 /// State of the interactive `/model` picker: the full pair list, the cursor
 /// position inside the *filtered* view, and the type-to-filter text.
@@ -273,6 +293,9 @@ impl ChatApp {
             run_usage_base: crate::agent::UsageTotals::default(),
             catalog: Vec::new(),
             model_picker: None,
+            exit_armed: false,
+            pasted_blocks: Vec::new(),
+            paste_seq: 0,
         }
     }
 
@@ -412,6 +435,11 @@ impl ChatApp {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> ChatAction {
+        // Any key other than Esc drops the pending exit confirmation.
+        if key.code != KeyCode::Esc {
+            self.exit_armed = false;
+        }
+
         // Ctrl+C always exits, even with the palette open.
         if key.mods.ctrl && key.code == KeyCode::Char('c') {
             return ChatAction::Exit;
@@ -438,10 +466,18 @@ impl ChatApp {
         match key.code {
             KeyCode::Esc => {
                 if completion_open {
+                    // The menu absorbs this Esc; it neither arms nor
+                    // confirms the exit.
                     self.completion_dismissed = true;
+                    self.exit_armed = false;
                     ChatAction::Continue
-                } else {
+                } else if self.exit_armed {
                     ChatAction::Exit
+                } else {
+                    // Two-step exit: a stray Esc must not kill the
+                    // session — the status row asks for a second press.
+                    self.exit_armed = true;
+                    ChatAction::Continue
                 }
             }
             // Alt+Enter composes a newline instead of submitting, so a prompt
@@ -512,17 +548,43 @@ impl ChatApp {
     }
 
     pub fn handle_paste(&mut self, text: &str) -> ChatAction {
-        // A chat message may legitimately span lines, so the paste is inserted
-        // verbatim at the caret; it never submits because it is a single event.
-        self.editor.insert_str(text);
+        // A chat message may legitimately span lines, so a small paste is
+        // inserted verbatim at the caret; it never submits because it is a
+        // single event. Large pastes collapse to a placeholder.
+        self.exit_armed = false;
+        self.insert_text_block(text);
         self.reset_completion();
         ChatAction::Continue
     }
 
     /// Insert clipboard text at the caret (used by the Ctrl+V capture path).
     pub fn apply_clipboard_text(&mut self, prompt_text: &str) {
-        self.editor.insert_str(prompt_text);
+        self.insert_text_block(prompt_text);
         self.reset_completion();
+    }
+
+    /// Insert pasted/clipboard text at the caret. Text at or above the
+    /// collapse bounds becomes a `[Pasted text #N +L lines]` placeholder —
+    /// the editor stays readable and the full text is swapped back in by
+    /// `submit_input` (the transcript keeps the compact marker).
+    fn insert_text_block(&mut self, text: &str) {
+        let line_count = text.lines().count();
+        let char_count = text.chars().count();
+        if line_count < PASTE_COLLAPSE_MIN_LINES && char_count < PASTE_COLLAPSE_MIN_CHARS {
+            self.editor.insert_str(text);
+            return;
+        }
+        self.paste_seq += 1;
+        let placeholder = if line_count > 1 {
+            format!("[Pasted text #{} +{line_count} lines]", self.paste_seq)
+        } else {
+            format!("[Pasted text #{} +{char_count} chars]", self.paste_seq)
+        };
+        self.editor.insert_str(&placeholder);
+        self.pasted_blocks.push(PastedBlock {
+            placeholder,
+            text: text.to_string(),
+        });
     }
 
     fn reset_completion(&mut self) {
@@ -601,15 +663,20 @@ impl ChatApp {
         self.history_cursor = None;
         self.completion_dismissed = false;
         self.completion_index = 0;
+        // Collapsed pastes belong to this compose; blocks whose
+        // placeholder was edited away are simply dropped.
+        let blocks = std::mem::take(&mut self.pasted_blocks);
         if text.is_empty() {
             return ChatAction::Continue;
         }
         if let Some(command) = text.strip_prefix('/') {
             return self.run_slash_command(command);
         }
+        // The transcript and history keep the compact placeholder; the
+        // model receives the fully expanded message.
         self.history.push(text.clone());
         self.push_user_message(&text);
-        ChatAction::Submit(text)
+        ChatAction::Submit(expand_pasted_blocks(&text, &blocks))
     }
 
     fn run_slash_command(&mut self, command: &str) -> ChatAction {
@@ -1161,18 +1228,42 @@ impl ChatApp {
                 Span::styled(format!(" · {}", self.workspace.display()), dim_style()),
             ],
         };
-        let hint = if self.model_picker.is_some() {
+        let hint = if self.exit_armed {
+            "Press Esc again to exit "
+        } else if self.model_picker.is_some() {
             "↑↓ select · Enter switch · type to filter · Esc close "
         } else if self.completion_visible() {
             "↑↓ select · Tab complete · Esc close "
         } else {
-            "Enter send · Alt+Enter newline · / commands · Ctrl+V paste · Esc exit "
+            "Enter send · Alt+Enter newline · / commands · Ctrl+V paste · Esc Esc exit "
         };
         let right = Line {
             spans: vec![Span::styled(hint, dim_style())],
         };
         status_line(width, left, right)
     }
+}
+
+/// Swap each collapsed paste back into the submitted message. Placeholders
+/// the user edited or deleted simply do not match and their block is lost —
+/// what the user sees in the editor is what gets sent.
+fn expand_pasted_blocks(text: &str, blocks: &[PastedBlock]) -> String {
+    let mut expanded = text.to_string();
+    for block in blocks {
+        expanded = expanded.replacen(&block.placeholder, &block.text, 1);
+    }
+    expanded
+}
+
+/// The startup banner pushed into the transcript before the first prompt.
+/// Rendered as ordinary system lines, so it flows into native scrollback
+/// like the rest of the conversation.
+pub fn welcome_banner(version: &str, provider_label: &str, workspace: &Path) -> Vec<String> {
+    vec![
+        format!("harness v{version}"),
+        format!("model {provider_label} · workspace {}", workspace.display()),
+        "Enter send · / commands · Alt+Enter newline · Esc Esc exit".to_string(),
+    ]
 }
 
 /// Maximum picker rows shown at once; the window scrolls to keep the cursor

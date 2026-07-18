@@ -129,9 +129,38 @@ fn ctrl_c_exits() {
 }
 
 #[test]
-fn esc_exits_when_no_completion_is_open() {
+fn esc_arms_a_confirmation_and_only_the_second_esc_exits() {
     let mut app = app();
+    // First Esc: no exit, the status row asks for a confirming press.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
+    let status = lines_text(&app.panel_lines(120, 10));
+    assert!(
+        status.contains("Press Esc again to exit"),
+        "missing confirmation hint: {status}"
+    );
     assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Exit);
+}
+
+#[test]
+fn any_other_key_disarms_the_exit_confirmation() {
+    let mut app = app();
+    app.handle_key(key(KeyCode::Esc));
+    app.handle_key(key(KeyCode::Char('h')));
+    // The armed state was dropped: the next Esc starts over.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
+    let status = lines_text(&app.panel_lines(120, 10));
+    assert!(status.contains("Press Esc again to exit"), "{status}");
+}
+
+#[test]
+fn esc_that_dismisses_the_completion_menu_does_not_arm_exit() {
+    let mut app = app();
+    type_text(&mut app, "/mo");
+    assert!(app.completion_visible());
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
+    // The menu absorbed that Esc — a follow-up Esc merely arms the
+    // confirmation instead of exiting.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
 }
 
 #[test]
@@ -157,6 +186,101 @@ fn paste_inserts_without_submitting() {
     assert_eq!(action, ChatAction::Continue);
     assert_eq!(app.input(), "ask: line one\nline two");
     assert!(app.transcript_text().is_empty());
+}
+
+// --- paste collapse (Claude-Code-style placeholders) ---
+
+#[test]
+fn large_paste_collapses_to_a_placeholder() {
+    let mut app = app();
+    let pasted = (0..184)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.handle_paste(&pasted);
+    // The editor holds only the compact marker, not 184 raw lines.
+    assert_eq!(app.input(), "[Pasted text #1 +184 lines]");
+}
+
+#[test]
+fn long_single_line_paste_collapses_to_a_char_placeholder() {
+    let mut app = app();
+    app.handle_paste(&"x".repeat(2000));
+    assert_eq!(app.input(), "[Pasted text #1 +2000 chars]");
+}
+
+#[test]
+fn submit_expands_the_placeholder_into_the_full_pasted_text() {
+    let mut app = app();
+    type_text(&mut app, "summarize: ");
+    let pasted = (0..10)
+        .map(|i| format!("row {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.handle_paste(&pasted);
+    let action = app.handle_key(key(KeyCode::Enter));
+    let ChatAction::Submit(message) = action else {
+        panic!("expected submit, got {action:?}");
+    };
+    // The model receives the full text…
+    assert!(message.starts_with("summarize: row 0\n"), "{message}");
+    assert!(message.contains("row 9"), "{message}");
+    // …while the transcript shows the compact placeholder.
+    assert!(
+        app.transcript_text().contains("[Pasted text #1 +10 lines]"),
+        "{}",
+        app.transcript_text()
+    );
+    assert!(!app.transcript_text().contains("row 5"));
+}
+
+#[test]
+fn two_pastes_get_distinct_placeholders_and_both_expand() {
+    let mut app = app();
+    app.handle_paste(&"alpha\n".repeat(12));
+    app.handle_paste(&"beta\n".repeat(7));
+    assert!(app.input().contains("[Pasted text #1 +12 lines]"));
+    assert!(app.input().contains("[Pasted text #2 +7 lines]"));
+    let ChatAction::Submit(message) = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("expected submit");
+    };
+    assert!(message.contains("alpha\nalpha"), "{message}");
+    assert!(message.contains("beta\nbeta"), "{message}");
+}
+
+#[test]
+fn placeholder_deleted_by_the_user_is_not_expanded() {
+    let mut app = app();
+    app.handle_paste(&"secret\n".repeat(10));
+    // The user erases the placeholder entirely and types something else.
+    while !app.input().is_empty() {
+        app.handle_key(key(KeyCode::Backspace));
+    }
+    let action = submit_message(&mut app, "just say hi");
+    assert_eq!(action, ChatAction::Submit("just say hi".to_string()));
+}
+
+#[test]
+fn small_paste_is_inserted_verbatim() {
+    let mut app = app();
+    app.handle_paste("one\ntwo");
+    assert_eq!(app.input(), "one\ntwo");
+}
+
+// --- welcome banner ---
+
+#[test]
+fn welcome_banner_names_the_build_model_and_workspace() {
+    let lines = harness_cli::chat::welcome_banner(
+        "0.1.0",
+        "deepseek/deepseek-v4-pro",
+        std::path::Path::new("C:/work/project"),
+    );
+    let text = lines.join("\n");
+    assert!(text.contains("harness"), "{text}");
+    assert!(text.contains("0.1.0"), "{text}");
+    assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
+    assert!(text.contains("C:/work/project"), "{text}");
 }
 
 #[test]

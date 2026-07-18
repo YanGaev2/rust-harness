@@ -109,6 +109,47 @@ fn tui_paste_fills_api_key_field_in_wizard_and_strips_newline() {
 }
 
 #[test]
+fn setup_tui_esc_arms_then_second_esc_exits() {
+    let mut app = setup_app();
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Continue);
+    assert!(
+        app.status_message().contains("Press Esc again"),
+        "{}",
+        app.status_message()
+    );
+    // Any other key disarms the confirmation…
+    app.handle_key(key(KeyCode::Char('x')));
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Continue);
+    // …and a straight double Esc exits.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Exit);
+}
+
+#[test]
+fn tui_esc_closes_the_wizard_instead_of_exiting_harness() {
+    let mut app = TuiApp::new(
+        "harness",
+        PathBuf::from("C:/config/providers.json"),
+        PathBuf::from("C:/work/project"),
+    );
+    type_text_tui(&mut app, "/provider add");
+    app.handle_key(key(KeyCode::Enter));
+    app.handle_key(key(KeyCode::Enter)); // provider chosen -> base URL step
+
+    // Esc inside the wizard: dialog closes, the program keeps running.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Continue);
+    assert!(app.dialog_title().is_none());
+
+    // At the top level Esc is two-step: arm, then exit.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Continue);
+    assert!(
+        app.status_message().contains("Press Esc again"),
+        "{}",
+        app.status_message()
+    );
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Exit);
+}
+
+#[test]
 fn terminal_setup_enables_bracketed_paste_to_protect_the_terminal() {
     let read = |path: &str| {
         std::fs::read_to_string(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(path))

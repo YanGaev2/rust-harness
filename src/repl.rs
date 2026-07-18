@@ -489,18 +489,20 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
 
     tui_terminal::install_panic_restore();
     let mut screen = Screen::stdout().map_err(tui_io_error)?;
-    // Start from a clean viewport like the reference tools: the TUI
-    // draws from the top row; the panel follows the content down.
+    // Start from a clean viewport with the panel pinned to the bottom
+    // edge (the reference-tool chat layout): committed content
+    // accumulates just above the editor instead of hanging at the top.
+    screen.set_bottom_anchor(true);
     screen.clear_screen().map_err(ReplError::Io)?;
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
-    // Key hints live in the persistent status line, so no welcome banner is
-    // needed in the transcript.
-    let mut app = ChatApp::new(
-        format!("{}/{}", active_provider.name(), active_model),
-        &workspace,
-    )
-    .with_catalog(catalog_pairs(&catalog));
+    let provider_label = format!("{}/{}", active_provider.name(), active_model);
+    let mut app =
+        ChatApp::new(provider_label.clone(), &workspace).with_catalog(catalog_pairs(&catalog));
+    for line in crate::chat::welcome_banner(env!("CARGO_PKG_VERSION"), &provider_label, &workspace)
+    {
+        app.push_system_line(line);
+    }
     let mut chat = ChatSession::start(
         SessionStore::for_workspace(&workspace),
         &workspace,

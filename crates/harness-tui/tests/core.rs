@@ -266,6 +266,77 @@ fn clear_wipes_screen_and_scrollback_and_resets_origin() {
     assert!(repaint.contains("status"));
 }
 
+// --- bottom-anchored mode (opt-in, used by the chat TUI) ---
+
+#[test]
+fn bottom_anchor_pins_panel_to_the_bottom_from_startup() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    let out = buf.contents();
+    // Panel occupies the last two rows (8, 9 → escape rows 9, 10),
+    // not the top of the blank viewport.
+    assert!(
+        out.contains("\x1b[9;1H"),
+        "panel top not at bottom: {out:?}"
+    );
+    assert!(
+        out.contains("\x1b[10;1H"),
+        "panel bottom row missing: {out:?}"
+    );
+}
+
+#[test]
+fn bottom_anchor_commits_content_just_above_the_panel() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    let before = buf.contents().len();
+    screen
+        .present(&lines(&["banner"]), lines(&["editor", "status"]))
+        .unwrap();
+    let out = buf.contents()[before..].to_string();
+    // The committed line prints at the bottom flow origin (row 9 →
+    // escape row 10) and the panel lands on the last two rows.
+    assert!(out.contains("\x1b[10;1H"), "commit not at bottom: {out:?}");
+    assert!(out.contains("banner"));
+    assert!(out.contains("\x1b[9;1H"), "panel not repinned: {out:?}");
+    assert!(out.contains("editor"));
+}
+
+#[test]
+fn bottom_anchor_resize_repins_to_the_bottom() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    let before = buf.contents().len();
+    screen.resize(40, 20).unwrap();
+    let out = buf.contents()[before..].to_string();
+    // Anchored mode is the opposite contract of the flow-mode resize
+    // test above: growing the window MUST teleport the panel down.
+    assert!(
+        out.contains("\x1b[19;1H"),
+        "panel must repin to the bottom: {out:?}"
+    );
+}
+
+#[test]
+fn bottom_anchor_shrinking_panel_returns_to_the_bottom() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    screen.render_panel(lines(&["a", "b", "c", "d"])).unwrap();
+    let before = buf.contents().len();
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    let out = buf.contents()[before..].to_string();
+    // 4-row panel sat at rows 6..9; the 2-row panel must hug rows 8..9
+    // again instead of staying at row 6 with a gap below.
+    assert!(out.contains("\x1b[9;1H"), "panel not at bottom: {out:?}");
+    assert!(out.contains("input"));
+}
+
 #[test]
 fn oversized_panel_is_tail_clipped_without_panicking() {
     let (mut screen, buf) = screen(40, 3, 0);

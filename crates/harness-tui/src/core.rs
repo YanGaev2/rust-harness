@@ -21,6 +21,10 @@ pub struct Screen {
     /// Terminal row (0-based) where the panel starts — also where the
     /// next scrollback emission begins.
     origin: u16,
+    /// Opt-in bottom-pinned layout: the panel hugs the last rows of the
+    /// viewport and every repaint/resize re-derives its top from the
+    /// bottom edge instead of following the content flow.
+    anchored: bool,
 }
 
 impl Screen {
@@ -33,6 +37,20 @@ impl Screen {
             height,
             panel: Vec::new(),
             origin: start_row.min(height.saturating_sub(1)),
+            anchored: false,
+        }
+    }
+
+    /// Switch to the bottom-pinned layout (Claude-Code-style chat): the
+    /// flow origin moves to the last viewport row so committed content
+    /// accumulates just above the panel, and repaints/resizes keep the
+    /// panel glued to the bottom edge. Call before the first paint (or
+    /// right before `clear_screen`) — an already-painted panel is not
+    /// relocated retroactively.
+    pub fn set_bottom_anchor(&mut self, anchored: bool) {
+        self.anchored = anchored;
+        if anchored && self.panel.is_empty() {
+            self.origin = self.height.saturating_sub(1);
         }
     }
 
@@ -89,8 +107,13 @@ impl Screen {
             }
         }
         // Reserve at least the cursor row even with no panel painted,
-        // so origin can never land outside the viewport.
-        self.origin = (row0 + k).min(height.saturating_sub(panel_len.max(1)));
+        // so origin can never land outside the viewport. Anchored mode
+        // ignores the flow and pins the panel to the bottom edge.
+        self.origin = if self.anchored {
+            height.saturating_sub(panel_len.max(1))
+        } else {
+            (row0 + k).min(height.saturating_sub(panel_len.max(1)))
+        };
         push_panel_rows(&mut frame, &self.panel, self.origin);
         frame.push_str(esc::SYNC_END);
         self.terminal.write_all(frame.as_bytes())
@@ -123,6 +146,17 @@ impl Screen {
                 frame.push_str("\r\n");
             }
             self.origin = self.origin.saturating_sub(overflow);
+        }
+        if self.anchored {
+            let target = height.saturating_sub(new_len.max(1));
+            if target > self.origin {
+                // Panel shrank: wipe the old panel area first, then
+                // repin to the bottom (the flow origin would leave the
+                // shorter panel floating with a gap below it).
+                frame.push_str(&esc::move_to(self.origin, 0));
+                frame.push_str(esc::CLEAR_DOWN);
+                self.origin = target;
+            }
         }
         frame.push_str(&esc::move_to(self.origin, 0));
         frame.push_str(esc::CLEAR_DOWN);
@@ -173,7 +207,11 @@ impl Screen {
                 frame.push_str("\r\n");
             }
         }
-        let origin = (row0 + k).min(height.saturating_sub(live_len.max(1)));
+        let origin = if self.anchored {
+            height.saturating_sub(live_len.max(1))
+        } else {
+            (row0 + k).min(height.saturating_sub(live_len.max(1)))
+        };
         push_panel_rows(&mut frame, &live, origin);
         frame.push_str(esc::SYNC_END);
         self.terminal.write_all(frame.as_bytes())?;
@@ -195,12 +233,21 @@ impl Screen {
             self.panel = clipped;
         }
         let panel_len = self.panel.len() as u16;
-        self.origin = self
-            .origin
-            .min(self.height.saturating_sub(panel_len.max(1)));
+        let clamp = self.height.saturating_sub(panel_len.max(1));
+        // Anchored mode repins to the new bottom edge; flow mode keeps
+        // the content-following origin (clamped so the panel fits).
+        let clear_from = if self.anchored {
+            let target = clamp;
+            let clear_from = self.origin.min(target);
+            self.origin = target;
+            clear_from
+        } else {
+            self.origin = self.origin.min(clamp);
+            self.origin
+        };
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
-        frame.push_str(&esc::move_to(self.origin, 0));
+        frame.push_str(&esc::move_to(clear_from, 0));
         frame.push_str(esc::CLEAR_DOWN);
         push_panel_rows(&mut frame, &self.panel, self.origin);
         frame.push_str(esc::SYNC_END);
@@ -214,7 +261,7 @@ impl Screen {
     /// scrollback is left untouched.
     pub fn clear_screen(&mut self) -> io::Result<()> {
         self.panel.clear();
-        self.origin = 0;
+        self.origin = self.reset_origin();
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -228,7 +275,7 @@ impl Screen {
     /// `render_panel`/`emit` starts from the top row.
     pub fn clear(&mut self) -> io::Result<()> {
         self.panel.clear();
-        self.origin = 0;
+        self.origin = self.reset_origin();
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -245,6 +292,19 @@ impl Screen {
         frame.push_str(&esc::move_to(self.origin, 0));
         frame.push_str(esc::CLEAR_DOWN);
         self.terminal.write_all(frame.as_bytes())
+    }
+}
+
+impl Screen {
+    /// Where a wiped screen starts painting: the top row in flow mode,
+    /// the last row in anchored mode (so the first frame lands at the
+    /// bottom instead of the top of the blank viewport).
+    fn reset_origin(&self) -> u16 {
+        if self.anchored {
+            self.height.saturating_sub(1)
+        } else {
+            0
+        }
     }
 }
 

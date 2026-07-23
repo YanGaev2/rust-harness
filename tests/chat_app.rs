@@ -330,7 +330,68 @@ fn ctrl_v_requests_clipboard_capture_and_callback_inserts() {
     assert_eq!(app.input(), "pasted from clipboard");
 }
 
+// --- resize repaint: re-wrap the emitted tail at the new width ---
+
+#[test]
+fn viewport_tail_rewraps_emitted_entries_and_excludes_live_ones() {
+    let mut app = app();
+    submit_message(&mut app, "first message with quite a few words in it");
+    let (_, through) = app.peek_scrollback(80);
+    app.acknowledge_emitted(through);
+    // A second entry that was never flushed must not appear: the panel
+    // renders it as the live tail, so the repaint would duplicate it.
+    submit_message(&mut app, "second unflushed");
+
+    let tail = app.viewport_tail(20, 30);
+    let text = lines_text(&tail);
+    assert!(text.contains("first message"), "{text}");
+    assert!(!text.contains("second unflushed"), "{text}");
+    // Re-wrapped to the new width: no rendered line exceeds 20 columns.
+    for line in &tail {
+        assert!(
+            line.text().chars().count() <= 20,
+            "line wider than 20: {:?}",
+            line.text()
+        );
+    }
+}
+
+#[test]
+fn viewport_tail_returns_only_the_last_rows() {
+    let mut app = app();
+    submit_message(&mut app, "oldest entry");
+    submit_message(&mut app, "newest entry");
+    let (_, through) = app.peek_scrollback(80);
+    app.acknowledge_emitted(through);
+
+    let tail = app.viewport_tail(80, 2);
+    assert!(tail.len() <= 2, "got {} lines", tail.len());
+    let text = lines_text(&tail);
+    assert!(text.contains("newest"), "{text}");
+    assert!(!text.contains("oldest"), "{text}");
+}
+
 // --- slash commands ---
+
+#[test]
+fn slash_paste_requests_clipboard_capture() {
+    // Windows Terminal binds Ctrl+V to its own paste action, so the 0x16 byte
+    // never reaches the app there; /paste is the terminal-agnostic route to
+    // the same clipboard capture (text or PNG attachment).
+    let mut app = app();
+    let action = submit_message(&mut app, "/paste");
+    assert_eq!(action, ChatAction::CaptureClipboard);
+    assert_eq!(app.input(), "");
+}
+
+#[test]
+fn slash_paste_appears_in_command_suggestions() {
+    let mut app = app();
+    type_text(&mut app, "/pa");
+    assert!(app.completion_visible());
+    let suggestions = app.completion_suggestions();
+    assert!(suggestions.contains(&"/paste".to_string()));
+}
 
 #[test]
 fn slash_model_returns_switch_action_without_echo() {

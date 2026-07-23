@@ -393,3 +393,76 @@ fn repl_renders_agent_events_for_streaming_terminal_output() {
     assert!(output.contains("tool call-1 file.write ok"));
     assert!(output.ends_with("streamed answer"));
 }
+
+// --- resize debounce: eager erase, lazy repaint ---
+// Width changes reflow the terminal buffer and smear any painted panel,
+// so the loop erases the viewport on every width event but repaints the
+// full frame only once the size has been stable for the settle window.
+
+#[test]
+fn resize_debouncer_erases_on_width_change_and_repaints_after_settle() {
+    use harness_cli::repl::{ResizeAction, ResizeDebouncer};
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let mut deb = ResizeDebouncer::new(120, 30, Duration::from_millis(150));
+    assert_eq!(deb.observe(100, 30, t0), ResizeAction::Erase);
+    assert!(deb.is_pending());
+    // Still settling: nothing to do yet.
+    assert_eq!(
+        deb.observe(100, 30, t0 + Duration::from_millis(50)),
+        ResizeAction::None
+    );
+    // Stable past the settle window: one full repaint, then quiet.
+    assert_eq!(
+        deb.observe(100, 30, t0 + Duration::from_millis(200)),
+        ResizeAction::Repaint
+    );
+    assert!(!deb.is_pending());
+    assert_eq!(
+        deb.observe(100, 30, t0 + Duration::from_millis(300)),
+        ResizeAction::None
+    );
+}
+
+#[test]
+fn resize_debouncer_height_only_change_resizes_immediately() {
+    use harness_cli::repl::{ResizeAction, ResizeDebouncer};
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let mut deb = ResizeDebouncer::new(120, 30, Duration::from_millis(150));
+    // No reflow on a height-only change: keep the cheap repin path and
+    // never schedule a repaint.
+    assert_eq!(deb.observe(120, 40, t0), ResizeAction::Resize);
+    assert!(!deb.is_pending());
+    assert_eq!(
+        deb.observe(120, 40, t0 + Duration::from_millis(200)),
+        ResizeAction::None
+    );
+}
+
+#[test]
+fn resize_debouncer_restarts_the_settle_window_while_dragging() {
+    use harness_cli::repl::{ResizeAction, ResizeDebouncer};
+    use std::time::{Duration, Instant};
+
+    let t0 = Instant::now();
+    let mut deb = ResizeDebouncer::new(120, 30, Duration::from_millis(150));
+    assert_eq!(deb.observe(110, 30, t0), ResizeAction::Erase);
+    // The drag continues: erase again, settle timer restarts.
+    assert_eq!(
+        deb.observe(90, 28, t0 + Duration::from_millis(100)),
+        ResizeAction::Erase
+    );
+    // 100ms after the LAST change is still inside the window…
+    assert_eq!(
+        deb.observe(90, 28, t0 + Duration::from_millis(200)),
+        ResizeAction::None
+    );
+    // …and 160ms after it the frame repaints once.
+    assert_eq!(
+        deb.observe(90, 28, t0 + Duration::from_millis(260)),
+        ResizeAction::Repaint
+    );
+}

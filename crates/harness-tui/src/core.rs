@@ -254,6 +254,61 @@ impl Screen {
         self.terminal.write_all(frame.as_bytes())
     }
 
+    /// Adopt a new size after a width change and wipe the viewport.
+    /// Width changes make the terminal reflow its buffer, so every row
+    /// coordinate recorded before the resize — including the painted
+    /// panel's — is stale; erasing the whole viewport is the only
+    /// cleanup that needs no coordinates. The painted panel is
+    /// forgotten; follow up with [`Screen::repaint`] once the size
+    /// settles. Native scrollback is never touched.
+    pub fn resize_erase(&mut self, width: u16, height: u16) -> io::Result<()> {
+        self.width = width;
+        self.height = height.max(1);
+        self.panel.clear();
+        self.origin = self.reset_origin();
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        frame.push_str(esc::CLEAR_ALL);
+        frame.push_str(&esc::move_to(0, 0));
+        frame.push_str(esc::SYNC_END);
+        self.terminal.write_all(frame.as_bytes())
+    }
+
+    /// Repaint the whole viewport from the model: the content tail sits
+    /// directly above the panel (anchored mode) or flows from the top
+    /// with the panel below it (flow mode). Absolute row writes only —
+    /// nothing scrolls, so nothing is duplicated into scrollback.
+    pub fn repaint(&mut self, content: &[Line], mut live: Vec<Line>) -> io::Result<()> {
+        let height = self.height.max(1);
+        let max_rows = height as usize;
+        if live.len() > max_rows {
+            live = live.split_off(live.len() - max_rows);
+        }
+        let live_len = live.len() as u16;
+        let origin = if self.anchored {
+            height.saturating_sub(live_len.max(1))
+        } else {
+            (content.len() as u16).min(height.saturating_sub(live_len.max(1)))
+        };
+        // Content fills the rows above the panel, tail-clipped to fit.
+        let space = origin as usize;
+        let tail_start = content.len().saturating_sub(space);
+        let tail = &content[tail_start..];
+        let first_row = origin - tail.len() as u16;
+        let mut frame = String::new();
+        frame.push_str(esc::SYNC_BEGIN);
+        frame.push_str(esc::CLEAR_ALL);
+        for (i, line) in tail.iter().enumerate() {
+            frame.push_str(&esc::move_to(first_row + i as u16, 0));
+            frame.push_str(&render_ansi(line));
+        }
+        push_panel_rows(&mut frame, &live, origin);
+        frame.push_str(esc::SYNC_END);
+        self.origin = origin;
+        self.panel = live;
+        self.terminal.write_all(frame.as_bytes())
+    }
+
     /// Wipe the visible viewport and home the cursor — the startup
     /// claim. A deliberate product choice built on pi's `clearScreen`
     /// primitive (pi itself starts at the shell cursor; we clear so the

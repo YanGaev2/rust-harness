@@ -275,8 +275,8 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   input (`/p` → `/provider`, typed prefix highlighted, usage + description per row);
   Up/Down select, Tab completes, Esc closes, Enter runs. Typing `/model ` extends
   the menu with the saved provider/model pairs themselves.
-  Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/history QUERY`,
-  `/clear`, `/new`, `/cost`, `/help`, `/exit`.
+  Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/paste`,
+  `/history QUERY`, `/clear`, `/new`, `/cost`, `/help`, `/exit`.
 - **Interactive model picker**: `/model` alone opens a selector under the
   input — `→ deepseek-v4-pro [deepseek] ✓` rows (cursor arrow, dimmed provider,
   check on the active pair) with a `(K/N)` counter; Up/Down move, typing
@@ -308,11 +308,21 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   `[Pasted text #1 +184 lines]` placeholder** in the editor; the full text is
   substituted back in when the message is sent, while the transcript and history
   keep the compact marker.
-- Captures **Ctrl+V** from the system clipboard: text is inserted at the caret, a
-  PNG image is saved to `.harness/attachments` and referenced in the prompt.
+- Captures **Ctrl+V or `/paste`** from the system clipboard: text is inserted at
+  the caret, a PNG image is saved to `.harness/attachments` and referenced in the
+  prompt. `/paste` exists because many terminals bind Ctrl+V themselves —
+  Windows Terminal in particular swallows it entirely when the clipboard holds
+  an image (its own paste action finds no text and the key never reaches the
+  app), so use `/paste` there.
 - Recalls prompt history with Up/Down. The transcript scrolls with the terminal's
   own **mouse wheel and scrollbar** (the mouse is not captured), and text
   selection/copy works natively.
+- **Survives window resizing without ghost panels**: width changes make the
+  terminal reflow its buffer, which used to smear the painted input panel into
+  broken border fragments. Now a width change erases the viewport immediately
+  and, once the size has been stable for ~150ms, repaints the visible
+  transcript tail and the panel re-wrapped to the new width (typed input is
+  preserved). Height-only changes keep the cheap repin path.
 
 ```powershell
 harness repl --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --timeout-ms 60000 --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000
@@ -384,6 +394,30 @@ Capture already-pasted terminal text through the same attachment path:
 ```powershell
 harness clipboard paste --workspace . --text "pasted text"
 ```
+
+## Roadmap
+
+Done (each item is verified by tests and/or the agent benchmark):
+
+- ✅ Cache-first request envelope — byte-stable prefix, BLAKE3 cache keys, live `/cost`
+- ✅ Four chat API formats (OpenAI-compatible, OpenAI Responses, Codex Responses, Anthropic Messages) + SSE streaming
+- ✅ Provider onboarding — presets, `/models` discovery, Bearer/header/env auth, per-provider proxy, cache metadata
+- ✅ Agent loop with forgiving tool runtime — name aliases, argument coercion, repair memos, loop guardrails
+- ✅ Model-fitted tools — probe suite + 26-task benchmark across 6 model families (1199 tool calls, 0 failures)
+- ✅ Fallback chains with error classification (switch on 5xx/429/quota, never on auth/context/policy)
+- ✅ Own TUI library (`harness-tui`) — no ratatui/crossterm, native-scrollback screen, own input parser
+- ✅ Chat TUI — markdown rendering, slash-command autocomplete, interactive model picker, streaming tool cards
+- ✅ Session & trace persistence under `~/.harness` with resume on launch
+- ✅ Clipboard & attachments — Ctrl+V / `/paste`, PNG capture into `.harness/attachments`
+- ✅ Window-resize survival — immediate erase + 150 ms debounce + full repaint, no ghost panels
+- ✅ Agent self-awareness — environment line + harness usage notes in the system prompt
+
+Planned:
+
+- [ ] Subagents — spawn scoped child agent runs with their own tool budgets
+- [ ] New UI
+- [ ] Provider presets/configs for more model families
+- [ ] Vision — image blocks in provider requests so models actually see PNG attachments
 
 ## Implemented core
 

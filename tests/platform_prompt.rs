@@ -156,6 +156,24 @@ fn agent_system_prompt_explains_a_missing_shell() {
 }
 
 #[test]
+fn agent_system_prompt_describes_harness_config_and_attachments() {
+    // The model runs inside the harness CLI and gets asked about it; without
+    // these lines it guesses config paths instead of knowing them.
+    let profile = ShellProfile::native();
+    let prompt = agent_system_prompt(std::path::Path::new("F:/rust-harness"), Some(&profile));
+
+    assert!(prompt.contains(".harness/providers.json"));
+    assert!(prompt.contains("harness provider"));
+    assert!(prompt.contains(".harness/attachments"));
+    assert!(prompt.contains("attachment.read"));
+
+    // Also present when no shell is available — the harness facts do not
+    // depend on the shell profile.
+    let no_shell = agent_system_prompt(std::path::Path::new("/workspace"), None);
+    assert!(no_shell.contains(".harness/providers.json"));
+}
+
+#[test]
 fn agent_system_prompt_is_stable_for_a_session() {
     // The prompt feeds the provider cache prefix; two builds for the same
     // workspace must be byte-identical.

@@ -337,6 +337,90 @@ fn bottom_anchor_shrinking_panel_returns_to_the_bottom() {
     assert!(out.contains("input"));
 }
 
+// --- width-change resize: erase + full repaint from the model ---
+// Windows Terminal reflows the buffer on width change, so absolute rows
+// recorded before the resize are meaningless afterwards. The chat loop
+// erases the viewport eagerly (resize_erase) and repaints everything it
+// owns from the model once the size settles (repaint).
+
+#[test]
+fn resize_erase_wipes_viewport_adopts_size_and_keeps_scrollback() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    screen.render_panel(lines(&["input", "status"])).unwrap();
+    let before = buf.contents().len();
+    screen.resize_erase(60, 12).unwrap();
+    let out = buf.contents()[before..].to_string();
+    assert!(out.contains("\x1b[2J"), "missing viewport wipe: {out:?}");
+    assert!(
+        !out.contains("\x1b[3J"),
+        "resize must never destroy scrollback: {out:?}"
+    );
+    assert_eq!(screen.width(), 60);
+    assert_eq!(screen.height(), 12);
+}
+
+#[test]
+fn repaint_paints_content_tail_above_the_bottom_panel_in_one_frame() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    screen
+        .render_panel(lines(&["old input", "old status"]))
+        .unwrap();
+    screen.resize_erase(60, 12).unwrap();
+    let before = buf.contents().len();
+    screen
+        .repaint(&lines(&["one", "two"]), lines(&["input", "status"]))
+        .unwrap();
+    let out = buf.contents()[before..].to_string();
+    // One synchronized frame.
+    assert_eq!(out.matches("\x1b[?2026h").count(), 1, "{out:?}");
+    assert_eq!(out.matches("\x1b[?2026l").count(), 1);
+    // Panel pinned to the new bottom: rows 10, 11 → escapes 11, 12.
+    assert!(out.contains("\x1b[11;1H"), "panel top: {out:?}");
+    assert!(out.contains("\x1b[12;1H"), "panel bottom: {out:?}");
+    assert!(out.contains("input"));
+    // Content sits directly above the panel: rows 8, 9 → escapes 9, 10.
+    assert!(out.contains("\x1b[9;1H"), "content top: {out:?}");
+    assert!(out.contains("\x1b[10;1H"), "content bottom: {out:?}");
+    assert!(out.contains("one"));
+    assert!(out.contains("two"));
+    // Absolute row writes only — repaint must never scroll content into
+    // scrollback (that would duplicate history).
+    assert!(
+        !out.contains("\r\n"),
+        "repaint must not print flow newlines: {out:?}"
+    );
+}
+
+#[test]
+fn repaint_clips_oversized_content_and_restores_the_diff_origin() {
+    let (mut screen, buf) = screen(40, 6, 0);
+    screen.set_bottom_anchor(true);
+    screen.clear_screen().unwrap();
+    // 8 content lines into 4 free rows (height 6 - panel 2): tail only.
+    let texts: Vec<String> = (0..8).map(|i| format!("line{i}")).collect();
+    let content: Vec<Line> = texts.iter().map(Line::raw).collect();
+    screen
+        .repaint(&content, lines(&["input", "status"]))
+        .unwrap();
+    let out = buf.contents();
+    assert!(out.contains("line7"), "tail kept: {out:?}");
+    assert!(!out.contains("line3"), "head clipped: {out:?}");
+    // Subsequent same-height panel updates diff against the repainted
+    // panel at the restored origin (row 4 → escape 5).
+    let before = buf.contents().len();
+    screen
+        .render_panel(lines(&["input", "new status"]))
+        .unwrap();
+    let update = buf.contents()[before..].to_string();
+    assert!(update.contains("\x1b[6;1H"), "diff at origin: {update:?}");
+    assert!(update.contains("new status"));
+    assert!(!update.contains("line7"), "content repainted: {update:?}");
+}
+
 #[test]
 fn oversized_panel_is_tail_clipped_without_panicking() {
     let (mut screen, buf) = screen(40, 3, 0);

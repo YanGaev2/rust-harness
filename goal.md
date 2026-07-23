@@ -744,3 +744,45 @@ ust-harness\README.md` - the absolute
   captures go through the same path. Test count 340->351 (Windows), tmux
   smoke-verified on Linux (banner+bottom panel, armed hint, placeholder,
   clean double-Esc exit).
+- /paste command + harness self-knowledge in the prompt (user report: image
+  paste dead, model guesses where its own configs live). Root cause for
+  images: Windows Terminal binds ctrl+v to its own paste action, which finds
+  no text when the clipboard holds an image and silently consumes the key -
+  the 0x16 byte never reaches the app, so the existing CaptureClipboard path
+  was unreachable there. /paste in the chat TUI now triggers the same capture
+  terminal-agnostically (text at the caret, PNG into .harness/attachments).
+  agent_system_prompt gains a static HARNESS_CONTEXT paragraph (providers.json
+  location, harness provider subcommands, attachments dir + attachment.read)
+  so the model answers questions about its own runtime instead of guessing;
+  the text is byte-stable to keep the cache prefix intact. Known open gap:
+  a captured PNG is only referenced by path - attachment.read returns empty
+  content for kind=image and no chat format sends image blocks, so no model
+  can actually see the pixels yet (vision support is a separate feature).
+  Test count 351->354.
+- Resize ghost fix: erase-then-repaint with debounce (user report: widening
+  then narrowing the window littered the screen with broken panel copies).
+  Root cause: width changes make Windows Terminal reflow the buffer,
+  including the painted panel rows; Screen::resize cleared from a
+  pre-reflow absolute row, so smeared fragments above it - or already
+  scrolled into native scrollback - survived, and the 400ms poll let every
+  intermediate drag width leave one. Considered codex's cursor-anchor
+  design (agents/codex-resize-alternatives.md) but rejected it
+  pre-implementation: reading the anchor back mid-session needs DSR while
+  InputPump owns stdin (terminal.rs documents cursor_position as
+  startup-only), and a blind anchor risks erasing visible transcript. Fix
+  (pi-style, tui.ts does fullRender on width change): width change ->
+  Screen::resize_erase (CLEAR_ALL viewport, never 3J, panel forgotten);
+  after 150ms of stable size -> Screen::repaint (re-wrapped transcript
+  tail from ChatApp::viewport_tail bottom-aligned above the re-wrapped
+  panel, absolute row writes only so nothing scrolls or duplicates).
+  ResizeDebouncer in repl.rs: pure state machine (Erase eager / Repaint
+  lazy / height-only Resize immediate), injected clocks for tests; idle
+  poll 400ms -> 100ms to shrink the first-erase window, 50ms while
+  settling; draw_chat suppressed while pending. Residue that escapes into
+  scrollback during the detection window is unreachable by design - but
+  it is now readable text copies, not broken border fragments. Test count
+  354->359 (+2 chat_app, +3 repl) plus harness-tui 117->120 (+3 core,
+  counted separately from the workspace root). tmux smoke on WSL: panel
+  repaints at each width with
+  typed input preserved, single live panel, two readable history copies
+  from the detection window.

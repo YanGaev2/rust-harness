@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use harness_tui::core::Screen;
 use harness_tui::input::{Event as TuiEvent, KeyCode as TuiKeyCode, Parser, coalesce_burst};
@@ -515,13 +515,26 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     }
 
     let mut pump = InputPump::start();
+    let mut resize = ResizeDebouncer::new(screen.width(), screen.height(), RESIZE_SETTLE);
 
     'session: loop {
-        draw_chat(&mut screen, &mut app)?;
-        let events = pump
-            .poll(Duration::from_millis(400))
-            .map_err(ReplError::Io)?;
-        check_resize(&mut screen)?;
+        // While a width change settles the viewport stays erased — a
+        // panel painted mid-drag would be reflowed into ghost fragments.
+        if !resize.is_pending() {
+            draw_chat(&mut screen, &mut app)?;
+        }
+        // 100ms idle polling keeps the first-erase window small: the
+        // longer a stale-width panel survives a resize, the more of it
+        // the terminal's reflow can push into unreachable scrollback.
+        // Unchanged frames diff to zero updates, so the extra ticks
+        // cost nothing.
+        let poll_window = if resize.is_pending() {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(100)
+        };
+        let events = pump.poll(poll_window).map_err(ReplError::Io)?;
+        handle_resize(&mut screen, &app, &mut resize)?;
         for event in events {
             let action = match event {
                 TuiEvent::Paste(text) => app.handle_paste(&text),
@@ -602,8 +615,10 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                             app.push_agent_event(&event);
                         }
                         app.tick();
-                        check_resize(&mut screen)?;
-                        draw_chat(&mut screen, &mut app)?;
+                        handle_resize(&mut screen, &app, &mut resize)?;
+                        if !resize.is_pending() {
+                            draw_chat(&mut screen, &mut app)?;
+                        }
                         // Poll input BEFORE the finished check so a
                         // queued Esc is consumed as a busy cancel and
                         // can never leak into the idle loop as an exit.
@@ -637,7 +652,9 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                     for notice in chat.take_notices() {
                         app.push_system_line(notice);
                     }
-                    draw_chat(&mut screen, &mut app)?;
+                    if !resize.is_pending() {
+                        draw_chat(&mut screen, &mut app)?;
+                    }
                 }
             }
         }
@@ -671,13 +688,104 @@ fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
     Ok(())
 }
 
-/// The terminal delivers no resize signal we listen for — the idle loop
-/// polls the size once per tick, which is cheap and cross-platform.
-fn check_resize(screen: &mut Screen) -> Result<(), ReplError> {
-    if let Ok((width, height)) = tui_terminal::size()
-        && (width != screen.width() || height != screen.height())
-    {
-        screen.resize(width, height).map_err(ReplError::Io)?;
+/// How long the terminal size must stay unchanged before the full
+/// repaint runs. Short enough to feel instant after a drag, long enough
+/// to skip the intermediate widths the drag produces.
+const RESIZE_SETTLE: Duration = Duration::from_millis(150);
+
+/// What the chat loop should do about the terminal size right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeAction {
+    /// Size unchanged and nothing pending.
+    None,
+    /// Height-only change: repin the panel immediately (`Screen::resize`).
+    /// Height changes do not reflow the buffer, so the cheap path is safe.
+    Resize,
+    /// Width changed: erase the viewport now (`Screen::resize_erase`).
+    /// The reflowed old panel must not survive to the next reflow.
+    Erase,
+    /// The size has been stable for the settle window: repaint the whole
+    /// frame from the model (`Screen::repaint`).
+    Repaint,
+}
+
+/// Debounced resize policy: erase eagerly on every width change (a panel
+/// painted mid-drag is reflowed into ghost fragments by the very next
+/// width step), repaint lazily once the size settles. Pure state machine
+/// with injected clocks so tests need no terminal.
+#[derive(Debug)]
+pub struct ResizeDebouncer {
+    width: u16,
+    height: u16,
+    settle: Duration,
+    pending: Option<Instant>,
+}
+
+impl ResizeDebouncer {
+    pub fn new(width: u16, height: u16, settle: Duration) -> Self {
+        ResizeDebouncer {
+            width,
+            height,
+            settle,
+            pending: None,
+        }
+    }
+
+    pub fn observe(&mut self, width: u16, height: u16, now: Instant) -> ResizeAction {
+        let width_changed = width != self.width;
+        let height_changed = height != self.height;
+        self.width = width;
+        self.height = height;
+        // A height change during an active drag is part of the same
+        // gesture — keep erasing and restart the settle window.
+        if width_changed || (height_changed && self.pending.is_some()) {
+            self.pending = Some(now);
+            return ResizeAction::Erase;
+        }
+        if height_changed {
+            return ResizeAction::Resize;
+        }
+        match self.pending {
+            Some(since) if now.duration_since(since) >= self.settle => {
+                self.pending = None;
+                ResizeAction::Repaint
+            }
+            _ => ResizeAction::None,
+        }
+    }
+
+    pub fn is_pending(&self) -> bool {
+        self.pending.is_some()
+    }
+}
+
+/// The terminal delivers no resize signal we listen for — the loops poll
+/// the size once per tick and feed it through the debouncer: eager erase
+/// on width changes, cheap repin on height-only changes, one full
+/// repaint from the model once the size settles.
+fn handle_resize(
+    screen: &mut Screen,
+    app: &ChatApp,
+    resize: &mut ResizeDebouncer,
+) -> Result<(), ReplError> {
+    let Ok((width, height)) = tui_terminal::size() else {
+        return Ok(());
+    };
+    match resize.observe(width, height, Instant::now()) {
+        ResizeAction::None => {}
+        ResizeAction::Resize => screen.resize(width, height).map_err(ReplError::Io)?,
+        ResizeAction::Erase => screen.resize_erase(width, height).map_err(ReplError::Io)?,
+        ResizeAction::Repaint => {
+            // Mirror draw_chat's layout budget, then fill every row the
+            // panel leaves free with the re-wrapped transcript tail.
+            let width = screen.width() as usize;
+            let height = screen.height() as usize;
+            let max_live_rows = height.saturating_sub(14).max(3);
+            let live = app.panel_lines(width, max_live_rows);
+            let content_rows = height.saturating_sub(live.len());
+            let tail = app.viewport_tail(width, content_rows);
+            screen.repaint(&tail, live).map_err(ReplError::Io)?;
+        }
     }
     Ok(())
 }

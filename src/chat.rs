@@ -110,6 +110,11 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
         description: "list saved providers and their models",
     },
     ChatCommand {
+        name: "/paste",
+        usage: "/paste",
+        description: "capture the system clipboard (text or image)",
+    },
+    ChatCommand {
         name: "/history",
         usage: "/history QUERY",
         description: "search your past prompts",
@@ -697,6 +702,9 @@ impl ChatApp {
                 ChatAction::NewSession
             }
             Some("exit") | Some("quit") => ChatAction::Exit,
+            // Terminals often bind Ctrl+V themselves (Windows Terminal eats it
+            // entirely for images), so the capture needs a key-free route.
+            Some("paste") => ChatAction::CaptureClipboard,
             Some("provider") => {
                 let label = self.provider_label.clone();
                 self.push_system_line(format!("active provider: {label}"));
@@ -1168,6 +1176,34 @@ impl ChatApp {
     /// actually reached the terminal.
     pub fn acknowledge_emitted(&mut self, through: usize) {
         self.emitted = self.emitted.max(through.min(self.transcript.len()));
+    }
+
+    /// Re-wrapped tail of the already-flushed transcript for the resize
+    /// repaint: the last `rows` rendered lines of `transcript[..emitted]`
+    /// wrapped to `width`. Un-flushed entries are excluded — the panel
+    /// renders them as the live tail, so including them here would show
+    /// them twice. Entries are walked newest-first so a long session
+    /// only wraps what fits on screen.
+    pub fn viewport_tail(&self, width: usize, rows: usize) -> Vec<Line> {
+        let mut segments: Vec<Vec<Line>> = Vec::new();
+        let mut total = 0usize;
+        for entry in self.transcript[..self.emitted.min(self.transcript.len())]
+            .iter()
+            .rev()
+        {
+            let mut segment = entry_lines(entry, width);
+            segment.push(Line::default());
+            total += segment.len();
+            segments.push(segment);
+            if total >= rows {
+                break;
+            }
+        }
+        let mut lines: Vec<Line> = segments.into_iter().rev().flatten().collect();
+        if lines.len() > rows {
+            lines.drain(..lines.len() - rows);
+        }
+        lines
     }
 
     /// Qwen-style progressive commit for long streams: when the live

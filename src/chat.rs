@@ -10,7 +10,7 @@
 //! status row.
 
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use harness_tui::components::editor::Editor;
 use harness_tui::components::menu::{MenuItem, menu_lines};
@@ -121,6 +121,11 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
         description: "show session token usage and estimated cost",
     },
     ChatCommand {
+        name: "/thinking",
+        usage: "/thinking",
+        description: "toggle full reasoning in the transcript",
+    },
+    ChatCommand {
         name: "/retain-thinking",
         usage: "/retain-thinking",
         description: "toggle replaying reasoning back to the model",
@@ -162,6 +167,19 @@ struct ToolEntry {
     summary: Option<String>,
 }
 
+/// A reasoning block. While it streams (`elapsed` unset) the panel shows a
+/// live `∴ Thinking… Ns` header over the newest lines; once closed it
+/// renders as a one-line `∴ Thought for Ns` summary, or in full when
+/// `expanded` (the `/thinking` mode or a Ctrl+O replay). Native scrollback
+/// cannot be edited, so collapsing happens at commit time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ThinkingEntry {
+    text: String,
+    started: Instant,
+    elapsed: Option<Duration>,
+    expanded: bool,
+}
+
 /// A single block in the transcript. Tool calls are a structured entry so a
 /// streamed `ToolResult` can update the matching call in place (Running →
 /// Ok/Failed) instead of appending a disconnected line.
@@ -181,7 +199,7 @@ enum ChatEntry {
         text: String,
         continued: bool,
     },
-    Thinking(String),
+    Thinking(ThinkingEntry),
     Tool(ToolEntry),
     System(String),
 }
@@ -204,6 +222,8 @@ pub struct ChatApp {
     emitted: usize,
     streaming_assistant: bool,
     streaming_thinking: bool,
+    /// `/thinking`: commit reasoning in full instead of one summary line.
+    thinking_expanded: bool,
     retain_thinking: bool,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -300,6 +320,7 @@ impl ChatApp {
             emitted: 0,
             streaming_assistant: false,
             streaming_thinking: false,
+            thinking_expanded: false,
             // On by default: the thinking models this harness targets
             // (DeepSeek V4 / Kimi / MiMo) require the reasoning echo, and it
             // is what lets an interrupted turn resume with its thinking.
@@ -405,6 +426,7 @@ impl ChatApp {
         self.busy_since = busy.then(Instant::now);
         self.stream_activity = busy.then(Instant::now);
         if !busy {
+            self.close_thinking();
             self.git_branch = git_branch(&self.workspace);
         }
     }
@@ -493,6 +515,12 @@ impl ChatApp {
         // Ctrl+C always exits, even with the palette open.
         if key.mods.ctrl && key.code == KeyCode::Char('c') {
             return ChatAction::Exit;
+        }
+
+        // Ctrl+O replays the latest collapsed reasoning in full.
+        if key.mods.ctrl && key.code == KeyCode::Char('o') {
+            self.expand_last_thinking();
+            return ChatAction::Continue;
         }
 
         // Ctrl+V delegates a system-clipboard capture (text or image) to the loop.
@@ -750,6 +778,15 @@ impl ChatApp {
             // Terminals often bind Ctrl+V themselves (Windows Terminal eats it
             // entirely for images), so the capture needs a key-free route.
             Some("paste") => ChatAction::CaptureClipboard,
+            Some("thinking") => {
+                self.thinking_expanded = !self.thinking_expanded;
+                self.push_system_line(if self.thinking_expanded {
+                    "thinking: full — reasoning stays expanded in the transcript"
+                } else {
+                    "thinking: collapsed — one summary line per block (Ctrl+O shows the last)"
+                });
+                ChatAction::Continue
+            }
             Some("retain-thinking") => {
                 self.retain_thinking = !self.retain_thinking;
                 let status = if self.retain_thinking {
@@ -967,6 +1004,33 @@ impl ChatApp {
         }
     }
 
+    /// Stop the clock of a reasoning block that is still streaming: it is
+    /// final from now on and renders as its collapsed summary.
+    fn close_thinking(&mut self) {
+        if let Some(ChatEntry::Thinking(thinking)) = self.transcript.last_mut()
+            && thinking.elapsed.is_none()
+        {
+            thinking.elapsed = Some(thinking.started.elapsed());
+        }
+    }
+
+    /// Ctrl+O: lines already in native scrollback cannot be unfolded, so
+    /// the latest finished reasoning block is printed again, in full, as a
+    /// new transcript entry.
+    fn expand_last_thinking(&mut self) {
+        let latest = self.transcript.iter().rev().find_map(|entry| match entry {
+            ChatEntry::Thinking(thinking) if thinking.elapsed.is_some() => Some(thinking.clone()),
+            _ => None,
+        });
+        match latest {
+            Some(mut thinking) => {
+                thinking.expanded = true;
+                self.transcript.push(ChatEntry::Thinking(thinking));
+            }
+            None => self.push_system_line("no reasoning to show yet"),
+        }
+    }
+
     /// Current `/retain-thinking` state; the REPL passes it to each run's
     /// `AgentRunner`, so a mid-session toggle applies from the next turn.
     pub fn retain_thinking(&self) -> bool {
@@ -974,6 +1038,7 @@ impl ChatApp {
     }
 
     pub fn push_user_message(&mut self, message: &str) {
+        self.close_thinking();
         self.transcript.push(ChatEntry::User(message.to_string()));
         self.streaming_assistant = false;
         self.streaming_thinking = false;
@@ -982,6 +1047,7 @@ impl ChatApp {
 
     /// Append a system/status line (welcome banner, error notice, etc.).
     pub fn push_system_line(&mut self, text: impl Into<String>) {
+        self.close_thinking();
         self.transcript.push(ChatEntry::System(text.into()));
         self.streaming_assistant = false;
         self.streaming_thinking = false;
@@ -1004,15 +1070,23 @@ impl ChatApp {
         // arms re-arm their own flag.
         let was_thinking = std::mem::take(&mut self.streaming_thinking);
         let was_assistant = std::mem::take(&mut self.streaming_assistant);
+        if was_thinking && !matches!(event, AgentEvent::Thinking(_)) {
+            self.close_thinking();
+        }
         match event {
             AgentEvent::Thinking(text) => {
                 // Coalesce streamed reasoning fragments into one growing block.
                 if was_thinking
                     && let Some(ChatEntry::Thinking(existing)) = self.transcript.last_mut()
                 {
-                    existing.push_str(text);
+                    existing.text.push_str(text);
                 } else {
-                    self.transcript.push(ChatEntry::Thinking(text.clone()));
+                    self.transcript.push(ChatEntry::Thinking(ThinkingEntry {
+                        text: text.clone(),
+                        started: Instant::now(),
+                        elapsed: None,
+                        expanded: self.thinking_expanded,
+                    }));
                 }
                 self.streaming_thinking = true;
             }
@@ -1303,9 +1377,10 @@ impl ChatApp {
         let Some(last) = self.transcript.last() else {
             return;
         };
+        // A live reasoning block shows only its newest lines, so it never
+        // outgrows the live budget; only streamed answers need splitting.
         let streaming_text = match last {
             ChatEntry::Assistant { text, .. } if self.streaming_assistant => text,
-            ChatEntry::Thinking(text) if self.streaming_thinking => text,
             _ => return,
         };
         if entry_lines(last, width, &self.theme).len() <= max_live_rows {
@@ -1328,12 +1403,7 @@ impl ChatApp {
                     continued: true,
                 });
             }
-            ChatEntry::Thinking(text) => {
-                let (head, tail) = split_at_boundary(&text, split);
-                self.transcript.push(ChatEntry::Thinking(head));
-                self.transcript.push(ChatEntry::Thinking(tail));
-            }
-            _ => unreachable!("only streaming text entries are split"),
+            _ => unreachable!("only streaming answers are split"),
         }
     }
 
@@ -1591,7 +1661,7 @@ fn palette_lines(theme: &Theme) -> Vec<Line> {
         });
     }
     lines.push(Line::styled(
-        " Up/Down recall · Ctrl+V paste · Esc close",
+        " Up/Down recall · Ctrl+O last reasoning · Ctrl+V paste · Esc close",
         muted,
     ));
     lines
@@ -1613,14 +1683,7 @@ fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme) -> Vec<Line> {
             .into_iter()
             .map(|line| indent_line(line, "  "))
             .collect(),
-        ChatEntry::Thinking(text) => {
-            let style = Style::fg(theme.muted);
-            text.split('\n')
-                .map(|raw| Line {
-                    spans: vec![Span::raw("  "), Span::styled(raw, style)],
-                })
-                .collect()
-        }
+        ChatEntry::Thinking(thinking) => return thinking_lines(thinking, width, theme),
         ChatEntry::System(text) => {
             let style = if text.starts_with("memo:") {
                 Style::fg(theme.accent)
@@ -1637,6 +1700,46 @@ fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme) -> Vec<Line> {
         .into_iter()
         .flat_map(|line| wrap_styled_line(line, width))
         .collect()
+}
+
+/// Newest reasoning rows kept visible under a live `Thinking…` header.
+const THINKING_TAIL_ROWS: usize = 4;
+
+/// A reasoning block: live header plus its newest rows while streaming,
+/// one summary line once closed, the full muted text when expanded.
+fn thinking_lines(thinking: &ThinkingEntry, width: usize, theme: &Theme) -> Vec<Line> {
+    let muted = Style::fg(theme.muted);
+    let header = match thinking.elapsed {
+        None => format!(
+            "∴ Thinking… {}",
+            format_elapsed(thinking.started.elapsed().as_secs())
+        ),
+        Some(elapsed) if thinking.expanded => {
+            format!("∴ Thought for {}", format_elapsed(elapsed.as_secs().max(1)))
+        }
+        Some(elapsed) => format!(
+            "∴ Thought for {} · ctrl+o to expand",
+            format_elapsed(elapsed.as_secs().max(1))
+        ),
+    };
+    let mut lines = vec![Line::styled(header, muted)];
+    let live = thinking.elapsed.is_none();
+    if live || thinking.expanded {
+        let mut body: Vec<Line> = thinking
+            .text
+            .trim()
+            .split('\n')
+            .map(|raw| Line {
+                spans: vec![Span::raw("  "), Span::styled(raw, muted)],
+            })
+            .flat_map(|line| wrap_styled_line(line, width))
+            .collect();
+        if live && body.len() > THINKING_TAIL_ROWS {
+            body.drain(..body.len() - THINKING_TAIL_ROWS);
+        }
+        lines.extend(body);
+    }
+    lines
 }
 
 /// The user's turn: `› ` and the text on a full-width background strip,
@@ -2058,7 +2161,7 @@ fn entry_plain_lines(entry: &ChatEntry) -> Vec<String> {
             format!("model {model} · workspace {workspace}"),
         ],
         ChatEntry::Assistant { text, .. } => vec![text.clone()],
-        ChatEntry::Thinking(text) => vec![format!("thinking: {text}")],
+        ChatEntry::Thinking(thinking) => vec![format!("thinking: {}", thinking.text)],
         ChatEntry::System(text) => vec![text.clone()],
         ChatEntry::Tool(tool) => {
             let glyph = match tool.status {

@@ -1002,16 +1002,104 @@ fn ordered_list_items_hang_under_their_text() {
 #[test]
 fn reasoning_is_never_italic() {
     let mut app = app();
+    submit_message(&mut app, "/thinking");
     app.push_agent_event(&AgentEvent::Thinking("weighing options".to_string()));
+    app.push_agent_event(&AgentEvent::FinalContentDelta("done".to_string()));
     let lines = app.take_scrollback(80);
     assert!(lines_text(&lines).contains("weighing options"));
+    let reasoning: Vec<&Line> = lines
+        .iter()
+        .take_while(|line| !line.text().contains("done"))
+        .collect();
     assert!(
-        lines
+        reasoning
             .iter()
             .flat_map(|line| &line.spans)
             .all(|span| !span.style.italic && !span.style.dim),
-        "reasoning must use an explicit muted color, not italic/dim: {lines:?}"
+        "reasoning must use an explicit muted color, not italic/dim: {reasoning:?}"
     );
+}
+
+#[test]
+fn live_reasoning_shows_a_timer_and_only_the_newest_rows() {
+    let mut app = app();
+    app.set_busy(true);
+    let text: String = (1..=9).map(|i| format!("step {i}\n")).collect();
+    app.push_agent_event(&AgentEvent::Thinking(text));
+    let panel = lines_text(&app.panel_lines(80, 30));
+    assert!(panel.contains("∴ Thinking… 0s"), "{panel}");
+    assert!(
+        panel.contains("step 9") && panel.contains("step 6"),
+        "{panel}"
+    );
+    assert!(
+        !panel.contains("step 5"),
+        "older rows scroll out of the live tail: {panel}"
+    );
+}
+
+#[test]
+fn finished_reasoning_commits_as_one_summary_line() {
+    let mut app = app();
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::Thinking("secret plan\nmore".to_string()));
+    app.push_agent_event(&AgentEvent::FinalContentDelta("answer".to_string()));
+    let flushed = lines_text(&app.take_scrollback(80));
+    assert!(
+        flushed.contains("∴ Thought for 1s · ctrl+o to expand"),
+        "{flushed}"
+    );
+    assert!(
+        !flushed.contains("secret plan"),
+        "collapsed by default: {flushed}"
+    );
+    // The plain projection (traces, non-TTY) keeps the full text.
+    assert!(app.transcript_text().contains("thinking: secret plan"));
+}
+
+#[test]
+fn run_end_closes_a_reasoning_block_that_was_still_streaming() {
+    let mut app = app();
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::Thinking("half a thought".to_string()));
+    app.set_busy(false);
+    let flushed = lines_text(&app.take_scrollback(80));
+    assert!(flushed.contains("∴ Thought for"), "{flushed}");
+    assert!(
+        !flushed.contains("Thinking…"),
+        "no live header in history: {flushed}"
+    );
+}
+
+#[test]
+fn ctrl_o_replays_the_latest_reasoning_in_full() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::Thinking("first idea".to_string()));
+    app.push_agent_event(&AgentEvent::FinalContentDelta("one".to_string()));
+    app.push_agent_event(&AgentEvent::Thinking("second idea".to_string()));
+    app.push_agent_event(&AgentEvent::FinalContentDelta("two".to_string()));
+    app.take_scrollback(80);
+    assert_eq!(
+        app.handle_key(KeyEvent::ctrl(KeyCode::Char('o'))),
+        ChatAction::Continue
+    );
+    let replay = lines_text(&app.take_scrollback(80));
+    assert!(replay.contains("second idea"), "{replay}");
+    assert!(
+        !replay.contains("first idea"),
+        "only the latest block: {replay}"
+    );
+    assert!(
+        !replay.contains("ctrl+o"),
+        "the expanded copy needs no hint: {replay}"
+    );
+}
+
+#[test]
+fn ctrl_o_without_reasoning_says_so() {
+    let mut app = app();
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('o')));
+    assert!(app.transcript_text().contains("no reasoning to show yet"));
 }
 
 #[test]

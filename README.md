@@ -107,6 +107,19 @@ Then start the interactive interface like other terminal agents:
 harness
 ```
 
+On Windows Terminal, add a profile tuned for the harness (an app cannot
+change the terminal font, but Windows Terminal reads profile fragments):
+
+```powershell
+harness terminal-setup            # adds the "Harness" profile
+harness terminal-setup --remove   # removes it
+```
+
+The profile runs PowerShell with Cascadia Mono, line height 1.2, real bold
+(`intenseTextStyle: bold`; the default only brightens bold text), padding,
+and a Harness Dark/Light color scheme pair. Your `settings.json` does not
+change.
+
 On first launch, if no provider is configured yet, `harness` opens a
 harness-tui terminal setup screen with a status header, workspace/config
 paths, command hints, and the `[no provider] >` prompt. From there, run
@@ -266,27 +279,44 @@ Start the interactive REPL. On a real terminal it opens the **harness-tui chat
 TUI** (our own line-based library in `crates/harness-tui`, no ratatui/crossterm);
 piped/non-TTY callers fall back to line mode. The chat TUI:
 
-- **Streams** responses over SSE (OpenAI-compatible providers): the model's
-  reasoning appears live as unlabeled dim/italic text, and each **tool call**
-  renders as a `●` card (marker colored gray running → green/red done) with its
-  name, compact arguments, a `⎿ summary` result line, and a `memo:` line when
-  the forgiving runtime auto-corrected the call.
-- Uses a **Claude-Code-style screen**: finished chat blocks are printed into the
-  terminal's **native scrollback** (`>` echoes your turns, `●` marks answers) —
-  they stay selectable, wheel-scrollable, and survive exit; only the bottom
-  panel (live blocks, a `⠹ Working… (12s)` spinner row, the `>` prompt editor
-  with a drawn caret, and the provider/model status line) is repainted.
-- Renders assistant answers as **Markdown**: headings, `-`/`*` bullets, fenced code
-  blocks, rules, and inline `**bold**`/`*italic*`/`` `code` ``.
+- **Streams** responses over SSE (OpenAI-compatible providers). While the
+  model reasons, the panel shows `∴ Thinking… 4s` and the newest four lines.
+  When the block ends, the transcript keeps one line: `∴ Thought for 4s ·
+  ctrl+o to expand`. Ctrl+O prints the latest reasoning again in full.
+  `/thinking` keeps future reasoning expanded.
+- Shows each **tool call** as a card. The status glyph is a spinner while the
+  call runs, then `✓`, `✗`, or `○` (interrupted). The card shows the tool name
+  and its main argument (command, query, pattern, path, URL), not raw JSON.
+  Calls of 2s and longer show their time. `shell.exec` cards show the last
+  five output lines and a non-zero exit code. `file.replace` cards show a
+  diff on tinted rows. A `memo:` line appears when the forgiving runtime
+  corrected the call.
+- Uses a **native-scrollback screen**: finished chat blocks go into the
+  terminal's own scrollback. They stay selectable, wheel-scrollable, and
+  survive exit. Your turns are `›` lines on a full-width strip; answers have
+  no marker. Only the live panel is repainted: the streaming tail, the
+  `⠹ Working… (12s · ↓ 1.2k tokens · esc to interrupt)` row, the editor
+  between two rules, and the status line. The status line shows the
+  workspace and git branch on the left, the model and session tokens
+  (`↑12.3k ↓3.4k · cache 85%`) on the right. Key hints appear there only
+  when they apply.
+- Renders assistant answers as **Markdown**: headings, bullet and numbered
+  lists, block quotes, tables, fenced code blocks, rules, and inline
+  `**bold**`/`*italic*`/`` `code` ``. Code fences stay literal and code lines
+  have no gutter, so a mouse selection copies valid markdown.
+- Picks its **palette from the terminal**: it asks the terminal for its
+  background color (OSC 11) and uses a dark or a light 24-bit palette. On
+  terminals without truecolor it uses the nearest 256 colors. Grays are
+  explicit colors, never dim or italic attributes.
 - Offers **slash-command autocomplete**: type `/` to open a filtered menu below the
   input (`/p` → `/provider`, typed prefix highlighted, usage + description per row);
   Up/Down select, Tab completes, Esc closes, Enter runs. Typing `/model ` extends
   the menu with the saved provider/model pairs themselves.
   Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/paste`,
-  `/history QUERY`, `/clear`, `/new`, `/cost`, `/retain-thinking`, `/help`,
-  `/exit`.
+  `/history QUERY`, `/clear`, `/new`, `/cost`, `/thinking`,
+  `/retain-thinking`, `/help`, `/exit`.
 - **Interactive model picker**: `/model` alone opens a selector under the
-  input — `→ deepseek-v4-pro [deepseek] ✓` rows (cursor arrow, dimmed provider,
+  input — `› deepseek-v4-pro [deepseek] ✓` rows (cursor marker, muted provider,
   check on the active pair) with a `(K/N)` counter; Up/Down move, typing
   filters, Enter switches, Esc closes. `/model 2`, a bare model or provider
   name, or the full pair still switch directly. A model name the config has
@@ -297,20 +327,32 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
 - **Resumes the last chat on launch**: the conversation is persisted per
   workspace and reloaded at startup (a `resumed session … (N messages)` notice
   appears in the transcript). `/new` abandons it and starts a fresh session.
-- **Bottom-anchored layout with a welcome banner**: the input panel is pinned to
-  the bottom edge of the terminal (like the reference agent CLIs) and a startup
-  banner (`harness vX`, active model, workspace, key hints) is printed into the
-  transcript just above it; conversation content accumulates upward from the
-  panel into native scrollback.
+- **Docked layout with a welcome banner**: the conversation flows from the
+  top, and the editor and status rows sit on the bottom edge. Blank filler
+  between them belongs to the panel, so it never goes into the scrollback:
+  opening and closing a menu leaves no gap in the history. The startup
+  banner (`harness vX`, active model, workspace, key hints) is the first
+  transcript entry.
+- **Type ahead while the agent works**: keys go to the editor during a run.
+  Enter queues the prompt (`⏵ queued …` above the editor), and the queue is
+  sent in order when the run ends. Local commands (`/help`, `/cost`,
+  `/thinking`, …) run at once. An interrupted run puts the queued prompts
+  back into the editor.
 - **Esc or Ctrl+C interrupts a running agent** (an `Interrupted by user` notice
-  appears; the partial trace is still saved). Streaming stops between tokens,
+  appears; the partial trace is still saved). Esc first closes an open menu. Streaming stops between tokens,
   tool loops stop before the next round; the session stays open — when idle,
   **exit is two-step**: the first Esc shows `Press Esc again to exit` in the
   status row (any other key disarms it), the second Esc exits; Ctrl+C still
   exits immediately. The setup TUI follows the same contract, and Esc inside
   the provider wizard closes the dialog instead of killing the program.
-- Has a **multi-line prompt** (Alt+Enter or Ctrl+J inserts a newline; Left/Right/
-  Home/End move the caret) and **paste that never auto-submits** — pasted newlines
+- Has a **multi-line prompt**. Alt+Enter, Ctrl+J and Ctrl+Enter insert a
+  newline (Windows Terminal sends Ctrl+Enter as Ctrl+J). Shift+Enter also
+  works on terminals with the kitty keyboard protocol (Windows Terminal
+  1.25+, WezTerm, kitty, Ghostty). Editing keys: Delete, Ctrl+W and
+  Ctrl+Backspace (delete a word), Ctrl+U/Ctrl+K (delete to line start/end),
+  Ctrl+A/Ctrl+E and Home/End (line start/end), Ctrl+Left/Right (by word).
+  Up/Down move between the prompt's lines before they recall history.
+  **Paste never auto-submits** — pasted newlines
   stay literal even on the legacy Windows console (a burst of key events is
   coalesced into one paste). A paste of 3+ lines (or 700+ chars) **collapses to a
   `[Pasted text #1 +184 lines]` placeholder** in the editor; the full text is
@@ -330,7 +372,8 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   broken border fragments. Now a width change erases the viewport immediately
   and, once the size has been stable for ~150ms, repaints the visible
   transcript tail and the panel re-wrapped to the new width (typed input is
-  preserved). Height-only changes keep the cheap repin path.
+  preserved). Height changes take the same path, because the docked status
+  row keeps the cursor on the last row and the terminal may scroll.
 
 ```powershell
 harness repl --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --timeout-ms 60000 --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000
@@ -442,12 +485,12 @@ Done (each item is verified by tests and/or the agent benchmark):
 - ✅ Session & trace persistence under `~/.harness` with resume on launch
 - ✅ Clipboard & attachments — Ctrl+V / `/paste`, PNG capture into `.harness/attachments`
 - ✅ Window-resize survival — immediate erase + 150 ms debounce + full repaint, no ghost panels
+- ✅ TUI redesign — docked layout without history gaps, light/dark truecolor palette, collapsible reasoning, tool cards with output tails and diffs, type-ahead queue, editing keys, Windows Terminal profile
 - ✅ Agent self-awareness — environment line + harness usage notes in the system prompt
 
 Planned:
 
 - [ ] Subagents — spawn scoped child agent runs with their own tool budgets
-- [ ] New UI
 - [ ] Provider presets/configs for more model families
 - [ ] Vision — image blocks in provider requests so models actually see PNG attachments
 

@@ -14,7 +14,7 @@ use harness_tui::terminal as tui_terminal;
 use harness_tui::theme::Theme;
 
 use crate::agent::{AgentError, AgentEvent, AgentRunner};
-use crate::chat::{BusyAction, ChatAction, ChatApp, busy_action};
+use crate::chat::{BusyAction, ChatAction, ChatApp};
 use crate::chat_client::WireTap;
 use crate::clipboard::{
     AttachmentStore, ClipboardAttachment, ClipboardCapture, ClipboardError, ClipboardSource,
@@ -494,13 +494,24 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
         } else {
             Duration::from_millis(100)
         };
-        let events = pump.poll(poll_window).map_err(ReplError::Io)?;
+        // A prompt queued during the last run goes first, without waiting
+        // for input; otherwise poll the keyboard.
+        let inputs: Vec<LoopInput> = match app.take_queued() {
+            Some(action) => vec![LoopInput::Queued(action)],
+            None => pump
+                .poll(poll_window)
+                .map_err(ReplError::Io)?
+                .into_iter()
+                .map(LoopInput::Event)
+                .collect(),
+        };
         handle_resize(&mut screen, &app, &mut resize)?;
-        for event in events {
-            let action = match event {
-                TuiEvent::Paste(text) => app.handle_paste(&text),
-                TuiEvent::Key(key) => app.handle_key(key),
-                _ => ChatAction::Continue,
+        for input in inputs {
+            let action = match input {
+                LoopInput::Queued(action) => action,
+                LoopInput::Event(TuiEvent::Paste(text)) => app.handle_paste(&text),
+                LoopInput::Event(TuiEvent::Key(key)) => app.handle_key(key),
+                LoopInput::Event(_) => ChatAction::Continue,
             };
             match action {
                 ChatAction::Continue => {}
@@ -587,8 +598,22 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                             .poll(Duration::from_millis(50))
                             .map_err(ReplError::Io)?
                         {
-                            if matches!(busy_action(&event), BusyAction::Cancel) {
-                                cancel.store(true, Ordering::SeqCst);
+                            match app.busy_action(&event) {
+                                BusyAction::Cancel => cancel.store(true, Ordering::SeqCst),
+                                // The user keeps typing; Enter queues the
+                                // prompt for after this run (the app holds
+                                // the queue), so only a clipboard capture
+                                // needs the loop now.
+                                BusyAction::Forward => {
+                                    let action = match event {
+                                        TuiEvent::Paste(text) => app.handle_paste(&text),
+                                        TuiEvent::Key(key) => app.handle_key(key),
+                                        _ => ChatAction::Continue,
+                                    };
+                                    if action == ChatAction::CaptureClipboard {
+                                        capture_into_chat(&mut app, &mut capture, &clipboard);
+                                    }
+                                }
                             }
                         }
                         if worker.is_finished() {
@@ -599,6 +624,9 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                         app.push_agent_event(&event);
                     }
                     app.set_busy(false);
+                    if run.is_err() {
+                        app.restore_queued_to_editor();
+                    }
                     match run {
                         Ok(result) => chat.complete_turn(&result),
                         Err(err @ AgentError::Cancelled { .. }) => {
@@ -629,6 +657,13 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
 
     let _ = screen.release();
     Ok(())
+}
+
+/// One step of the chat loop: a terminal event, or a prompt the user
+/// queued while the previous run was busy.
+enum LoopInput {
+    Event(TuiEvent),
+    Queued(ChatAction),
 }
 
 /// One frame: commit finalized transcript rows into native scrollback

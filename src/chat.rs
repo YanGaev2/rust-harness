@@ -9,6 +9,7 @@
 //! ([`ChatApp::panel_lines`]) shows only the live tail, the editor, and the
 //! status row.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -45,22 +46,16 @@ pub enum ChatAction {
 /// What to do with an input event that arrives while the agent is running.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BusyAction {
+    /// Interrupt the run.
     Cancel,
-    Ignore,
-}
-
-/// Input policy while the agent is busy: Esc or Ctrl+C cancel the run,
-/// everything else is ignored (the wheel scrolls natively now).
-pub fn busy_action(event: &Event) -> BusyAction {
-    match event {
-        Event::Key(key) if key.code == KeyCode::Esc => BusyAction::Cancel,
-        Event::Key(key) if key.mods.ctrl && key.code == KeyCode::Char('c') => BusyAction::Cancel,
-        _ => BusyAction::Ignore,
-    }
+    /// Hand the event to the app: the user keeps composing (and queueing)
+    /// the next message while the agent works.
+    Forward,
 }
 
 const EDITOR_PROMPT: &str = "› ";
 const EDITOR_PLACEHOLDER: &str = "Ask anything · / for commands";
+const EDITOR_PLACEHOLDER_BUSY: &str = "Queue a follow-up · Esc to interrupt";
 /// Maximum editor rows shown in the pinned panel.
 const EDITOR_MAX_ROWS: usize = 6;
 /// Maximum completion-menu rows shown in the pinned panel.
@@ -291,6 +286,15 @@ pub struct ChatApp {
     pasted_blocks: Vec<PastedBlock>,
     /// Monotonic paste counter feeding the `#N` in placeholders.
     paste_seq: usize,
+    /// Prompts submitted while the agent was busy, oldest first.
+    queued: VecDeque<QueuedPrompt>,
+}
+
+/// A prompt submitted while the agent was busy; it is sent once the run
+/// ends, or handed back to the editor if the run is interrupted.
+struct QueuedPrompt {
+    text: String,
+    blocks: Vec<PastedBlock>,
 }
 
 /// A collapsed paste: the placeholder inserted into the editor and the
@@ -370,6 +374,7 @@ impl ChatApp {
             exit_armed: false,
             pasted_blocks: Vec::new(),
             paste_seq: 0,
+            queued: VecDeque::new(),
         }
     }
 
@@ -454,11 +459,69 @@ impl ChatApp {
         self.busy = busy;
         self.busy_since = busy.then(Instant::now);
         self.stream_activity = busy.then(Instant::now);
+        self.editor.set_placeholder(if busy {
+            EDITOR_PLACEHOLDER_BUSY
+        } else {
+            EDITOR_PLACEHOLDER
+        });
         if !busy {
             self.close_thinking();
             self.cancel_running_tools();
             self.git_branch = git_branch(&self.workspace);
         }
+    }
+
+    /// Input policy while the agent runs: Esc or Ctrl+C cancel the run —
+    /// except that Esc first closes an open menu or palette — and every
+    /// other event goes to the editor.
+    pub fn busy_action(&self, event: &Event) -> BusyAction {
+        match event {
+            Event::Key(key) if key.code == KeyCode::Esc && self.overlay_open() => {
+                BusyAction::Forward
+            }
+            Event::Key(key) if key.code == KeyCode::Esc => BusyAction::Cancel,
+            Event::Key(key) if key.mods.ctrl && key.code == KeyCode::Char('c') => {
+                BusyAction::Cancel
+            }
+            _ => BusyAction::Forward,
+        }
+    }
+
+    fn overlay_open(&self) -> bool {
+        self.help_visible || self.model_picker.is_some() || self.completion_visible()
+    }
+
+    /// How many prompts wait for the current run to finish.
+    pub fn queued_len(&self) -> usize {
+        self.queued.len()
+    }
+
+    /// The next queued prompt once the run is over, as the action its
+    /// submit produces (a message to send or a command to run).
+    pub fn take_queued(&mut self) -> Option<ChatAction> {
+        if self.busy {
+            return None;
+        }
+        let prompt = self.queued.pop_front()?;
+        Some(self.submit_text(prompt.text, prompt.blocks))
+    }
+
+    /// An interrupted or failed run hands its queued prompts back to the
+    /// editor, so the user can edit or drop them instead of having them
+    /// fire automatically.
+    pub fn restore_queued_to_editor(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let mut parts = Vec::new();
+        for prompt in std::mem::take(&mut self.queued) {
+            parts.push(prompt.text);
+            self.pasted_blocks.extend(prompt.blocks);
+        }
+        if !self.editor.is_empty() {
+            parts.push(self.editor.text().to_string());
+        }
+        self.editor.set_text(parts.join("\n"));
     }
 
     /// Whole seconds the current run has been going (0 when idle).
@@ -820,6 +883,15 @@ impl ChatApp {
         if text.is_empty() {
             return ChatAction::Continue;
         }
+        if self.busy && !runs_while_busy(&text) {
+            self.queued.push_back(QueuedPrompt { text, blocks });
+            return ChatAction::Continue;
+        }
+        self.submit_text(text, blocks)
+    }
+
+    /// Run a submitted prompt: a slash command, or a message for the model.
+    fn submit_text(&mut self, text: String, blocks: Vec<PastedBlock>) -> ChatAction {
         if let Some(command) = text.strip_prefix('/') {
             return self.run_slash_command(command);
         }
@@ -1360,6 +1432,19 @@ impl ChatApp {
             lines.extend(palette_lines(&self.theme));
         }
 
+        for prompt in &self.queued {
+            let row = Line {
+                spans: vec![
+                    Span::styled(" ⏵ queued ", Style::fg(self.theme.accent)),
+                    Span::styled(
+                        crate::repl::summarize_one_line(&prompt.text, width),
+                        Style::fg(self.theme.muted),
+                    ),
+                ],
+            };
+            lines.push(truncate(&row, width));
+        }
+
         let editor_rows = self.editor.render(width, EDITOR_MAX_ROWS);
         lines.extend(ruled_lines(editor_rows, width, &self.theme));
 
@@ -1627,6 +1712,27 @@ fn git_branch(workspace: &Path) -> Option<String> {
         ),
         None => Some(head.chars().take(7).collect()),
     }
+}
+
+/// Slash commands that only read or toggle local state run at once even
+/// while the agent works; everything else waits in the queue.
+fn runs_while_busy(text: &str) -> bool {
+    let Some(command) = text.strip_prefix('/') else {
+        return false;
+    };
+    matches!(
+        command.split_whitespace().next(),
+        Some(
+            "help"
+                | "?"
+                | "cost"
+                | "provider"
+                | "history"
+                | "thinking"
+                | "retain-thinking"
+                | "paste"
+        )
+    )
 }
 
 /// Swap each collapsed paste back into the submitted message. Placeholders

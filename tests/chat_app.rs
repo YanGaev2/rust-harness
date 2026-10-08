@@ -3,7 +3,7 @@
 //! `tests/chat_tui.rs` suite onto the new pure line-based API.
 
 use harness_cli::agent::AgentEvent;
-use harness_cli::chat::{BusyAction, ChatAction, ChatApp, busy_action};
+use harness_cli::chat::{BusyAction, ChatAction, ChatApp};
 use harness_cli::runtime::ToolBatchResult;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
 use harness_tui::text::{Color, Line};
@@ -1546,24 +1546,87 @@ fn transcript_text_uses_plain_projection() {
 // --- busy input policy ---
 
 #[test]
-fn busy_action_cancels_on_esc_and_ctrl_c_only() {
+fn busy_input_cancels_on_esc_and_ctrl_c_and_forwards_everything_else() {
+    let app = app();
+    let esc = Event::Key(KeyEvent::plain(KeyCode::Esc));
+    assert_eq!(app.busy_action(&esc), BusyAction::Cancel);
     assert_eq!(
-        busy_action(&Event::Key(KeyEvent::plain(KeyCode::Esc))),
+        app.busy_action(&Event::Key(KeyEvent::ctrl(KeyCode::Char('c')))),
         BusyAction::Cancel
     );
-    assert_eq!(
-        busy_action(&Event::Key(KeyEvent::ctrl(KeyCode::Char('c')))),
-        BusyAction::Cancel
+    for event in [
+        Event::Key(KeyEvent::plain(KeyCode::Char('x'))),
+        Event::Key(KeyEvent::plain(KeyCode::Enter)),
+        Event::WheelUp,
+        Event::Paste("text".to_string()),
+    ] {
+        assert_eq!(app.busy_action(&event), BusyAction::Forward, "{event:?}");
+    }
+}
+
+#[test]
+fn esc_closes_an_open_menu_instead_of_cancelling_the_run() {
+    let mut app = app();
+    app.set_busy(true);
+    type_text(&mut app, "/");
+    assert!(app.completion_visible());
+    let esc = Event::Key(KeyEvent::plain(KeyCode::Esc));
+    assert_eq!(app.busy_action(&esc), BusyAction::Forward);
+    app.handle_key(KeyEvent::plain(KeyCode::Esc));
+    assert!(!app.completion_visible());
+    assert_eq!(app.busy_action(&esc), BusyAction::Cancel);
+}
+
+#[test]
+fn enter_while_busy_queues_the_prompt_and_sends_it_after_the_run() {
+    let mut app = app();
+    submit_message(&mut app, "first task");
+    app.set_busy(true);
+    let action = submit_message(&mut app, "and then the docs");
+    assert_eq!(action, ChatAction::Continue, "nothing is sent mid-run");
+    assert_eq!(app.queued_len(), 1);
+    assert_eq!(app.input(), "", "the editor is free for the next draft");
+    let panel = lines_text(&app.panel_lines(80, 20));
+    assert!(panel.contains("⏵ queued and then the docs"), "{panel}");
+    assert!(
+        panel.contains("Queue a follow-up"),
+        "busy placeholder: {panel}"
     );
+    assert_eq!(app.take_queued(), None, "the queue waits for the run");
+
+    app.set_busy(false);
     assert_eq!(
-        busy_action(&Event::Key(KeyEvent::plain(KeyCode::Char('x')))),
-        BusyAction::Ignore
+        app.take_queued(),
+        Some(ChatAction::Submit("and then the docs".to_string()))
     );
-    assert_eq!(busy_action(&Event::WheelUp), BusyAction::Ignore);
-    assert_eq!(
-        busy_action(&Event::Paste("text".to_string())),
-        BusyAction::Ignore
-    );
+    assert_eq!(app.queued_len(), 0);
+    assert!(app.transcript_text().contains("you: and then the docs"));
+}
+
+#[test]
+fn local_commands_run_at_once_while_busy() {
+    let mut app = app();
+    app.set_busy(true);
+    submit_message(&mut app, "/cost");
+    assert_eq!(app.queued_len(), 0);
+    assert!(app.transcript_text().contains("session usage"));
+    // Commands that touch the session wait for the run.
+    submit_message(&mut app, "/new");
+    assert_eq!(app.queued_len(), 1);
+}
+
+#[test]
+fn an_interrupted_run_hands_queued_prompts_back_to_the_editor() {
+    let mut app = app();
+    app.set_busy(true);
+    submit_message(&mut app, "step one");
+    submit_message(&mut app, "step two");
+    type_text(&mut app, "draft");
+    app.set_busy(false);
+    app.restore_queued_to_editor();
+    assert_eq!(app.queued_len(), 0);
+    assert_eq!(app.input(), "step one\nstep two\ndraft");
+    assert_eq!(app.take_queued(), None);
 }
 
 #[test]

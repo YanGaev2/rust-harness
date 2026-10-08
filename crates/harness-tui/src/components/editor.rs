@@ -31,6 +31,11 @@ impl Editor {
         }
     }
 
+    /// Text shown while the buffer is empty.
+    pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
+        self.placeholder = placeholder.into();
+    }
+
     /// Colors for the prompt glyph and the empty-editor placeholder.
     pub fn set_styles(&mut self, prompt: Style, placeholder: Style) {
         self.prompt_style = prompt;

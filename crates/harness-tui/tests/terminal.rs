@@ -166,3 +166,41 @@ fn restore_now_is_safe_anytime() {
     harness_tui::terminal::restore_now();
     harness_tui::terminal::restore_now();
 }
+
+// --- startup probe parsing (cursor report + OSC 11 background) ---
+
+#[test]
+fn cursor_report_is_found_past_pending_keystrokes() {
+    use harness_tui::terminal::parse_cursor_report;
+    // An arrow key and a typed `R` arrive before the real report.
+    assert_eq!(parse_cursor_report(b"\x1b[AR\x1b[12;5R"), Some((11, 4)));
+    assert_eq!(parse_cursor_report(b"\x1b[12;5"), None, "incomplete report");
+}
+
+#[test]
+fn background_report_parses_any_hex_width_and_terminator() {
+    use harness_tui::terminal::parse_background_report;
+    assert_eq!(
+        parse_background_report(b"\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\x1b[1;1R"),
+        Some((12, 12, 12))
+    );
+    assert_eq!(
+        parse_background_report(b"\x1b]11;rgb:ff/fa/f0\x07"),
+        Some((255, 250, 240))
+    );
+    assert_eq!(parse_background_report(b"\x1b[1;1R"), None, "no OSC reply");
+}
+
+#[test]
+fn theme_follows_background_luminance_and_quantizes_to_256_colors() {
+    use harness_tui::text::Color;
+    use harness_tui::theme::{Theme, quantize};
+    assert_eq!(Theme::for_background(Some((12, 12, 12))), Theme::dark());
+    assert_eq!(Theme::for_background(Some((250, 250, 250))), Theme::light());
+    assert_eq!(Theme::for_background(None), Theme::dark());
+    assert_eq!(quantize(Color::Rgb(0, 0, 0)), Color::Indexed(16));
+    assert_eq!(quantize(Color::Rgb(128, 128, 128)), Color::Indexed(244));
+    assert_eq!(quantize(Color::Rgb(255, 0, 0)), Color::Indexed(196));
+    let quantized = Theme::dark().quantized();
+    assert!(matches!(quantized.accent, Color::Indexed(_)));
+}

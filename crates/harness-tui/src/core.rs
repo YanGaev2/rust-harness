@@ -34,6 +34,8 @@ pub struct Screen {
     /// Terminal row (0-based) where the panel starts — also where the
     /// next committed content begins.
     origin: u16,
+    /// The terminal's background color, when it reported one.
+    background: Option<(u8, u8, u8)>,
 }
 
 impl Screen {
@@ -48,16 +50,28 @@ impl Screen {
             live: Vec::new(),
             docked: 0,
             origin: start_row.min(height.saturating_sub(1)),
+            background: None,
         }
     }
 
-    /// Attach to the real terminal: queries size and cursor position so
-    /// the panel starts where the shell prompt left off.
+    /// Attach to the real terminal: queries size, cursor position (so the
+    /// panel starts where the shell prompt left off) and background color
+    /// (OSC 11, else `COLORFGBG`).
     pub fn stdout() -> Result<Screen, TerminalError> {
         let terminal = Terminal::stdout()?;
         let (width, height) = crate::terminal::size()?;
-        let (row, _col) = crate::terminal::cursor_position()?;
-        Ok(Screen::new(terminal, width, height, row))
+        let probe = crate::terminal::startup_probe()?;
+        let mut screen = Screen::new(terminal, width, height, probe.cursor.0);
+        screen.background = probe
+            .background
+            .or_else(crate::terminal::colorfgbg_background);
+        Ok(screen)
+    }
+
+    /// The terminal's background color, when it reported one — pick the
+    /// light or dark palette from it.
+    pub fn background(&self) -> Option<(u8, u8, u8)> {
+        self.background
     }
 
     pub fn width(&self) -> u16 {

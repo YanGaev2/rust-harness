@@ -455,10 +455,11 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
     let provider_label = format!("{}/{}", active_provider.name(), active_model);
+    let theme = Theme::for_background(screen.background());
     let theme = if tui_terminal::supports_truecolor() {
-        Theme::dark()
+        theme
     } else {
-        Theme::dark().quantized()
+        theme.quantized()
     };
     let mut app = ChatApp::new(provider_label, &workspace)
         .with_catalog(catalog_pairs(&catalog))

@@ -146,40 +146,91 @@ pub fn raw_mode() -> Result<RawModeHandle, TerminalError> {
     Ok(RawModeHandle { _raw: raw })
 }
 
-/// Ask the terminal where the cursor is (DSR): returns 0-based
-/// (row, col). Call only at startup, before the input pump owns stdin —
-/// the response arrives interleaved with any pending keystrokes.
-pub fn cursor_position() -> Result<(u16, u16), TerminalError> {
+/// What the startup probe learned about the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StartupProbe {
+    /// 0-based (row, col) of the cursor.
+    pub cursor: (u16, u16),
+    /// Default background color, when the terminal answers OSC 11.
+    pub background: Option<(u8, u8, u8)>,
+}
+
+/// Ask the terminal where the cursor is (DSR) and for its background
+/// color (OSC 11) in one round trip. Terminals answer in order and every
+/// VT terminal answers DSR, so an OSC 11 reply that has not arrived by
+/// the cursor report is not coming — no timeout is needed. Call only at
+/// startup, before the input pump owns stdin: the replies arrive
+/// interleaved with any pending keystrokes.
+pub fn startup_probe() -> Result<StartupProbe, TerminalError> {
     let mut out = io::stdout();
-    out.write_all(b"\x1b[6n")?;
+    out.write_all(b"\x1b]11;?\x1b\\\x1b[6n")?;
     out.flush()?;
     let mut collected: Vec<u8> = Vec::new();
-    let mut chunk = [0u8; 32];
-    for _ in 0..16 {
+    let mut chunk = [0u8; 64];
+    for _ in 0..32 {
         let n = sys::read_input(&mut chunk)?;
         if n == 0 {
             break;
         }
         collected.extend_from_slice(&chunk[..n]);
-        if collected.contains(&b'R') {
-            break;
+        // Keep reading until a real `ESC [ row ; col R` parses: a pending
+        // keystroke may contain an `R` or an `ESC [` of its own.
+        if let Some(cursor) = parse_cursor_report(&collected) {
+            return Ok(StartupProbe {
+                cursor,
+                background: parse_background_report(&collected),
+            });
         }
     }
-    parse_cursor_report(&collected).ok_or(TerminalError::Platform("cursor position report"))
+    Err(TerminalError::Platform("cursor position report"))
 }
 
-/// Extract `ESC [ row ; col R` from a byte stream that may contain
-/// unrelated pending input around it.
-fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
-    let start = bytes.windows(2).position(|w| w == b"\x1b[")?;
-    let rest = &bytes[start + 2..];
-    let end = rest.iter().position(|&b| b == b'R')?;
+/// Find `ESC [ row ; col R` in a byte stream that may contain unrelated
+/// pending input around it.
+pub fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
+    (0..bytes.len()).find_map(|start| {
+        let rest = bytes.get(start..)?.strip_prefix(b"\x1b[")?;
+        let end = rest
+            .iter()
+            .position(|&b| !(b.is_ascii_digit() || b == b';'))?;
+        if rest[end] != b'R' {
+            return None;
+        }
+        let body = std::str::from_utf8(&rest[..end]).ok()?;
+        let (row, col) = body.split_once(';')?;
+        Some((
+            row.parse::<u16>().ok()?.saturating_sub(1),
+            col.parse::<u16>().ok()?.saturating_sub(1),
+        ))
+    })
+}
+
+/// Parse an OSC 11 reply — `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` ended by BEL or
+/// ST — into 8-bit channels (1 to 4 hex digits per channel are allowed).
+pub fn parse_background_report(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    let start = bytes.windows(5).position(|w| w == b"\x1b]11;")?;
+    let rest = &bytes[start + 5..];
+    let end = rest.iter().position(|&b| b == 0x07 || b == 0x1b)?;
     let body = std::str::from_utf8(&rest[..end]).ok()?;
-    let (row, col) = body.split_once(';')?;
-    Some((
-        row.parse::<u16>().ok()?.saturating_sub(1),
-        col.parse::<u16>().ok()?.saturating_sub(1),
-    ))
+    let mut channels = body.strip_prefix("rgb:")?.split('/').map(|hex| {
+        let digits = hex.len().clamp(1, 4) as u32;
+        let value = u32::from_str_radix(hex, 16).ok()?;
+        let max = 16u32.pow(digits) - 1;
+        Some((value * 255 / max) as u8)
+    });
+    Some((channels.next()??, channels.next()??, channels.next()??))
+}
+
+/// Background hint from the `COLORFGBG` convention (`fg;bg`, set by
+/// rxvt, Konsole and others): palette slots 7 and 9–15 are light.
+pub fn colorfgbg_background() -> Option<(u8, u8, u8)> {
+    let value = std::env::var("COLORFGBG").ok()?;
+    let slot: u8 = value.rsplit(';').next()?.parse().ok()?;
+    Some(if slot == 7 || (9..=15).contains(&slot) {
+        (255, 255, 255)
+    } else {
+        (0, 0, 0)
+    })
 }
 
 /// The live terminal: owns the output writer, keeps raw mode for its

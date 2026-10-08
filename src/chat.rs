@@ -588,11 +588,11 @@ impl ChatApp {
                     ChatAction::Continue
                 }
             }
-            // Alt+Enter composes a newline instead of submitting, so a prompt
-            // can span multiple lines without sending early. (Shift+Enter is
-            // indistinguishable from Enter in a VT byte stream, so Alt+Enter
-            // replaces it; Ctrl+J is the classic fallback.)
-            KeyCode::Enter if key.mods.alt => {
+            // A modified Enter composes a newline instead of submitting.
+            // Alt+Enter works everywhere; Shift+Enter needs the kitty
+            // keyboard protocol (Windows Terminal 1.25+, WezTerm, kitty);
+            // Ctrl+Enter arrives as LF = Ctrl+J on Windows Terminal 1.24.
+            KeyCode::Enter if key.mods.alt || key.mods.shift || key.mods.ctrl => {
                 self.editor.insert_char('\n');
                 ChatAction::Continue
             }
@@ -605,9 +605,42 @@ impl ChatApp {
                 self.complete_selection();
                 ChatAction::Continue
             }
+            KeyCode::Backspace if key.mods.ctrl || key.mods.alt => {
+                self.editor.delete_word_back();
+                self.reset_completion();
+                ChatAction::Continue
+            }
+            KeyCode::Char('w') if key.mods.ctrl => {
+                self.editor.delete_word_back();
+                self.reset_completion();
+                ChatAction::Continue
+            }
             KeyCode::Backspace => {
                 self.editor.backspace();
                 self.reset_completion();
+                ChatAction::Continue
+            }
+            KeyCode::Delete => {
+                self.editor.delete_forward();
+                self.reset_completion();
+                ChatAction::Continue
+            }
+            KeyCode::Char('u') if key.mods.ctrl => {
+                self.editor.delete_to_line_start();
+                self.reset_completion();
+                ChatAction::Continue
+            }
+            KeyCode::Char('k') if key.mods.ctrl => {
+                self.editor.delete_to_line_end();
+                self.reset_completion();
+                ChatAction::Continue
+            }
+            KeyCode::Left if key.mods.ctrl || key.mods.alt => {
+                self.editor.move_word_left();
+                ChatAction::Continue
+            }
+            KeyCode::Right if key.mods.ctrl || key.mods.alt => {
+                self.editor.move_word_right();
                 ChatAction::Continue
             }
             KeyCode::Left => {
@@ -622,14 +655,24 @@ impl ChatApp {
                 self.editor.move_home();
                 ChatAction::Continue
             }
+            KeyCode::Char('a') if key.mods.ctrl => {
+                self.editor.move_home();
+                ChatAction::Continue
+            }
             KeyCode::End => {
                 self.editor.move_end();
                 ChatAction::Continue
             }
+            KeyCode::Char('e') if key.mods.ctrl => {
+                self.editor.move_end();
+                ChatAction::Continue
+            }
+            // Up/Down move between the lines of a multi-line prompt and
+            // recall history only from its first/last line.
             KeyCode::Up => {
                 if completion_open {
                     self.completion_index = self.completion_index.saturating_sub(1);
-                } else {
+                } else if !self.editor.move_up() {
                     self.recall_previous();
                 }
                 ChatAction::Continue
@@ -638,7 +681,7 @@ impl ChatApp {
                 if completion_open {
                     let last = self.completion_matches().len().saturating_sub(1);
                     self.completion_index = (self.completion_index + 1).min(last);
-                } else {
+                } else if !self.editor.move_down() {
                     self.recall_next();
                 }
                 ChatAction::Continue
@@ -1722,7 +1765,7 @@ fn palette_lines(theme: &Theme) -> Vec<Line> {
         });
     }
     lines.push(Line::styled(
-        " Up/Down recall · Ctrl+O last reasoning · Ctrl+V paste · Esc close",
+        " Alt/Shift/Ctrl+Enter newline · Up/Down recall · Ctrl+O last reasoning · Ctrl+V paste · Esc close",
         muted,
     ));
     lines

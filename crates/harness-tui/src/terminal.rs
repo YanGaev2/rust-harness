@@ -62,6 +62,11 @@ pub mod esc {
     pub const SYNC_END: &str = "\x1b[?2026l";
     pub const BRACKETED_PASTE_ON: &str = "\x1b[?2004h";
     pub const BRACKETED_PASTE_OFF: &str = "\x1b[?2004l";
+    /// Push / pop kitty keyboard protocol flag 1 ("disambiguate escape
+    /// codes"): Shift+Enter, Ctrl/Alt chords and Esc become unambiguous
+    /// `CSI … u` keys. Terminals without the protocol ignore both.
+    pub const KITTY_KEYS_ON: &str = "\x1b[>1u";
+    pub const KITTY_KEYS_OFF: &str = "\x1b[<u";
     /// SGR mouse capture (1000 = button tracking, 1006 = SGR encoding).
     /// Not enabled by `Terminal` setup: capturing the mouse breaks
     /// native-scrollback wheel scrolling. The input layer toggles it.
@@ -82,10 +87,10 @@ pub mod esc {
 
 /// Everything a session must write to leave the terminal usable, in
 /// safe order: close any open synchronized frame, release the mouse,
-/// turn bracketed paste off, show the cursor. Raw-mode restore is
-/// separate (console modes, not escapes).
+/// pop the kitty keyboard flags, turn bracketed paste off, show the
+/// cursor. Raw-mode restore is separate (console modes, not escapes).
 pub fn restore_sequence() -> &'static str {
-    "\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[?2004l\x1b[?25h"
+    "\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h"
 }
 
 /// True only when both stdin and stdout are terminals — the TUI needs
@@ -219,6 +224,7 @@ impl Terminal {
     fn write_setup(&mut self) -> Result<(), TerminalError> {
         self.out.write_all(esc::HIDE_CURSOR.as_bytes())?;
         self.out.write_all(esc::BRACKETED_PASTE_ON.as_bytes())?;
+        self.out.write_all(esc::KITTY_KEYS_ON.as_bytes())?;
         self.out.flush()?;
         Ok(())
     }

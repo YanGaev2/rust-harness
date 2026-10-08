@@ -46,9 +46,18 @@ fn four_byte_emoji_char() {
 #[test]
 fn control_bytes_map_to_named_keys() {
     assert_eq!(feed_all(b"\r"), vec![key(KeyCode::Enter)]);
-    assert_eq!(feed_all(b"\n"), vec![key(KeyCode::Enter)]);
+    // Raw mode keeps ICRNL off: Enter is CR, LF is Ctrl+J (and Ctrl+Enter
+    // on Windows Terminal before 1.25).
+    assert_eq!(
+        feed_all(b"\n"),
+        vec![Event::Key(KeyEvent::ctrl(KeyCode::Char('j')))]
+    );
     assert_eq!(feed_all(b"\t"), vec![key(KeyCode::Tab)]);
     assert_eq!(feed_all(b"\x7f"), vec![key(KeyCode::Backspace)]);
+    assert_eq!(
+        feed_all(b"\x08"),
+        vec![Event::Key(KeyEvent::ctrl(KeyCode::Backspace))]
+    );
 }
 
 #[test]
@@ -314,5 +323,46 @@ fn real_paste_inside_burst_stays_separate() {
             Event::Paste("block".to_string()),
             Event::Paste("b".to_string()),
         ]
+    );
+}
+
+// --- kitty keyboard protocol (CSI … u) ---
+
+#[test]
+fn kitty_keys_decode_modified_enter_chords_and_esc() {
+    let shift_enter = Event::Key(KeyEvent {
+        code: KeyCode::Enter,
+        mods: harness_tui::input::Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+    });
+    assert_eq!(feed_all(b"\x1b[13;2u"), vec![shift_enter]);
+    assert_eq!(
+        feed_all(b"\x1b[99;5u"),
+        vec![Event::Key(KeyEvent::ctrl(KeyCode::Char('c')))]
+    );
+    assert_eq!(feed_all(b"\x1b[27u"), vec![key(KeyCode::Esc)]);
+    // Alternate-key sub-parameters do not corrupt the base key.
+    assert_eq!(
+        feed_all(b"\x1b[97:65;5u"),
+        vec![Event::Key(KeyEvent::ctrl(KeyCode::Char('a')))]
+    );
+}
+
+#[test]
+fn kitty_key_releases_and_functional_keys_are_dropped() {
+    assert_eq!(feed_all(b"\x1b[97;1:3u"), vec![]);
+    assert_eq!(feed_all(b"\x1b[57441u"), vec![]);
+    // The stream continues normally after a dropped key.
+    assert_eq!(feed_all(b"\x1b[57441ux"), vec![key(KeyCode::Char('x'))]);
+}
+
+#[test]
+fn a_pasted_line_feed_stays_a_newline_in_a_burst() {
+    let events = feed_all(b"one\ntwo");
+    assert_eq!(
+        harness_tui::input::coalesce_burst(events),
+        vec![Event::Paste("one\ntwo".to_string())]
     );
 }

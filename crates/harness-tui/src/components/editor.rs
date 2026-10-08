@@ -88,6 +88,36 @@ impl Editor {
         self.cursor -= 1;
     }
 
+    /// Remove the grapheme under the caret (the Delete key).
+    pub fn delete_forward(&mut self) {
+        if self.cursor >= self.grapheme_count() {
+            return;
+        }
+        let start = self.byte_offset(self.cursor);
+        let end = self.byte_offset(self.cursor + 1);
+        self.text.replace_range(start..end, "");
+    }
+
+    /// Remove the word before the caret plus the spaces between them.
+    pub fn delete_word_back(&mut self) {
+        let start = self.word_start_before(self.cursor);
+        self.remove_graphemes(start, self.cursor);
+        self.cursor = start;
+    }
+
+    /// Remove from the start of the caret's line to the caret.
+    pub fn delete_to_line_start(&mut self) {
+        let start = self.line_bounds().0;
+        self.remove_graphemes(start, self.cursor);
+        self.cursor = start;
+    }
+
+    /// Remove from the caret to the end of its line.
+    pub fn delete_to_line_end(&mut self) {
+        let end = self.line_bounds().1;
+        self.remove_graphemes(self.cursor, end);
+    }
+
     pub fn move_left(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
     }
@@ -96,12 +126,99 @@ impl Editor {
         self.cursor = (self.cursor + 1).min(self.grapheme_count());
     }
 
-    pub fn move_home(&mut self) {
-        self.cursor = 0;
+    /// To the start of the previous word.
+    pub fn move_word_left(&mut self) {
+        self.cursor = self.word_start_before(self.cursor);
     }
 
+    /// Past the end of the next word.
+    pub fn move_word_right(&mut self) {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let mut at = self.cursor;
+        while at < graphemes.len() && is_space(graphemes[at]) {
+            at += 1;
+        }
+        while at < graphemes.len() && !is_space(graphemes[at]) {
+            at += 1;
+        }
+        self.cursor = at;
+    }
+
+    /// To the start of the caret's line.
+    pub fn move_home(&mut self) {
+        self.cursor = self.line_bounds().0;
+    }
+
+    /// To the end of the caret's line.
     pub fn move_end(&mut self) {
-        self.cursor = self.grapheme_count();
+        self.cursor = self.line_bounds().1;
+    }
+
+    /// One line up, keeping the column where possible. `false` on the
+    /// first line, so the caller can treat Up as history recall.
+    pub fn move_up(&mut self) -> bool {
+        let (start, _) = self.line_bounds();
+        if start == 0 {
+            return false;
+        }
+        let column = self.cursor - start;
+        self.cursor = start - 1;
+        let (previous_start, previous_end) = self.line_bounds();
+        self.cursor = previous_start + column.min(previous_end - previous_start);
+        true
+    }
+
+    /// One line down, keeping the column where possible. `false` on the
+    /// last line.
+    pub fn move_down(&mut self) -> bool {
+        let (start, end) = self.line_bounds();
+        if end >= self.grapheme_count() {
+            return false;
+        }
+        let column = self.cursor - start;
+        self.cursor = end + 1;
+        let (next_start, next_end) = self.line_bounds();
+        self.cursor = next_start + column.min(next_end - next_start);
+        true
+    }
+
+    /// Grapheme range `[start, end)` of the caret's logical line (end is
+    /// the index of its `\n`, or the buffer end).
+    fn line_bounds(&self) -> (usize, usize) {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let cursor = self.cursor.min(graphemes.len());
+        let start = graphemes[..cursor]
+            .iter()
+            .rposition(|g| *g == "\n")
+            .map_or(0, |at| at + 1);
+        let end = graphemes[cursor..]
+            .iter()
+            .position(|g| *g == "\n")
+            .map_or(graphemes.len(), |at| cursor + at);
+        (start, end)
+    }
+
+    /// Start of the word that ends at or before `from`, skipping the
+    /// spaces in between.
+    fn word_start_before(&self, from: usize) -> usize {
+        let graphemes: Vec<&str> = self.text.graphemes(true).collect();
+        let mut at = from.min(graphemes.len());
+        while at > 0 && is_space(graphemes[at - 1]) {
+            at -= 1;
+        }
+        while at > 0 && !is_space(graphemes[at - 1]) {
+            at -= 1;
+        }
+        at
+    }
+
+    fn remove_graphemes(&mut self, from: usize, to: usize) {
+        if from >= to {
+            return;
+        }
+        let start = self.byte_offset(from);
+        let end = self.byte_offset(to);
+        self.text.replace_range(start..end, "");
     }
 
     /// Total wrapped rows at this width (minimum 1) — the panel uses it
@@ -240,6 +357,11 @@ impl WrappedRow {
             graphemes: Vec::new(),
         }
     }
+}
+
+/// Word separators for word motions: whitespace, newlines included.
+fn is_space(grapheme: &str) -> bool {
+    grapheme.chars().all(char::is_whitespace)
 }
 
 fn caret_span(under: &str) -> Span {

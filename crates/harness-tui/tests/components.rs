@@ -224,3 +224,58 @@ fn select_marks_the_chosen_item() {
     let lines = select_lines(&["codex", "deepseek"], 1);
     assert_eq!(plain(&lines), vec!["  codex", "> deepseek"]);
 }
+
+// --- Editor motions and kill commands ---
+
+#[test]
+fn editor_deletes_forward_and_by_word() {
+    let mut ed = editor();
+    ed.insert_str("hello big world");
+    ed.delete_word_back();
+    assert_eq!(ed.text(), "hello big ");
+    ed.delete_word_back();
+    assert_eq!(ed.text(), "hello ");
+    ed.move_home();
+    ed.delete_forward();
+    assert_eq!(ed.text(), "ello ");
+    assert_eq!(ed.cursor(), 0);
+}
+
+#[test]
+fn editor_word_motions_skip_spaces_then_words() {
+    let mut ed = editor();
+    ed.insert_str("one two  three");
+    ed.move_word_left();
+    assert_eq!(ed.cursor(), 9);
+    ed.move_word_left();
+    assert_eq!(ed.cursor(), 4);
+    ed.move_word_right();
+    assert_eq!(ed.cursor(), 7);
+}
+
+#[test]
+fn editor_line_commands_stay_on_the_caret_line() {
+    let mut ed = editor();
+    ed.insert_str("first\nsecond line");
+    ed.move_home();
+    assert_eq!(ed.cursor(), 6, "Home goes to the start of the current line");
+    ed.move_word_right();
+    ed.delete_to_line_end();
+    assert_eq!(ed.text(), "first\nsecond");
+    ed.delete_to_line_start();
+    assert_eq!(ed.text(), "first\n");
+}
+
+#[test]
+fn editor_up_down_keep_the_column_and_report_the_edges() {
+    let mut ed = editor();
+    ed.insert_str("abcdef\nxy\n12345");
+    assert!(ed.move_up());
+    assert_eq!(ed.cursor(), 9, "column clamps to the shorter line");
+    assert!(ed.move_up());
+    assert_eq!(ed.cursor(), 2);
+    assert!(!ed.move_up(), "first line reports the edge");
+    assert!(ed.move_down());
+    assert!(ed.move_down());
+    assert!(!ed.move_down(), "last line reports the edge");
+}

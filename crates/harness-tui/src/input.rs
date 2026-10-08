@@ -199,9 +199,14 @@ fn parse_one(buf: &[u8]) -> Step {
     debug_assert!(!buf.is_empty());
     match buf[0] {
         ESC => parse_escape(buf),
-        b'\r' | b'\n' => emit_key(1, KeyCode::Enter),
+        b'\r' => emit_key(1, KeyCode::Enter),
+        // LF is Ctrl+J — and Ctrl+Enter on Windows Terminal before 1.25.
+        // Raw mode turns ICRNL off, so a real Enter always arrives as CR.
+        b'\n' => Step::Emit(1, Event::Key(KeyEvent::ctrl(KeyCode::Char('j')))),
         b'\t' => emit_key(1, KeyCode::Tab),
-        0x7f | 0x08 => emit_key(1, KeyCode::Backspace),
+        0x7f => emit_key(1, KeyCode::Backspace),
+        // BS is what Windows Terminal and xterm send for Ctrl+Backspace.
+        0x08 => Step::Emit(1, Event::Key(KeyEvent::ctrl(KeyCode::Backspace))),
         0x00 => Step::Consume(1),
         byte @ 0x01..=0x1a => Step::Emit(
             1,
@@ -299,6 +304,10 @@ fn parse_csi(buf: &[u8]) -> Step {
         return parse_sgr_mouse(consumed, &params[1..], final_byte);
     }
 
+    if final_byte == b'u' {
+        return parse_kitty_key(consumed, params);
+    }
+
     let numbers = parse_params(params);
     let mods = modifiers_from_param(numbers.get(1).copied());
 
@@ -321,6 +330,48 @@ fn parse_csi(buf: &[u8]) -> Step {
         Some(code) => Step::Emit(consumed, Event::Key(KeyEvent { code, mods })),
         None => Step::Consume(consumed),
     }
+}
+
+/// CSI code[:alternates] ; mods[:event] u — a key in the kitty keyboard
+/// protocol (enabled in "disambiguate" mode by `Terminal`): Shift+Enter,
+/// Ctrl/Alt chords and Esc arrive this way on terminals that support it.
+/// Key releases (event type 3) and private-use functional keys are dropped.
+fn parse_kitty_key(consumed: usize, params: &[u8]) -> Step {
+    let fields: Vec<Vec<u32>> = params
+        .split(|&b| b == b';')
+        .map(|field| {
+            field
+                .split(|&b| b == b':')
+                .map(|part| {
+                    part.iter()
+                        .filter(|b| b.is_ascii_digit())
+                        .fold(0u32, |acc, &b| {
+                            acc.saturating_mul(10).saturating_add((b - b'0') as u32)
+                        })
+                })
+                .collect()
+        })
+        .collect();
+    let key = fields.first().and_then(|f| f.first()).copied().unwrap_or(0);
+    let modifier = fields.get(1).and_then(|f| f.first()).copied().unwrap_or(1);
+    let event_type = fields.get(1).and_then(|f| f.get(1)).copied().unwrap_or(1);
+    if event_type == 3 {
+        return Step::Consume(consumed);
+    }
+    let code = match key {
+        13 => KeyCode::Enter,
+        9 => KeyCode::Tab,
+        27 => KeyCode::Esc,
+        8 | 127 => KeyCode::Backspace,
+        // 57344.. is the kitty private-use range for functional keys.
+        57344.. => return Step::Consume(consumed),
+        other => match char::from_u32(other) {
+            Some(ch) if !ch.is_control() => KeyCode::Char(ch),
+            _ => return Step::Consume(consumed),
+        },
+    };
+    let mods = modifiers_from_param(u16::try_from(modifier).ok());
+    Step::Emit(consumed, Event::Key(KeyEvent { code, mods }))
 }
 
 /// CSI < cb ; cx ; cy M/m — SGR mouse. Only the wheel matters to us.
@@ -421,6 +472,8 @@ pub fn coalesce_burst(events: Vec<Event>) -> Vec<Event> {
                 KeyCode::Char(ch) => pasted.push(ch),
                 _ => {}
             },
+            // A pasted LF decodes as Ctrl+J: it is still a newline.
+            Event::Key(key) if key.mods.ctrl && key.code == KeyCode::Char('j') => pasted.push('\n'),
             Event::Paste(text) => {
                 flush(&mut pasted, &mut out);
                 out.push(Event::Paste(text));

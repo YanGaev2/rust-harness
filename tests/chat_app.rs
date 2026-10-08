@@ -1593,3 +1593,66 @@ fn stale_running_card_from_cancelled_run_does_not_block_next_flush() {
         "user entry must flush during the next busy turn"
     );
 }
+
+// --- editing keys ---
+
+#[test]
+fn modified_enter_and_ctrl_j_compose_newlines() {
+    use harness_tui::input::Modifiers;
+    let mut app = app();
+    type_text(&mut app, "a");
+    for mods in [
+        Modifiers {
+            shift: true,
+            ..Default::default()
+        },
+        Modifiers {
+            ctrl: true,
+            ..Default::default()
+        },
+    ] {
+        let action = app.handle_key(KeyEvent {
+            code: KeyCode::Enter,
+            mods,
+        });
+        assert_eq!(action, ChatAction::Continue);
+    }
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('j')));
+    assert_eq!(app.input(), "a\n\n\n");
+}
+
+#[test]
+fn ctrl_w_delete_and_kill_line_edit_the_prompt() {
+    let mut app = app();
+    type_text(&mut app, "fix the bug");
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('w')));
+    assert_eq!(app.input(), "fix the ");
+    app.handle_key(KeyEvent::ctrl(KeyCode::Backspace));
+    assert_eq!(app.input(), "fix ");
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('a')));
+    app.handle_key(KeyEvent::plain(KeyCode::Delete));
+    assert_eq!(app.input(), "ix ");
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('k')));
+    assert_eq!(app.input(), "");
+}
+
+#[test]
+fn up_moves_inside_a_multiline_prompt_before_recalling_history() {
+    let mut app = app();
+    submit_message(&mut app, "older prompt");
+    type_text(&mut app, "line one");
+    app.handle_key(KeyEvent::alt(KeyCode::Enter));
+    type_text(&mut app, "two");
+    app.handle_key(KeyEvent::plain(KeyCode::Up));
+    assert_eq!(
+        app.input(),
+        "line one\ntwo",
+        "first Up moves the caret, keeps the draft"
+    );
+    app.handle_key(KeyEvent::plain(KeyCode::Up));
+    assert_eq!(
+        app.input(),
+        "older prompt",
+        "Up on the first line recalls history"
+    );
+}

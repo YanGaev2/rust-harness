@@ -4,6 +4,7 @@ use harness_tui::components::select::select_lines;
 use harness_tui::components::spinner::{format_elapsed, spinner_lines};
 use harness_tui::components::status::status_line;
 use harness_tui::text::{Line, Span};
+use harness_tui::theme::Theme;
 
 fn plain(lines: &[Line]) -> Vec<String> {
     lines.iter().map(Line::text).collect()
@@ -130,11 +131,21 @@ fn editor_rows_reports_full_height() {
 // --- Spinner ---
 
 #[test]
-fn spinner_shows_elapsed_with_spacer() {
-    let lines = spinner_lines(0, 5);
+fn spinner_shows_detail_with_spacer() {
+    let lines = spinner_lines(&Theme::dark(), 0, "5s · esc to interrupt");
     assert_eq!(lines.len(), 2);
     assert_eq!(lines[0].text(), "");
-    assert!(lines[1].text().contains("Working… (5s)"));
+    assert!(lines[1].text().contains("Working… (5s · esc to interrupt)"));
+}
+
+#[test]
+fn spinner_without_detail_drops_the_parentheses() {
+    let lines = spinner_lines(&Theme::dark(), 3, "");
+    assert!(
+        lines[1].text().ends_with("Working…"),
+        "{:?}",
+        lines[1].text()
+    );
 }
 
 #[test]
@@ -160,6 +171,13 @@ fn status_drops_right_hint_when_too_narrow() {
     assert_eq!(line.text(), " provider");
 }
 
+#[test]
+fn status_clips_an_overlong_left_side_with_an_ellipsis() {
+    let line = status_line(12, Line::raw(" F:/very/long/path"), Line::raw("model "));
+    assert_eq!(line.text(), " F:/very/lo…");
+    assert_eq!(harness_tui::text::visible_width(&line.text()), 12);
+}
+
 // --- Completion menu ---
 
 fn items() -> Vec<MenuItem> {
@@ -179,11 +197,11 @@ fn items() -> Vec<MenuItem> {
 
 #[test]
 fn menu_marks_the_selected_row() {
-    let lines = menu_lines(&items(), "/", 1, 6);
+    let lines = menu_lines(&Theme::dark(), &items(), "/", 1, 6);
     let texts = plain(&lines);
     assert_eq!(texts.len(), 2);
     assert!(texts[0].starts_with("   /model"));
-    assert!(texts[1].starts_with(" \u{25b8} /new"));
+    assert!(texts[1].starts_with(" \u{203a} /new"));
     assert!(texts[0].contains("switch the active provider/model"));
 }
 
@@ -196,7 +214,7 @@ fn menu_caps_visible_rows() {
             description: "desc".into(),
         })
         .collect();
-    assert_eq!(menu_lines(&many, "/", 0, 6).len(), 6);
+    assert_eq!(menu_lines(&Theme::dark(), &many, "/", 0, 6).len(), 6);
 }
 
 // --- Select list ---

@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use harness_tui::core::Screen;
 use harness_tui::input::{Event as TuiEvent, KeyCode as TuiKeyCode, Parser, coalesce_burst};
 use harness_tui::terminal as tui_terminal;
+use harness_tui::theme::Theme;
 
 use crate::agent::{AgentError, AgentEvent, AgentRunner};
 use crate::chat::{BusyAction, ChatAction, ChatApp, busy_action};
@@ -454,12 +455,15 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
     let provider_label = format!("{}/{}", active_provider.name(), active_model);
-    let mut app =
-        ChatApp::new(provider_label.clone(), &workspace).with_catalog(catalog_pairs(&catalog));
-    for line in crate::chat::welcome_banner(env!("CARGO_PKG_VERSION"), &provider_label, &workspace)
-    {
-        app.push_system_line(line);
-    }
+    let theme = if tui_terminal::supports_truecolor() {
+        Theme::dark()
+    } else {
+        Theme::dark().quantized()
+    };
+    let mut app = ChatApp::new(provider_label, &workspace)
+        .with_catalog(catalog_pairs(&catalog))
+        .with_theme(theme);
+    app.push_banner(env!("CARGO_PKG_VERSION"));
     let mut chat = ChatSession::start(
         SessionStore::for_workspace(&workspace),
         &workspace,

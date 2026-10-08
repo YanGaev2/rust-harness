@@ -94,6 +94,18 @@ pub fn is_tty() -> bool {
     sys::is_tty()
 }
 
+/// Whether the terminal renders 24-bit SGR colors. Windows consoles do
+/// (conhost since Windows 10 1703, Windows Terminal always); elsewhere
+/// trust `COLORTERM`, plus `WT_SESSION` for WSL inside Windows Terminal.
+pub fn supports_truecolor() -> bool {
+    if cfg!(windows) || std::env::var_os("WT_SESSION").is_some() {
+        return true;
+    }
+    std::env::var("COLORTERM")
+        .map(|value| matches!(value.as_str(), "truecolor" | "24bit"))
+        .unwrap_or(false)
+}
+
 /// (width, height) of the stdout terminal in cells.
 pub fn size() -> Result<(u16, u16), TerminalError> {
     sys::size()

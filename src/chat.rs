@@ -14,10 +14,11 @@ use std::time::Instant;
 
 use harness_tui::components::editor::Editor;
 use harness_tui::components::menu::{MenuItem, menu_lines};
-use harness_tui::components::spinner::spinner_lines;
+use harness_tui::components::spinner::{format_elapsed, spinner_lines};
 use harness_tui::components::status::status_line;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Color, Line, Span, Style, visible_width, wrap_hanging};
+use harness_tui::text::{Line, Span, Style, visible_width, wrap_hanging};
+use harness_tui::theme::Theme;
 
 /// What the event loop should do after the app handled an input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,17 +59,12 @@ pub fn busy_action(event: &Event) -> BusyAction {
     }
 }
 
-const EDITOR_PROMPT: &str = "> ";
-const EDITOR_PLACEHOLDER: &str = "Type a message · / for commands · Alt+Enter newline";
+const EDITOR_PROMPT: &str = "› ";
+const EDITOR_PLACEHOLDER: &str = "Ask anything · / for commands";
 /// Maximum editor rows shown in the pinned panel.
 const EDITOR_MAX_ROWS: usize = 6;
 /// Maximum completion-menu rows shown in the pinned panel.
 const COMPLETION_MAX_ROWS: usize = 6;
-
-const CYAN: Color = Color::Ansi(6);
-const GREEN: Color = Color::Ansi(2);
-const RED: Color = Color::Ansi(1);
-const LIGHT_GREEN: Color = Color::Ansi(10);
 
 /// Status note for a stream that stopped producing events while the run is
 /// still alive. Providers that buffer whole tool calls (baseten/Kimi) go
@@ -172,6 +168,12 @@ struct ToolEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatEntry {
     User(String),
+    /// The startup banner: version, active model, workspace.
+    Banner {
+        version: String,
+        model: String,
+        workspace: String,
+    },
     /// Streamed assistant output. `continued` marks a frozen-off tail of an
     /// answer whose head already flushed — same hanging indent, no second
     /// `● ` marker (Qwen-style progressive commit of long streams).
@@ -192,6 +194,10 @@ enum ChatEntry {
 pub struct ChatApp {
     provider_label: String,
     workspace: PathBuf,
+    theme: Theme,
+    /// Current git branch of the workspace for the footer; refreshed
+    /// after every run (the agent may switch branches).
+    git_branch: Option<String>,
     editor: Editor,
     transcript: Vec<ChatEntry>,
     /// How many transcript entries are already flushed to scrollback.
@@ -280,10 +286,16 @@ impl ModelPicker {
 
 impl ChatApp {
     pub fn new(provider_label: impl Into<String>, workspace: impl Into<PathBuf>) -> Self {
+        let workspace = workspace.into();
+        let theme = Theme::default();
+        let mut editor = Editor::new(EDITOR_PROMPT, EDITOR_PLACEHOLDER);
+        editor.set_styles(Style::fg(theme.accent), Style::fg(theme.muted));
         Self {
             provider_label: provider_label.into(),
-            workspace: workspace.into(),
-            editor: Editor::new(EDITOR_PROMPT, EDITOR_PLACEHOLDER),
+            git_branch: git_branch(&workspace),
+            workspace,
+            theme,
+            editor,
             transcript: Vec::new(),
             emitted: 0,
             streaming_assistant: false,
@@ -314,6 +326,25 @@ impl ChatApp {
     /// Whether the interactive `/model` picker is open.
     pub fn model_picker_visible(&self) -> bool {
         self.model_picker.is_some()
+    }
+
+    /// Render with `theme` (picked by the host from the terminal's
+    /// background and color depth).
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self.editor
+            .set_styles(Style::fg(theme.accent), Style::fg(theme.muted));
+        self
+    }
+
+    /// Push the startup banner (version, active model, workspace) into the
+    /// transcript, so it flows into native scrollback like the rest.
+    pub fn push_banner(&mut self, version: &str) {
+        self.transcript.push(ChatEntry::Banner {
+            version: version.to_string(),
+            model: self.provider_label.clone(),
+            workspace: display_path(&self.workspace),
+        });
     }
 
     /// Attach the saved provider/model catalog that `/model` and `/provider`
@@ -373,6 +404,9 @@ impl ChatApp {
         self.busy = busy;
         self.busy_since = busy.then(Instant::now);
         self.stream_activity = busy.then(Instant::now);
+        if !busy {
+            self.git_branch = git_branch(&self.workspace);
+        }
     }
 
     /// Whole seconds the current run has been going (0 when idle).
@@ -1116,7 +1150,7 @@ impl ChatApp {
             if !live.is_empty() {
                 live.push(Line::default());
             }
-            live.extend(entry_lines(entry, width));
+            live.extend(entry_lines(entry, width, &self.theme));
         }
         // Over the cap, keep the tail — the newest rows matter while streaming.
         if live.len() > max_live_rows {
@@ -1130,22 +1164,33 @@ impl ChatApp {
         let body_rows = lines.len();
 
         if self.busy {
-            // Two rows: a blank spacer, then ` ⠋ Working… (5s)`.
-            lines.extend(spinner_lines(self.spinner_frame, self.busy_elapsed_secs()));
+            // Two rows: a blank spacer, then ` ⠋ Working… (5s · …)`.
+            lines.extend(spinner_lines(
+                &self.theme,
+                self.spinner_frame,
+                &self.busy_detail(),
+            ));
             if let Some(note) = stream_idle_note(self.stream_idle_secs()) {
-                lines.push(Line::styled(format!("   {note}"), Style::default().dim()));
+                lines.push(Line::styled(
+                    format!("   {note}"),
+                    Style::fg(self.theme.muted),
+                ));
             }
         }
 
         if self.help_visible {
-            lines.extend(palette_lines());
+            lines.extend(palette_lines(&self.theme));
         }
 
-        let editor_rows = self.editor.render(width.saturating_sub(2), EDITOR_MAX_ROWS);
-        lines.extend(framed_lines(editor_rows, width));
+        let editor_rows = self.editor.render(width, EDITOR_MAX_ROWS);
+        lines.extend(ruled_lines(editor_rows, width, &self.theme));
 
         if let Some(picker) = &self.model_picker {
-            lines.extend(model_picker_lines(picker, &self.provider_label));
+            lines.extend(model_picker_lines(
+                picker,
+                &self.provider_label,
+                &self.theme,
+            ));
         } else if self.completion_visible() {
             let items: Vec<MenuItem> = self
                 .completion_matches()
@@ -1158,6 +1203,7 @@ impl ChatApp {
                 .collect();
             let selected = self.completion_index.min(items.len().saturating_sub(1));
             lines.extend(menu_lines(
+                &self.theme,
                 &items,
                 self.editor.text(),
                 selected,
@@ -1204,7 +1250,7 @@ impl ChatApp {
         }
         let mut lines = Vec::new();
         for entry in &self.transcript[self.emitted..limit] {
-            lines.extend(entry_lines(entry, width));
+            lines.extend(entry_lines(entry, width, &self.theme));
             lines.push(Line::default());
         }
         (lines, limit)
@@ -1229,7 +1275,7 @@ impl ChatApp {
             .iter()
             .rev()
         {
-            let mut segment = entry_lines(entry, width);
+            let mut segment = entry_lines(entry, width, &self.theme);
             segment.push(Line::default());
             total += segment.len();
             segments.push(segment);
@@ -1262,7 +1308,7 @@ impl ChatApp {
             ChatEntry::Thinking(text) if self.streaming_thinking => text,
             _ => return,
         };
-        if entry_lines(last, width).len() <= max_live_rows {
+        if entry_lines(last, width, &self.theme).len() <= max_live_rows {
             return;
         }
         let Some(split) = safe_split_point(streaming_text) else {
@@ -1291,31 +1337,121 @@ impl ChatApp {
         }
     }
 
-    /// Bottom status row: provider/workspace on the left, key hints on the
-    /// right; the hints are dropped whole on narrow terminals.
+    /// Detail shown in the busy spinner: elapsed time, output tokens of
+    /// this run once the provider reported usage, and the interrupt key.
+    fn busy_detail(&self) -> String {
+        let mut detail = format_elapsed(self.busy_elapsed_secs());
+        let produced = self
+            .session_usage
+            .completion_tokens
+            .saturating_sub(self.run_usage_base.completion_tokens);
+        if produced > 0 {
+            detail.push_str(&format!(" · ↓ {} tokens", compact_count(produced)));
+        }
+        detail.push_str(" · esc to interrupt");
+        detail
+    }
+
+    /// Bottom status row. Left: where you are (workspace and git branch),
+    /// replaced by the one hint that matters right now (exit confirmation,
+    /// picker/menu keys). Right: the active model and session token usage.
+    /// The right side is dropped first on narrow terminals.
     fn status_row(&self, width: usize) -> Line {
-        let left = Line {
-            spans: vec![
-                Span::styled(format!(" {}", self.provider_label), Style::fg(CYAN)),
-                Span::styled(
-                    format!(" · {}", self.workspace.display()),
-                    Style::default().dim(),
-                ),
-            ],
-        };
-        let hint = if self.exit_armed {
-            "Press Esc again to exit "
+        let muted = Style::fg(self.theme.muted);
+        let left = if self.exit_armed {
+            Line::styled(" Press Esc again to exit", Style::fg(self.theme.warning))
         } else if self.model_picker.is_some() {
-            "↑↓ select · Enter switch · type to filter · Esc close "
+            Line::styled(
+                " ↑↓ select · Enter switch · type to filter · Esc close",
+                muted,
+            )
         } else if self.completion_visible() {
-            "↑↓ select · Tab complete · Esc close "
+            Line::styled(" ↑↓ select · Tab complete · Esc close", muted)
         } else {
-            "Enter send · Alt+Enter newline · / commands · Ctrl+V paste · Esc Esc exit "
+            let mut location = format!(" {}", display_path(&self.workspace));
+            if let Some(branch) = &self.git_branch {
+                location.push_str(&format!(" ({branch})"));
+            }
+            Line::styled(location, muted)
         };
-        let right = Line {
-            spans: vec![Span::styled(hint, Style::default().dim())],
+        let mut right = vec![Span::styled(self.provider_label.clone(), muted)];
+        if let Some(usage) = self.usage_summary() {
+            right.push(Span::styled(format!(" · {usage}"), muted));
+        }
+        right.push(Span::raw(" "));
+        status_line(width, left, Line { spans: right })
+    }
+
+    /// `↑12.3k ↓3.4k · cache 85%` for the session so far; `None` before the
+    /// first provider response.
+    fn usage_summary(&self) -> Option<String> {
+        let usage = self.session_usage;
+        if usage.requests == 0 {
+            return None;
+        }
+        let mut summary = format!(
+            "↑{} ↓{}",
+            compact_count(usage.prompt_tokens),
+            compact_count(usage.completion_tokens)
+        );
+        if usage.cached_tokens > 0 && usage.prompt_tokens > 0 {
+            let percent = usage.cached_tokens * 100 / usage.prompt_tokens;
+            summary.push_str(&format!(" · cache {percent}%"));
+        }
+        Some(summary)
+    }
+}
+
+/// `950`, `12.3k`, `1.2M`.
+fn compact_count(value: u64) -> String {
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=999_999 => format!("{:.1}k", value as f64 / 1_000.0),
+        _ => format!("{:.1}M", value as f64 / 1_000_000.0),
+    }
+}
+
+/// The workspace path with the home directory shortened to `~`.
+fn display_path(path: &Path) -> String {
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    if let Some(home) = home
+        && let Ok(rest) = path.strip_prefix(&home)
+    {
+        let rest = rest.display().to_string();
+        return if rest.is_empty() {
+            "~".to_string()
+        } else {
+            format!("~{}{rest}", std::path::MAIN_SEPARATOR)
         };
-        status_line(width, left, right)
+    }
+    path.display().to_string()
+}
+
+/// The checked-out branch of the repository containing `workspace`, read
+/// straight from `.git/HEAD` (no git process): `main`, or the short commit
+/// id when HEAD is detached. Worktrees (`.git` file with `gitdir:`) work.
+fn git_branch(workspace: &Path) -> Option<String> {
+    let dot_git = workspace
+        .ancestors()
+        .map(|dir| dir.join(".git"))
+        .find(|candidate| candidate.exists())?;
+    let git_dir = if dot_git.is_file() {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = pointer.trim().strip_prefix("gitdir:")?.trim();
+        dot_git.parent()?.join(target)
+    } else {
+        dot_git
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    match head.strip_prefix("ref: ") {
+        Some(reference) => Some(
+            reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(reference)
+                .to_string(),
+        ),
+        None => Some(head.chars().take(7).collect()),
     }
 }
 
@@ -1330,14 +1466,20 @@ fn expand_pasted_blocks(text: &str, blocks: &[PastedBlock]) -> String {
     expanded
 }
 
-/// The startup banner pushed into the transcript before the first prompt.
-/// Rendered as ordinary system lines, so it flows into native scrollback
-/// like the rest of the conversation.
-pub fn welcome_banner(version: &str, provider_label: &str, workspace: &Path) -> Vec<String> {
+/// The startup banner: name and version, the active model and workspace,
+/// and the three keys a newcomer needs. Pushed into the transcript, so it
+/// flows into native scrollback like the rest of the conversation.
+fn banner_lines(version: &str, model: &str, workspace: &str, theme: &Theme) -> Vec<Line> {
+    let muted = Style::fg(theme.muted);
     vec![
-        format!("harness v{version}"),
-        format!("model {provider_label} · workspace {}", workspace.display()),
-        "Enter send · / commands · Alt+Enter newline · Esc Esc exit".to_string(),
+        Line {
+            spans: vec![
+                Span::styled("harness", Style::fg(theme.accent).bold()),
+                Span::styled(format!(" v{version}"), muted),
+            ],
+        },
+        Line::styled(format!("{model} · {workspace}"), muted),
+        Line::styled("/ commands · Alt+Enter newline · Esc Esc exit", muted),
     ]
 }
 
@@ -1345,45 +1487,39 @@ pub fn welcome_banner(version: &str, provider_label: &str, workspace: &Path) -> 
 /// visible and a `(K/N)` counter reports the position in the full list.
 const PICKER_MAX_ROWS: usize = 10;
 
-/// Render the interactive model picker: `→` marks the cursor row, `✓` the
-/// active pair, `[provider]` is dimmed, and the footer shows `(K/N)` plus
-/// the type-to-filter text.
-fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
+/// Render the interactive model picker: `›` and the accent color mark the
+/// cursor row, `[provider]` is muted, `✓` marks the active pair, and the
+/// footer shows `(K/N)` plus the type-to-filter text.
+fn model_picker_lines(picker: &ModelPicker, active_label: &str, theme: &Theme) -> Vec<Line> {
+    let muted = Style::fg(theme.muted);
     let filtered = picker.filtered();
-    let mut lines = Vec::new();
     if filtered.is_empty() {
-        lines.push(Line::styled(
-            format!("  no models match '{}' (Esc to close)", picker.filter),
-            Style::default().dim(),
-        ));
-        return lines;
+        return vec![Line::styled(
+            format!("   no models match '{}' (Esc to close)", picker.filter),
+            muted,
+        )];
     }
     let cursor = picker.cursor.min(filtered.len() - 1);
-    let start = if cursor >= PICKER_MAX_ROWS {
-        cursor + 1 - PICKER_MAX_ROWS
-    } else {
-        0
-    };
+    let start = (cursor + 1).saturating_sub(PICKER_MAX_ROWS);
+    let mut lines = Vec::new();
     for (index, (provider, model)) in filtered
         .iter()
         .enumerate()
         .skip(start)
         .take(PICKER_MAX_ROWS)
     {
-        let is_cursor = index == cursor;
-        let is_active = format!("{provider}/{model}") == active_label;
-        let marker = if is_cursor { "→ " } else { "  " };
-        let name_style = if is_cursor {
-            Style::fg(CYAN)
+        let (marker, name_style) = if index == cursor {
+            (" › ", Style::fg(theme.accent))
         } else {
-            Style::default()
+            ("   ", Style::default())
         };
         let mut spans = vec![
-            Span::styled(format!("{marker}{model} "), name_style),
-            Span::styled(format!("[{provider}]"), Style::default().dim()),
+            Span::styled(marker, Style::fg(theme.accent)),
+            Span::styled(format!("{model} "), name_style),
+            Span::styled(format!("[{provider}]"), muted),
         ];
-        if is_active {
-            spans.push(Span::styled(" ✓", Style::fg(GREEN)));
+        if format!("{provider}/{model}") == active_label {
+            spans.push(Span::styled(" ✓", Style::fg(theme.success)));
         }
         lines.push(Line { spans });
     }
@@ -1393,8 +1529,8 @@ fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
         format!(" · {}", picker.filter)
     };
     lines.push(Line::styled(
-        format!("  ({}/{}){filter_note}", cursor + 1, filtered.len()),
-        Style::default().dim(),
+        format!("   ({}/{}){filter_note}", cursor + 1, filtered.len()),
+        muted,
     ));
     lines
 }
@@ -1431,154 +1567,54 @@ fn split_at_boundary(text: &str, split: usize) -> (String, String) {
     (head, tail)
 }
 
-/// Wrap rows in a rounded full-width frame: `╭─╮` / `│ … │` / `╰─╯`.
-/// Rows are clipped and padded to the inner width so the right border
-/// always lines up.
-fn framed_lines(inner: Vec<Line>, width: usize) -> Vec<Line> {
-    let width = width.max(4);
-    let inner_width = width - 2;
-    let horizontal = "─".repeat(inner_width);
+/// The editor between two full-width rules — no side borders, so a mouse
+/// selection copies only the typed text.
+fn ruled_lines(inner: Vec<Line>, width: usize, theme: &Theme) -> Vec<Line> {
+    let rule = Line::styled("─".repeat(width.max(1)), Style::fg(theme.faint));
     let mut lines = Vec::with_capacity(inner.len() + 2);
-    lines.push(Line::styled(
-        format!("╭{horizontal}╮"),
-        Style::default().dim(),
-    ));
-    for row in inner {
-        let (mut spans, used) = clip_spans(row, inner_width);
-        spans.insert(0, Span::styled("│", Style::default().dim()));
-        if used < inner_width {
-            spans.push(Span::raw(" ".repeat(inner_width - used)));
-        }
-        spans.push(Span::styled("│", Style::default().dim()));
-        lines.push(Line { spans });
-    }
-    lines.push(Line::styled(
-        format!("╰{horizontal}╯"),
-        Style::default().dim(),
-    ));
+    lines.push(rule.clone());
+    lines.extend(inner);
+    lines.push(rule);
     lines
 }
 
-/// Truncate a row to `max_width` columns, keeping span styles; returns
-/// the surviving spans and the columns they occupy.
-fn clip_spans(row: Line, max_width: usize) -> (Vec<Span>, usize) {
-    let mut spans = Vec::new();
-    let mut used = 0usize;
-    for span in row.spans {
-        if used >= max_width {
-            break;
-        }
-        let span_width = visible_width(&span.text);
-        if used + span_width <= max_width {
-            used += span_width;
-            spans.push(span);
-            continue;
-        }
-        let mut clipped = String::new();
-        for ch in span.text.chars() {
-            let mut buf = [0u8; 4];
-            let ch_width = visible_width(ch.encode_utf8(&mut buf));
-            if used + ch_width > max_width {
-                break;
-            }
-            clipped.push(ch);
-            used += ch_width;
-        }
-        if !clipped.is_empty() {
-            spans.push(Span {
-                text: clipped,
-                style: span.style,
-            });
-        }
-        break;
-    }
-    (spans, used)
-}
-
 /// The `/help` palette as plain panel lines.
-fn palette_lines() -> Vec<Line> {
-    let mut lines = vec![Line::styled(
-        "Commands",
-        Style {
-            bold: true,
-            ..Style::default()
-        },
-    )];
+fn palette_lines(theme: &Theme) -> Vec<Line> {
+    let muted = Style::fg(theme.muted);
+    let mut lines = vec![Line::styled(" Commands", Style::default().bold())];
     for command in CHAT_COMMANDS {
         lines.push(Line {
             spans: vec![
-                Span::raw(format!("  {:<22}", command.usage)),
-                Span::styled(command.description, Style::default().dim()),
+                Span::raw(format!("   {:<22}", command.usage)),
+                Span::styled(command.description, muted),
             ],
         });
     }
     lines.push(Line::styled(
-        "Up/Down recall · Ctrl+V paste · Esc close",
-        Style::default().dim(),
+        " Up/Down recall · Ctrl+V paste · Esc close",
+        muted,
     ));
     lines
 }
 
-/// Render one transcript entry as styled lines wrapped to `width` columns
-/// with a hanging indent under the entry's marker.
-fn entry_lines(entry: &ChatEntry, width: usize) -> Vec<Line> {
-    entry_styled_lines(entry)
-        .into_iter()
-        .flat_map(|line| wrap_styled_line(line, width))
-        .collect()
-}
-
-/// Render one transcript entry as one or more styled lines: a `>` echo on a
-/// highlight strip for user turns, `●`-marked assistant/tool blocks, and
-/// unlabeled dim reasoning.
-fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
-    match entry {
-        ChatEntry::User(text) => {
-            // The user's turn sits on a subtle highlight strip (256-color dark
-            // gray; legacy consoles map it to the nearest base color), so it
-            // reads as "input" at a glance and never blends into reasoning.
-            let strip = Style {
-                bg: Color::Indexed(236),
-                ..Style::default()
-            };
-            let marker_style = Style { fg: CYAN, ..strip };
-            text.split('\n')
-                .enumerate()
-                .map(|(index, raw)| {
-                    let prefix = if index == 0 { "> " } else { "  " };
-                    Line {
-                        spans: vec![
-                            Span::styled(prefix, marker_style),
-                            Span::styled(format!("{raw} "), strip),
-                        ],
-                    }
-                })
-                .collect()
-        }
-        ChatEntry::Assistant { text, continued } => {
-            // The accent marker leads the first markdown line of a fresh
-            // answer; a frozen-off tail carries no second marker, and every
-            // other line keeps the assistant hanging indent.
-            let mut lines = Vec::new();
-            for (index, line) in markdown_lines(text).into_iter().enumerate() {
-                if index == 0 && !continued {
-                    let mut spans = vec![Span::styled("● ", Style::fg(CYAN))];
-                    spans.extend(line.spans);
-                    lines.push(Line { spans });
-                } else {
-                    lines.push(indent_line(line, "  "));
-                }
-            }
-            lines
-        }
+/// Render one transcript entry as styled lines wrapped to `width` columns,
+/// continuation rows hanging under the entry's marker: `›` on a full-width
+/// strip for user turns, unmarked indented markdown for answers, muted
+/// reasoning, status-marked tool cards.
+fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme) -> Vec<Line> {
+    let styled = match entry {
+        ChatEntry::User(text) => return user_lines(text, width, theme),
+        ChatEntry::Banner {
+            version,
+            model,
+            workspace,
+        } => banner_lines(version, model, workspace, theme),
+        ChatEntry::Assistant { text, .. } => markdown_lines(text, theme)
+            .into_iter()
+            .map(|line| indent_line(line, "  "))
+            .collect(),
         ChatEntry::Thinking(text) => {
-            // Reasoning renders as plain dim italic text with no badge — the
-            // model's inner voice should not carry a label in the transcript.
-            let style = Style {
-                dim: true,
-                italic: true,
-                ..Style::default()
-            };
+            let style = Style::fg(theme.muted);
             text.split('\n')
                 .map(|raw| Line {
                     spans: vec![Span::raw("  "), Span::styled(raw, style)],
@@ -1587,20 +1623,50 @@ fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
         }
         ChatEntry::System(text) => {
             let style = if text.starts_with("memo:") {
-                Style {
-                    fg: CYAN,
-                    italic: true,
-                    ..Style::default()
-                }
+                Style::fg(theme.accent)
             } else {
-                Style::default().dim()
+                Style::fg(theme.muted)
             };
             vec![Line {
                 spans: vec![Span::styled("· ", style), Span::styled(text.clone(), style)],
             }]
         }
-        ChatEntry::Tool(tool) => tool_card_lines(tool),
+        ChatEntry::Tool(tool) => tool_card_lines(tool, theme),
+    };
+    styled
+        .into_iter()
+        .flat_map(|line| wrap_styled_line(line, width))
+        .collect()
+}
+
+/// The user's turn: `› ` and the text on a full-width background strip,
+/// so turns stand out when scrolling back through a long session.
+fn user_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line> {
+    let width = width.max(1);
+    let strip = Style::default().bg(theme.user_bg);
+    let marker = Style::fg(theme.accent).bg(theme.user_bg).bold();
+    let mut rows = Vec::new();
+    for (index, raw) in text.split('\n').enumerate() {
+        let prefix = if index == 0 { "› " } else { "  " };
+        let line = Line {
+            spans: vec![Span::styled(prefix, marker), Span::styled(raw, strip)],
+        };
+        for mut row in wrap_hanging(&line, width, 2) {
+            // The hanging indent comes back unstyled: paint it into the strip.
+            for span in &mut row.spans {
+                if span.style.is_plain() {
+                    span.style = strip;
+                }
+            }
+            let used = row.width();
+            if used < width {
+                row.spans
+                    .push(Span::styled(" ".repeat(width - used), strip));
+            }
+            rows.push(row);
+        }
     }
+    rows
 }
 
 /// Prepend a fixed indent to a styled line (used to nest markdown under a badge).
@@ -1610,63 +1676,69 @@ fn indent_line(line: Line, pad: &str) -> Line {
     Line { spans }
 }
 
-fn tool_card_lines(tool: &ToolEntry) -> Vec<Line> {
-    // The `●` marker carries the status color; the tool name stays neutral
+fn tool_card_lines(tool: &ToolEntry, theme: &Theme) -> Vec<Line> {
+    // The marker carries the status color; the tool name stays neutral
     // bold so the eye scans markers, not a rainbow of glyphs.
+    let muted = Style::fg(theme.muted);
     let marker_style = match tool.status {
-        ToolStatus::Running => Style::default().dim(),
-        ToolStatus::Ok => Style::fg(GREEN),
-        ToolStatus::Failed => Style::fg(RED),
+        ToolStatus::Running => muted,
+        ToolStatus::Ok => Style::fg(theme.success),
+        ToolStatus::Failed => Style::fg(theme.error),
     };
     let mut spans = vec![
         Span::styled("● ", marker_style),
-        Span::styled(
-            tool.name.clone(),
-            Style {
-                bold: true,
-                ..Style::default()
-            },
-        ),
+        Span::styled(tool.name.clone(), Style::default().bold()),
     ];
     if !tool.args.is_empty() {
-        spans.push(Span::styled(
-            format!("({})", tool.args),
-            Style::default().dim(),
-        ));
+        spans.push(Span::styled(format!("({})", tool.args), muted));
     }
     let mut lines = vec![Line { spans }];
     if let Some(summary) = &tool.summary {
-        lines.push(Line::styled(
-            format!("  ⎿ {summary}"),
-            Style::default().dim(),
-        ));
+        lines.push(Line::styled(format!("  ⎿ {summary}"), muted));
     }
     lines
 }
 
-/// Word-wrap one styled line to `width` columns, preserving span styles.
-/// Breaks at the last space inside the window when there is one, else
-/// mid-word. Continuation rows hang-indent to the block's text column, so a
-/// wrapped turn stays visually inside its `>`/`●`/gutter block instead of
-/// snapping to x=0.
 /// Wrap one transcript row to the panel width with the chat's hanging
 /// indent: continuations align under the entry's leading marker. Width is
 /// measured in display columns (CJK/emoji take two), not chars.
 fn wrap_styled_line(line: Line, width: usize) -> Vec<Line> {
-    let indent = line
-        .spans
-        .iter()
-        .flat_map(|span| span.text.chars())
-        .take_while(|ch| *ch == ' ' || matches!(ch, '>' | '●' | '·' | '⎿' | '•' | '│'))
-        .count();
+    let indent = hanging_indent(&line.text());
     wrap_hanging(&line, width, indent)
 }
 
+/// Continuation indent for a transcript row: its leading spaces plus one
+/// leading marker (`•`, `›`, `⎿`, `│`, a status glyph, or an ordered-list
+/// number such as `12.`) and the space after it.
+fn hanging_indent(text: &str) -> usize {
+    let spaces = text.chars().take_while(|ch| *ch == ' ').count();
+    // Spaces are ASCII, so the char count is also the byte offset.
+    let rest = &text[spaces..];
+    let marker_chars = match rest.chars().next() {
+        Some('•' | '›' | '·' | '⎿' | '│' | '∴' | '✓' | '✗' | '●') => 1,
+        Some(ch) if ch.is_ascii_digit() => {
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            match rest[digits..].chars().next() {
+                Some('.' | ')') => digits + 1,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    };
+    if marker_chars > 0 && rest.chars().nth(marker_chars) == Some(' ') {
+        spaces + marker_chars + 1
+    } else {
+        spaces
+    }
+}
+
 /// Render a block of (lightweight) Markdown to styled lines: ATX headings,
-/// `-`/`*` bullets, fenced code blocks, horizontal rules, tables, and inline
-/// `**bold**`, `*italic*`, and `` `code` ``. Deliberately a pragmatic subset,
-/// not CommonMark.
-fn markdown_lines(text: &str) -> Vec<Line> {
+/// bullet and ordered lists, block quotes, fenced code blocks, horizontal
+/// rules, tables, and inline `**bold**`, `*italic*`, and `` `code` ``.
+/// Deliberately a pragmatic subset, not CommonMark. Code fences stay
+/// literal (muted) and code lines carry no gutter, so a mouse selection
+/// copies valid markdown and clean code.
+fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line> {
     // Terminal-default foreground so the transcript respects light/dark themes.
     let base = Style::default();
     let raw_lines: Vec<&str> = text.split('\n').collect();
@@ -1680,17 +1752,12 @@ fn markdown_lines(text: &str) -> Vec<Line> {
 
         if trimmed.starts_with("```") {
             in_code = !in_code;
-            lines.push(Line::styled("  ┄┄┄", Style::default().dim()));
+            lines.push(Line::styled(trimmed, Style::fg(theme.faint)));
             i += 1;
             continue;
         }
         if in_code {
-            lines.push(Line {
-                spans: vec![
-                    Span::styled("│ ", Style::default().dim()),
-                    Span::styled(raw, code_style()),
-                ],
-            });
+            lines.push(Line::raw(raw));
             i += 1;
             continue;
         }
@@ -1702,25 +1769,17 @@ fn markdown_lines(text: &str) -> Vec<Line> {
             while i < raw_lines.len() && is_table_row(raw_lines[i].trim_start()) {
                 i += 1;
             }
-            lines.extend(table_lines(&raw_lines[start..i], base));
+            lines.extend(table_lines(&raw_lines[start..i], base, theme));
             continue;
         }
 
-        if let Some(rest) = heading_text(trimmed) {
-            let (level, body) = rest;
-            // One accent color for headings; deeper levels drop the accent and
-            // keep only the bold weight.
+        if let Some((level, body)) = heading_text(trimmed) {
+            // One accent color for the top two levels; deeper levels keep
+            // only the bold weight.
             let style = if level <= 2 {
-                Style {
-                    fg: CYAN,
-                    bold: true,
-                    ..Style::default()
-                }
+                Style::fg(theme.heading).bold()
             } else {
-                Style {
-                    bold: true,
-                    ..Style::default()
-                }
+                Style::default().bold()
             };
             lines.push(Line::styled(body, style));
             i += 1;
@@ -1728,7 +1787,19 @@ fn markdown_lines(text: &str) -> Vec<Line> {
         }
 
         if is_horizontal_rule(trimmed) || is_table_separator(trimmed) {
-            lines.push(Line::styled("─".repeat(24), Style::default().dim()));
+            lines.push(Line::styled("─".repeat(24), Style::fg(theme.faint)));
+            i += 1;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            let mut spans = vec![Span::styled("│ ", Style::fg(theme.faint))];
+            spans.extend(inline_spans(
+                rest.strip_prefix(' ').unwrap_or(rest),
+                Style::fg(theme.muted),
+                theme,
+            ));
+            lines.push(Line { spans });
             i += 1;
             continue;
         }
@@ -1737,16 +1808,27 @@ fn markdown_lines(text: &str) -> Vec<Line> {
             let rest = &raw[indent + marker_len..];
             let mut spans = vec![Span::styled(
                 format!("{}• ", " ".repeat(indent)),
-                Style::fg(CYAN),
+                Style::fg(theme.accent),
             )];
-            spans.extend(inline_spans(rest, base));
+            spans.extend(inline_spans(rest, base, theme));
+            lines.push(Line { spans });
+            i += 1;
+            continue;
+        }
+
+        if let Some((indent, marker_len)) = ordered_prefix(raw) {
+            let mut spans = vec![Span::styled(
+                raw[..indent + marker_len].to_string(),
+                Style::fg(theme.accent),
+            )];
+            spans.extend(inline_spans(&raw[indent + marker_len..], base, theme));
             lines.push(Line { spans });
             i += 1;
             continue;
         }
 
         lines.push(Line {
-            spans: inline_spans(raw, base),
+            spans: inline_spans(raw, base, theme),
         });
         i += 1;
     }
@@ -1763,7 +1845,7 @@ fn is_table_row(line: &str) -> bool {
 /// Lay a block of `| … |` rows out as padded columns: cells keep their inline
 /// markdown, the header (a row directly above a `|---|` separator) is bold
 /// and underlined by a rule sized to the real column widths.
-fn table_lines(rows: &[&str], base: Style) -> Vec<Line> {
+fn table_lines(rows: &[&str], base: Style, theme: &Theme) -> Vec<Line> {
     const GAP: usize = 2;
 
     let mut body: Vec<(bool, Vec<Vec<Span>>)> = Vec::new();
@@ -1782,13 +1864,13 @@ fn table_lines(rows: &[&str], base: Style) -> Vec<Line> {
             .trim_start_matches('|')
             .trim_end_matches('|')
             .split('|')
-            .map(|cell| inline_spans(cell.trim(), base))
+            .map(|cell| inline_spans(cell.trim(), base, theme))
             .collect();
         body.push((false, cells));
     }
 
     let span_width =
-        |spans: &[Span]| -> usize { spans.iter().map(|s| s.text.chars().count()).sum() };
+        |spans: &[Span]| -> usize { spans.iter().map(|s| visible_width(&s.text)).sum() };
     let columns = body.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
     let mut widths = vec![0usize; columns];
     for (_, cells) in &body {
@@ -1807,13 +1889,7 @@ fn table_lines(rows: &[&str], base: Style) -> Vec<Line> {
             cell_widths.push(width);
             for span in cell {
                 let span = if is_header {
-                    Span::styled(
-                        span.text,
-                        Style {
-                            bold: true,
-                            ..span.style
-                        },
-                    )
+                    Span::styled(span.text, span.style.bold())
                 } else {
                     span
                 };
@@ -1841,7 +1917,7 @@ fn table_lines(rows: &[&str], base: Style) -> Vec<Line> {
                 })
                 .collect::<Vec<_>>()
                 .join(&" ".repeat(GAP));
-            lines.push(Line::styled(rule.trim_end(), Style::default().dim()));
+            lines.push(Line::styled(rule.trim_end(), Style::fg(theme.faint)));
         }
     }
     lines
@@ -1885,8 +1961,18 @@ fn bullet_prefix(line: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// If `line` begins an ordered-list item (`12. ` or `3) ` after optional
+/// indent), return the indent width and the marker length incl. the space.
+fn ordered_prefix(line: &str) -> Option<(usize, usize)> {
+    let indent = line.len() - line.trim_start().len();
+    let rest = &line[indent..];
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let after = rest.as_bytes().get(digits..digits + 2)?;
+    (digits > 0 && matches!(after, [b'.' | b')', b' '])).then_some((indent, digits + 2))
+}
+
 /// Parse inline Markdown emphasis/code in `text` into styled spans.
-fn inline_spans(text: &str, base: Style) -> Vec<Span> {
+fn inline_spans(text: &str, base: Style, theme: &Theme) -> Vec<Span> {
     let chars: Vec<char> = text.chars().collect();
     let mut spans: Vec<Span> = Vec::new();
     let mut buf = String::new();
@@ -1901,7 +1987,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span> {
             push_buf(&mut buf, &mut spans, base);
             spans.push(Span::styled(
                 chars[i + 1..end].iter().collect::<String>(),
-                code_style(),
+                Style::fg(theme.code),
             ));
             i = end + 1;
             continue;
@@ -1915,12 +2001,12 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span> {
             push_buf(&mut buf, &mut spans, base);
             spans.push(Span::styled(
                 chars[i + 2..end].iter().collect::<String>(),
-                Style { bold: true, ..base },
+                base.bold(),
             ));
             i = end + 2;
             continue;
         }
-        // Italic: *text* or _text_
+        // Italic: *text* or _text_ — short emphasis only, never whole blocks.
         if (c == '*' || c == '_')
             && let Some(end) = find_char(&chars, i + 1, c)
             && end > i + 1
@@ -1928,10 +2014,7 @@ fn inline_spans(text: &str, base: Style) -> Vec<Span> {
             push_buf(&mut buf, &mut spans, base);
             spans.push(Span::styled(
                 chars[i + 1..end].iter().collect::<String>(),
-                Style {
-                    italic: true,
-                    ..base
-                },
+                base.italic(),
             ));
             i = end + 1;
             continue;
@@ -1962,14 +2045,18 @@ fn find_seq(chars: &[char], from: usize, target: char) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&i| chars[i] == target && chars[i + 1] == target)
 }
 
-fn code_style() -> Style {
-    Style::fg(LIGHT_GREEN)
-}
-
 /// Plain-text projection of an entry for `transcript_text` (tests, non-TTY).
 fn entry_plain_lines(entry: &ChatEntry) -> Vec<String> {
     match entry {
         ChatEntry::User(text) => vec![format!("you: {text}")],
+        ChatEntry::Banner {
+            version,
+            model,
+            workspace,
+        } => vec![
+            format!("harness v{version}"),
+            format!("model {model} · workspace {workspace}"),
+        ],
         ChatEntry::Assistant { text, .. } => vec![text.clone()],
         ChatEntry::Thinking(text) => vec![format!("thinking: {text}")],
         ChatEntry::System(text) => vec![text.clone()],

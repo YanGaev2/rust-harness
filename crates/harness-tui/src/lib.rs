@@ -12,3 +12,4 @@ pub mod headless;
 pub mod input;
 pub mod terminal;
 pub mod text;
+pub mod theme;

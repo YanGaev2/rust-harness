@@ -1,32 +1,27 @@
-//! Busy spinner with elapsed time — pure line builders; the app owns
-//! the clock and the frame counter.
+//! Busy spinner — pure line builders; the app owns the clock, the frame
+//! counter and the detail text.
 
-use crate::text::{Color, Line, Span, Style};
+use crate::text::{Line, Span, Style};
+use crate::theme::Theme;
 
 pub const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// The two spinner rows: a blank spacer, then
-/// ` ⠹ Working… (12s)` (spinner cyan, label dimmed).
-pub fn spinner_lines(frame: usize, elapsed_secs: u64) -> Vec<Line> {
+/// ` ⠹ Working… (12s · esc to interrupt)` — glyph in the accent color,
+/// label and detail muted. An empty `detail` drops the parentheses.
+pub fn spinner_lines(theme: &Theme, frame: usize, detail: &str) -> Vec<Line> {
     let glyph = FRAMES[frame % FRAMES.len()];
+    let label = if detail.is_empty() {
+        "Working…".to_string()
+    } else {
+        format!("Working… ({detail})")
+    };
     vec![
         Line::default(),
         Line {
             spans: vec![
-                Span::styled(
-                    format!(" {glyph} "),
-                    Style {
-                        fg: Color::Ansi(6),
-                        ..Style::default()
-                    },
-                ),
-                Span::styled(
-                    format!("Working… ({})", format_elapsed(elapsed_secs)),
-                    Style {
-                        dim: true,
-                        ..Style::default()
-                    },
-                ),
+                Span::styled(format!(" {glyph} "), Style::fg(theme.accent)),
+                Span::styled(label, Style::fg(theme.muted)),
             ],
         },
     ]

@@ -6,7 +6,7 @@ use harness_cli::agent::AgentEvent;
 use harness_cli::chat::{BusyAction, ChatAction, ChatApp, busy_action};
 use harness_cli::runtime::ToolBatchResult;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::Line;
+use harness_tui::text::{Color, Line};
 use serde_json::json;
 
 fn app() -> ChatApp {
@@ -271,12 +271,9 @@ fn small_paste_is_inserted_verbatim() {
 
 #[test]
 fn welcome_banner_names_the_build_model_and_workspace() {
-    let lines = harness_cli::chat::welcome_banner(
-        "0.1.0",
-        "deepseek/deepseek-v4-pro",
-        std::path::Path::new("C:/work/project"),
-    );
-    let text = lines.join("\n");
+    let mut app = ChatApp::new("deepseek/deepseek-v4-pro", "C:/work/project");
+    app.push_banner("0.1.0");
+    let text = lines_text(&app.take_scrollback(80));
     assert!(text.contains("harness"), "{text}");
     assert!(text.contains("0.1.0"), "{text}");
     assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
@@ -486,7 +483,7 @@ fn slash_model_no_args_opens_interactive_picker() {
     assert!(app.model_picker_visible());
     let panel = lines_text(&app.panel_lines(100, 30));
     // Cursor starts on the active pair, which also carries the check mark.
-    assert!(panel.contains("→ deepseek-v4-pro [deepseek] ✓"));
+    assert!(panel.contains("› deepseek-v4-pro [deepseek] ✓"));
     assert!(panel.contains("deepseek-v4-flash [deepseek]"));
     assert!(panel.contains("glm-5.2 [glm]"));
     assert!(panel.contains("(1/3)"));
@@ -506,7 +503,7 @@ fn picker_cursor_starts_on_active_pair() {
     ]);
     submit_message(&mut app, "/model");
     let panel = lines_text(&app.panel_lines(100, 30));
-    assert!(panel.contains("→ glm-5.2 [glm] ✓"));
+    assert!(panel.contains("› glm-5.2 [glm] ✓"));
     assert!(panel.contains("(3/3)"));
 }
 
@@ -918,53 +915,129 @@ fn assistant_markdown_table_renders_aligned_without_pipes() {
 fn panel_contains_editor_prompt_and_status_row() {
     let mut app = app();
     let panel = lines_text(&app.panel_lines(100, 20));
-    assert!(panel.contains("Type a message"));
+    assert!(panel.contains("Ask anything"));
     assert!(panel.contains("deepseek/deepseek-v4-pro"));
     assert!(panel.contains("C:/work/project"));
 
-    // The editor prompt row keeps the "> " prefix once text is typed.
+    // The editor prompt row keeps the "› " prefix once text is typed.
     type_text(&mut app, "next question");
     let panel = lines_text(&app.panel_lines(100, 20));
-    assert!(panel.contains("> next question"));
+    assert!(panel.contains("› next question"));
 }
 
 #[test]
-fn editor_is_framed_in_a_rounded_border() {
+fn editor_sits_between_full_width_rules_without_side_borders() {
     let mut app = app();
-    let rows: Vec<String> = app
-        .panel_lines(40, 20)
-        .iter()
-        .map(|line| line.text())
-        .collect();
-    let top = rows
-        .iter()
-        .position(|row| row.starts_with('╭'))
-        .expect("top border row");
-    assert_eq!(rows[top].chars().count(), 40, "border spans the full width");
-    assert!(rows[top].ends_with('╮'));
-    // The editor row sits inside the frame, padded out to the right edge.
-    assert!(
-        rows[top + 1].starts_with("│ > "),
-        "editor row must be framed: {:?}",
-        rows[top + 1]
-    );
-    assert!(rows[top + 1].ends_with('│'));
-    assert_eq!(rows[top + 1].chars().count(), 40, "row padded to the frame");
-    assert!(rows[top + 2].starts_with('╰'));
-    assert!(rows[top + 2].ends_with('╯'));
-
-    // Typed text stays inside the frame.
     type_text(&mut app, "hello");
     let rows: Vec<String> = app
         .panel_lines(40, 20)
         .iter()
         .map(|line| line.text())
         .collect();
-    let row = rows
+    let editor = rows
         .iter()
-        .find(|row| row.contains("> hello"))
+        .position(|row| row.contains("› hello"))
         .expect("typed row");
-    assert!(row.starts_with('│') && row.ends_with('│'), "{row:?}");
+    for rule in [&rows[editor - 1], &rows[editor + 1]] {
+        assert_eq!(rule.chars().count(), 40, "rule spans the full width");
+        assert!(rule.chars().all(|ch| ch == '─'), "{rule:?}");
+    }
+    // No side borders: a mouse selection copies only the text.
+    assert!(!rows[editor].contains('│'), "{:?}", rows[editor]);
+}
+
+#[test]
+fn user_turn_is_a_full_width_strip() {
+    let mut app = app();
+    app.push_user_message("a question long enough to wrap onto a second row");
+    let lines = app.take_scrollback(30);
+    let strip: Vec<&Line> = lines.iter().filter(|line| line.width() > 0).collect();
+    assert!(strip.len() >= 2, "expected a wrapped turn: {strip:?}");
+    for row in &strip {
+        assert_eq!(
+            row.width(),
+            30,
+            "strip row must span the width: {:?}",
+            row.text()
+        );
+        assert!(
+            row.spans.iter().all(|span| span.style.bg != Color::Default),
+            "every cell sits on the strip background: {row:?}"
+        );
+    }
+    assert!(strip[0].text().starts_with("› a question"));
+    assert!(
+        strip[1].text().starts_with("  "),
+        "continuation hangs under the text"
+    );
+}
+
+#[test]
+fn assistant_answer_is_unmarked_and_code_copies_clean() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(
+        "Run this:\n```rust\nfn main() {}\n```".to_string(),
+    ));
+    let rows: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    assert_eq!(rows[0], "  Run this:", "no marker, two-column indent");
+    assert_eq!(rows[1], "  ```rust", "fences stay literal");
+    assert_eq!(rows[2], "  fn main() {}", "code has no gutter glyph");
+    assert_eq!(rows[3], "  ```");
+}
+
+#[test]
+fn ordered_list_items_hang_under_their_text() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(
+        "12. alpha beta gamma delta".to_string(),
+    ));
+    let rows: Vec<String> = app.take_scrollback(16).iter().map(Line::text).collect();
+    assert_eq!(rows[0], "  12. alpha");
+    assert!(
+        rows[1].starts_with("      "),
+        "hangs under the item text: {rows:?}"
+    );
+}
+
+#[test]
+fn reasoning_is_never_italic() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::Thinking("weighing options".to_string()));
+    let lines = app.take_scrollback(80);
+    assert!(lines_text(&lines).contains("weighing options"));
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| !span.style.italic && !span.style.dim),
+        "reasoning must use an explicit muted color, not italic/dim: {lines:?}"
+    );
+}
+
+#[test]
+fn status_row_shows_git_branch_and_session_usage() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::create_dir(workspace.path().join(".git")).unwrap();
+    std::fs::write(
+        workspace.path().join(".git").join("HEAD"),
+        "ref: refs/heads/feature/tui\n",
+    )
+    .unwrap();
+    let mut app = ChatApp::new("deepseek/deepseek-v4-pro", workspace.path());
+    let status = app.panel_lines(120, 10).pop().unwrap().text();
+    assert!(status.contains("(feature/tui)"), "{status:?}");
+    assert!(!status.contains('↑'), "no usage before the first response");
+
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::UsageUpdated(harness_cli::agent::UsageTotals {
+        requests: 1,
+        prompt_tokens: 12_300,
+        cached_tokens: 6_150,
+        completion_tokens: 3_400,
+    }));
+    app.set_busy(false);
+    let status = app.panel_lines(120, 10).pop().unwrap().text();
+    assert!(status.contains("↑12.3k ↓3.4k · cache 50%"), "{status:?}");
 }
 
 #[test]
@@ -980,7 +1053,7 @@ fn busy_panel_shows_working_row_with_spacer_and_live_entry() {
     let rows: Vec<String> = lines.iter().map(|line| line.text()).collect();
     let working = rows
         .iter()
-        .position(|row| row.contains("Working… (0s)"))
+        .position(|row| row.contains("Working… (0s"))
         .expect("busy panel must show the Working row");
     assert!(
         rows[working - 1].trim().is_empty(),
@@ -1121,7 +1194,7 @@ fn take_scrollback_flushes_user_and_system_while_busy_but_not_running_tool() {
     app.set_busy(true);
 
     let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("> hello"), "user turn flushes: {flushed}");
+    assert!(flushed.contains("› hello"), "user turn flushes: {flushed}");
     assert!(flushed.contains("· note"), "system line flushes");
     assert!(
         !flushed.contains("file.read"),
@@ -1144,7 +1217,7 @@ fn take_scrollback_keeps_streaming_assistant_live_while_busy() {
     app.push_agent_event(&AgentEvent::FinalContentDelta("partial answer".to_string()));
 
     let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("> question"));
+    assert!(flushed.contains("› question"));
     assert!(
         !flushed.contains("partial answer"),
         "the streaming tail must stay in the live panel"

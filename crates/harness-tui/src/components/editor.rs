@@ -15,6 +15,8 @@ pub struct Editor {
     cursor: usize,
     prompt: String,
     placeholder: String,
+    prompt_style: Style,
+    placeholder_style: Style,
 }
 
 impl Editor {
@@ -24,7 +26,15 @@ impl Editor {
             cursor: 0,
             prompt: prompt.into(),
             placeholder: placeholder.into(),
+            prompt_style: Style::default(),
+            placeholder_style: Style::default().dim(),
         }
+    }
+
+    /// Colors for the prompt glyph and the empty-editor placeholder.
+    pub fn set_styles(&mut self, prompt: Style, placeholder: Style) {
+        self.prompt_style = prompt;
+        self.placeholder_style = placeholder;
     }
 
     pub fn text(&self) -> &str {
@@ -107,16 +117,9 @@ impl Editor {
         if self.text.is_empty() {
             return vec![Line {
                 spans: vec![
-                    Span::raw(self.prefix(0)),
+                    Span::styled(self.prefix(0), self.prompt_style),
                     caret_span(" "),
-                    Span::styled(
-                        self.placeholder.clone(),
-                        Style {
-                            dim: true,
-                            italic: true,
-                            ..Style::default()
-                        },
-                    ),
+                    Span::styled(self.placeholder.clone(), self.placeholder_style),
                 ],
             }];
         }
@@ -131,7 +134,7 @@ impl Editor {
             .skip(first)
             .take(max_rows)
             .map(|(i, row)| {
-                let mut spans = vec![Span::raw(self.prefix(i))];
+                let mut spans = vec![Span::styled(self.prefix(i), self.prompt_style)];
                 if i == caret_row {
                     let before: String = row.graphemes[..caret_col].concat();
                     if !before.is_empty() {

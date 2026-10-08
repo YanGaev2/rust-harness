@@ -864,6 +864,189 @@ fn tool_summary_counts_multi_line_results() {
     );
 }
 
+fn started(app: &mut ChatApp, id: &str, name: &str, arguments: serde_json::Value) {
+    app.push_agent_event(&AgentEvent::ToolCallStarted {
+        round: 1,
+        id: id.to_string(),
+        name: name.to_string(),
+        arguments,
+    });
+}
+
+fn card_rows(app: &ChatApp, width: usize) -> Vec<String> {
+    app.panel_lines(width, 40)
+        .iter()
+        .map(Line::text)
+        .filter(|row| !row.is_empty())
+        .collect()
+}
+
+#[test]
+fn running_card_shows_a_spinner_and_the_headline_argument() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "read_file",
+        json!({"file_path": "src/chat.rs"}),
+    );
+    let rows = card_rows(&app, 80);
+    let card = rows
+        .iter()
+        .find(|row| row.contains("file.read"))
+        .expect("card row");
+    assert!(card.contains("file.read src/chat.rs"), "{card:?}");
+    assert!(!card.contains('{'), "no raw JSON on the card: {card:?}");
+    assert!(
+        harness_tui::components::spinner::FRAMES
+            .iter()
+            .any(|frame| card.starts_with(frame)),
+        "running card leads with a spinner frame: {card:?}"
+    );
+}
+
+#[test]
+fn search_card_shows_pattern_and_path() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "grep",
+        json!({"pattern": "fn main", "path": "src"}),
+    );
+    let rows = card_rows(&app, 80);
+    assert!(
+        rows.iter().any(|row| row.contains("fn main · src")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn shell_card_shows_the_output_tail_and_a_failing_exit_code() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "shell.exec",
+        json!({"command": "cargo test"}),
+    );
+    let output: String = (1..=8).map(|i| format!("line {i}\r\n")).collect();
+    app.push_agent_event(&AgentEvent::ToolResult(ToolBatchResult {
+        metadata: json!({"exit_code": 101}),
+        ..ok_result("c1", "shell.exec", &output)
+    }));
+    let rows = card_rows(&app, 80);
+    let card = rows
+        .iter()
+        .position(|row| row.contains("shell.exec cargo test"))
+        .unwrap();
+    assert!(rows[card].starts_with("✓ "), "{:?}", rows[card]);
+    assert_eq!(rows[card + 1], "  ⎿ … +3 earlier lines");
+    assert_eq!(rows[card + 2], "    line 4");
+    assert_eq!(rows[card + 6], "    line 8");
+    assert_eq!(rows[card + 7], "    exit 101");
+}
+
+#[test]
+fn edit_card_shows_a_colored_diff_from_the_call_arguments() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "edit_file",
+        json!({"path": "a.txt", "old_string": "beta", "new_string": "BETA\nbeta2"}),
+    );
+    app.push_agent_event(&AgentEvent::ToolResult(ok_result(
+        "c1",
+        "file.replace",
+        "replaced 1 occurrence(s) in a.txt",
+    )));
+    let lines = app.panel_lines(40, 40);
+    let rows: Vec<String> = lines.iter().map(Line::text).collect();
+    let card = rows
+        .iter()
+        .position(|row| row.contains("file.replace a.txt"))
+        .unwrap();
+    assert_eq!(rows[card + 1], "  ⎿ −1 +2");
+    assert!(rows[card + 2].starts_with("    - beta"), "{rows:?}");
+    assert!(rows[card + 3].starts_with("    + BETA"));
+    assert!(rows[card + 4].starts_with("    + beta2"));
+    let removed = &lines[card + 2];
+    assert_eq!(removed.width(), 40, "diff rows span the width");
+    assert!(
+        removed.spans[1..]
+            .iter()
+            .all(|span| span.style.bg != Color::Default),
+        "diff rows sit on a tinted background: {removed:?}"
+    );
+}
+
+#[test]
+fn read_card_reports_size_not_the_first_line() {
+    let mut app = app();
+    started(&mut app, "c1", "file.read", json!({"path": "a.txt"}));
+    app.push_agent_event(&AgentEvent::ToolResult(ok_result(
+        "c1",
+        "file.read",
+        "alpha\nbeta\ngamma\n",
+    )));
+    let rows = card_rows(&app, 80);
+    assert!(rows.iter().any(|row| row == "  ⎿ 3 lines"), "{rows:?}");
+    assert!(!rows.iter().any(|row| row.contains("alpha")), "{rows:?}");
+}
+
+#[test]
+fn failed_card_shows_the_error_in_the_error_color() {
+    let mut app = app();
+    started(&mut app, "c1", "file.read", json!({"path": "missing.txt"}));
+    app.push_agent_event(&AgentEvent::ToolResult(ToolBatchResult {
+        ok: false,
+        error: Some("file not found: missing.txt".to_string()),
+        ..ok_result("c1", "file.read", "")
+    }));
+    let lines = app.panel_lines(80, 40);
+    let error = lines
+        .iter()
+        .find(|line| line.text().contains("file not found"))
+        .expect("error row");
+    assert!(error.text().starts_with("  ⎿ "), "{:?}", error.text());
+    assert_ne!(error.spans[0].style.fg, Color::Default);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.text().starts_with("✗ file.read missing.txt"))
+    );
+}
+
+#[test]
+fn run_end_marks_unfinished_calls_interrupted() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "shell.exec",
+        json!({"command": "sleep 100"}),
+    );
+    app.set_busy(false);
+    let flushed: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    assert!(
+        flushed
+            .iter()
+            .any(|row| row.starts_with("○ shell.exec sleep 100")),
+        "{flushed:?}"
+    );
+    assert!(
+        flushed.iter().any(|row| row == "  ⎿ interrupted"),
+        "{flushed:?}"
+    );
+    assert!(app.transcript_text().contains("○ shell.exec"));
+}
+
 #[test]
 fn final_deltas_coalesce_into_one_assistant_entry() {
     let mut app = app();

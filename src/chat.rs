@@ -14,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use harness_tui::components::editor::Editor;
 use harness_tui::components::menu::{MenuItem, menu_lines};
-use harness_tui::components::spinner::{format_elapsed, spinner_lines};
+use harness_tui::components::spinner::{FRAMES, format_elapsed, spinner_lines};
 use harness_tui::components::status::status_line;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Line, Span, Style, visible_width, wrap_hanging};
+use harness_tui::text::{Line, Span, Style, truncate, visible_width, wrap_hanging};
 use harness_tui::theme::Theme;
 
 /// What the event loop should do after the app handled an input event.
@@ -156,15 +156,44 @@ enum ToolStatus {
     Running,
     Ok,
     Failed,
+    /// The run ended (Esc, error) before this call reported a result.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ToolEntry {
     id: String,
     name: String,
+    /// Compact JSON of the arguments (plain projection).
     args: String,
+    /// What a human scans for: the command, query, path or URL.
+    headline: String,
+    arguments: serde_json::Value,
     status: ToolStatus,
+    started: Instant,
+    elapsed: Option<Duration>,
+    /// One-line result (plain projection; the card's fallback detail).
     summary: Option<String>,
+    detail: ToolDetail,
+}
+
+/// Result preview drawn under a tool card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolDetail {
+    /// Only the one-line summary.
+    Summary,
+    /// The newest output rows of a command and how many earlier rows were
+    /// cut; a non-zero exit code is shown under them.
+    Output {
+        tail: Vec<String>,
+        hidden: usize,
+        exit_code: Option<i64>,
+    },
+    /// An edit: the replaced text and its replacement.
+    Diff {
+        removed: Vec<String>,
+        added: Vec<String>,
+    },
 }
 
 /// A reasoning block. While it streams (`elapsed` unset) the panel shows a
@@ -427,6 +456,7 @@ impl ChatApp {
         self.stream_activity = busy.then(Instant::now);
         if !busy {
             self.close_thinking();
+            self.cancel_running_tools();
             self.git_branch = git_branch(&self.workspace);
         }
     }
@@ -1004,6 +1034,22 @@ impl ChatApp {
         }
     }
 
+    /// A run that ended while calls were still running never reports their
+    /// results: mark those cards cancelled so they stop spinning.
+    fn cancel_running_tools(&mut self) {
+        // Running cards are never flushed, so only the live tail can hold them.
+        let live_from = self.emitted.min(self.transcript.len());
+        for entry in &mut self.transcript[live_from..] {
+            if let ChatEntry::Tool(tool) = entry
+                && tool.status == ToolStatus::Running
+            {
+                tool.status = ToolStatus::Cancelled;
+                tool.elapsed = Some(tool.started.elapsed());
+                tool.summary = Some("interrupted".to_string());
+            }
+        }
+    }
+
     /// Stop the clock of a reasoning block that is still streaming: it is
     /// final from now on and renders as its collapsed summary.
     fn close_thinking(&mut self) {
@@ -1110,8 +1156,13 @@ impl ChatApp {
                     id: id.clone(),
                     name: display_tool_name(name),
                     args: compact_json_args(arguments),
+                    headline: tool_headline(arguments),
+                    arguments: arguments.clone(),
                     status: ToolStatus::Running,
+                    started: Instant::now(),
+                    elapsed: None,
                     summary: None,
+                    detail: ToolDetail::Summary,
                 }));
             }
             AgentEvent::ToolResult(result) => {
@@ -1153,7 +1204,6 @@ impl ChatApp {
         } else {
             ToolStatus::Failed
         };
-        let summary = tool_result_summary(result);
         let pending = self
             .transcript
             .iter_mut()
@@ -1169,15 +1219,26 @@ impl ChatApp {
         match pending {
             Some(tool) => {
                 tool.status = status;
-                tool.summary = summary;
+                tool.elapsed = Some(tool.started.elapsed());
+                tool.summary = tool_result_summary(&tool.name, &tool.arguments, result);
+                tool.detail = tool_detail(&tool.name, &tool.arguments, result);
             }
-            None => self.transcript.push(ChatEntry::Tool(ToolEntry {
-                id: result.id.clone(),
-                name: display_tool_name(&result.tool_name),
-                args: String::new(),
-                status,
-                summary,
-            })),
+            None => {
+                let name = display_tool_name(&result.tool_name);
+                let arguments = serde_json::Value::Null;
+                self.transcript.push(ChatEntry::Tool(ToolEntry {
+                    id: result.id.clone(),
+                    summary: tool_result_summary(&name, &arguments, result),
+                    detail: tool_detail(&name, &arguments, result),
+                    name,
+                    args: String::new(),
+                    headline: String::new(),
+                    arguments,
+                    status,
+                    started: Instant::now(),
+                    elapsed: None,
+                }));
+            }
         }
         // Surface the self-correction memo so the user sees how the next call
         // should be shaped (the "forgiving tools" feedback loop).
@@ -1224,7 +1285,7 @@ impl ChatApp {
             if !live.is_empty() {
                 live.push(Line::default());
             }
-            live.extend(entry_lines(entry, width, &self.theme));
+            live.extend(entry_lines(entry, width, &self.theme, self.spinner_frame));
         }
         // Over the cap, keep the tail — the newest rows matter while streaming.
         if live.len() > max_live_rows {
@@ -1324,7 +1385,7 @@ impl ChatApp {
         }
         let mut lines = Vec::new();
         for entry in &self.transcript[self.emitted..limit] {
-            lines.extend(entry_lines(entry, width, &self.theme));
+            lines.extend(entry_lines(entry, width, &self.theme, self.spinner_frame));
             lines.push(Line::default());
         }
         (lines, limit)
@@ -1349,7 +1410,7 @@ impl ChatApp {
             .iter()
             .rev()
         {
-            let mut segment = entry_lines(entry, width, &self.theme);
+            let mut segment = entry_lines(entry, width, &self.theme, self.spinner_frame);
             segment.push(Line::default());
             total += segment.len();
             segments.push(segment);
@@ -1383,7 +1444,7 @@ impl ChatApp {
             ChatEntry::Assistant { text, .. } if self.streaming_assistant => text,
             _ => return,
         };
-        if entry_lines(last, width, &self.theme).len() <= max_live_rows {
+        if entry_lines(last, width, &self.theme, self.spinner_frame).len() <= max_live_rows {
             return;
         }
         let Some(split) = safe_split_point(streaming_text) else {
@@ -1671,7 +1732,7 @@ fn palette_lines(theme: &Theme) -> Vec<Line> {
 /// continuation rows hanging under the entry's marker: `›` on a full-width
 /// strip for user turns, unmarked indented markdown for answers, muted
 /// reasoning, status-marked tool cards.
-fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme) -> Vec<Line> {
+fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme, frame: usize) -> Vec<Line> {
     let styled = match entry {
         ChatEntry::User(text) => return user_lines(text, width, theme),
         ChatEntry::Banner {
@@ -1694,7 +1755,7 @@ fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme) -> Vec<Line> {
                 spans: vec![Span::styled("· ", style), Span::styled(text.clone(), style)],
             }]
         }
-        ChatEntry::Tool(tool) => tool_card_lines(tool, theme),
+        ChatEntry::Tool(tool) => return tool_card_lines(tool, width, theme, frame),
     };
     styled
         .into_iter()
@@ -1779,25 +1840,126 @@ fn indent_line(line: Line, pad: &str) -> Line {
     Line { spans }
 }
 
-fn tool_card_lines(tool: &ToolEntry, theme: &Theme) -> Vec<Line> {
-    // The marker carries the status color; the tool name stays neutral
-    // bold so the eye scans markers, not a rainbow of glyphs.
+/// Output rows kept under a command card.
+const OUTPUT_TAIL_ROWS: usize = 5;
+/// Diff rows shown under an edit card before `… +N lines`.
+const DIFF_MAX_ROWS: usize = 10;
+
+/// A tool call: status glyph (spinner while running, then `✓` / `✗` /
+/// `○`), the tool name in bold, its headline argument, the elapsed time
+/// for slow calls, and a result preview — the tail of a command's output,
+/// an edit's diff, or a one-line summary.
+fn tool_card_lines(tool: &ToolEntry, width: usize, theme: &Theme, frame: usize) -> Vec<Line> {
     let muted = Style::fg(theme.muted);
-    let marker_style = match tool.status {
-        ToolStatus::Running => muted,
-        ToolStatus::Ok => Style::fg(theme.success),
-        ToolStatus::Failed => Style::fg(theme.error),
+    let (glyph, glyph_style) = match tool.status {
+        ToolStatus::Running => (FRAMES[frame % FRAMES.len()], Style::fg(theme.accent)),
+        ToolStatus::Ok => ("✓", Style::fg(theme.success)),
+        ToolStatus::Failed => ("✗", Style::fg(theme.error)),
+        ToolStatus::Cancelled => ("○", muted),
     };
     let mut spans = vec![
-        Span::styled("● ", marker_style),
+        Span::styled(format!("{glyph} "), glyph_style),
         Span::styled(tool.name.clone(), Style::default().bold()),
     ];
-    if !tool.args.is_empty() {
-        spans.push(Span::styled(format!("({})", tool.args), muted));
+    if !tool.headline.is_empty() {
+        spans.push(Span::styled(format!(" {}", tool.headline), muted));
     }
-    let mut lines = vec![Line { spans }];
-    if let Some(summary) = &tool.summary {
-        lines.push(Line::styled(format!("  ⎿ {summary}"), muted));
+    let elapsed = tool.elapsed.unwrap_or_else(|| tool.started.elapsed());
+    if elapsed.as_secs() >= 2 {
+        spans.push(Span::styled(
+            format!(" · {}", format_elapsed(elapsed.as_secs())),
+            muted,
+        ));
+    }
+    let mut lines = wrap_hanging(&Line { spans }, width, 2);
+
+    let first_row = |text: String| format!("  ⎿ {text}");
+    match (&tool.status, &tool.detail) {
+        (ToolStatus::Failed, _) => {
+            let error = tool.summary.clone().unwrap_or_else(|| "failed".to_string());
+            lines.push(truncate(
+                &Line::styled(first_row(error), Style::fg(theme.error)),
+                width,
+            ));
+        }
+        (
+            _,
+            ToolDetail::Output {
+                tail,
+                hidden,
+                exit_code,
+            },
+        ) => {
+            let mut rows: Vec<String> = Vec::new();
+            if *hidden > 0 {
+                rows.push(format!("… +{hidden} earlier lines"));
+            }
+            rows.extend(tail.iter().cloned());
+            if rows.is_empty() {
+                rows.push("no output".to_string());
+            }
+            for (index, row) in rows.into_iter().enumerate() {
+                let text = if index == 0 {
+                    first_row(row)
+                } else {
+                    format!("    {row}")
+                };
+                lines.push(truncate(&Line::styled(text, muted), width));
+            }
+            if let Some(code) = exit_code.filter(|code| *code != 0) {
+                lines.push(Line::styled(
+                    format!("    exit {code}"),
+                    Style::fg(theme.error),
+                ));
+            }
+        }
+        (_, ToolDetail::Diff { removed, added }) => {
+            lines.push(Line::styled(
+                first_row(format!("−{} +{}", removed.len(), added.len())),
+                muted,
+            ));
+            let rows = removed
+                .iter()
+                .map(|text| ('-', text, theme.diff_del, theme.diff_del_bg))
+                .chain(
+                    added
+                        .iter()
+                        .map(|text| ('+', text, theme.diff_add, theme.diff_add_bg)),
+                );
+            let total = removed.len() + added.len();
+            for (sign, text, sign_color, background) in rows.take(DIFF_MAX_ROWS) {
+                let row = Line {
+                    spans: vec![
+                        Span::raw("    "),
+                        Span::styled(format!("{sign} "), Style::fg(sign_color).bg(background)),
+                        Span::styled(text.clone(), Style::default().bg(background)),
+                    ],
+                };
+                let mut row = truncate(&row, width);
+                let used = row.width();
+                if used < width {
+                    row.spans.push(Span::styled(
+                        " ".repeat(width - used),
+                        Style::default().bg(background),
+                    ));
+                }
+                lines.push(row);
+            }
+            if total > DIFF_MAX_ROWS {
+                lines.push(Line::styled(
+                    format!("    … +{} lines", total - DIFF_MAX_ROWS),
+                    muted,
+                ));
+            }
+        }
+        (_, ToolDetail::Summary) => {
+            if let Some(summary) = &tool.summary {
+                lines.push(truncate(
+                    &Line::styled(first_row(summary.clone()), muted),
+                    width,
+                ));
+            }
+        }
     }
     lines
 }
@@ -2168,6 +2330,7 @@ fn entry_plain_lines(entry: &ChatEntry) -> Vec<String> {
                 ToolStatus::Running => "→",
                 ToolStatus::Ok => "✓",
                 ToolStatus::Failed => "✗",
+                ToolStatus::Cancelled => "○",
             };
             let mut line = format!("{glyph} {}", tool.name);
             if !tool.args.is_empty() {
@@ -2198,7 +2361,117 @@ fn display_tool_name(name: &str) -> String {
     crate::runtime::canonical_tool_name(name).unwrap_or_else(|| name.to_string())
 }
 
-fn tool_result_summary(result: &crate::runtime::ToolBatchResult) -> Option<String> {
+/// The argument a human scans for on a card: the command, query or URL,
+/// the path it applies to, or `primary · path` when both are present
+/// (a search pattern and where it searches). Falls back to compact JSON.
+fn tool_headline(arguments: &serde_json::Value) -> String {
+    const PRIMARY: &[&str] = &["command", "cmd", "query", "pattern", "url"];
+    let Some(map) = arguments.as_object() else {
+        return compact_json_args(arguments);
+    };
+    let first = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| map.get(*key).and_then(serde_json::Value::as_str))
+            .map(|value| crate::repl::summarize_one_line(value, 80))
+    };
+    match (first(PRIMARY), first(crate::runtime::PATH_ALIASES)) {
+        (Some(primary), Some(path)) => format!("{primary} · {path}"),
+        (Some(primary), None) => primary,
+        (None, Some(path)) => path,
+        (None, None) => compact_json_args(arguments),
+    }
+}
+
+/// First string argument found under any of `keys`.
+fn string_argument<'a>(arguments: &'a serde_json::Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| arguments.get(*key).and_then(serde_json::Value::as_str))
+}
+
+/// The preview under a finished card: a command's output tail, an edit's
+/// diff (from the call's own arguments — the result only counts
+/// replacements), or the summary line.
+fn tool_detail(
+    name: &str,
+    arguments: &serde_json::Value,
+    result: &crate::runtime::ToolBatchResult,
+) -> ToolDetail {
+    if !result.ok {
+        return ToolDetail::Summary;
+    }
+    match name {
+        "shell.exec" => {
+            let mut rows: Vec<String> = result
+                .content
+                .lines()
+                .map(|line| line.trim_end().to_string())
+                .collect();
+            while rows.last().is_some_and(String::is_empty) {
+                rows.pop();
+            }
+            let hidden = rows.len().saturating_sub(OUTPUT_TAIL_ROWS);
+            ToolDetail::Output {
+                tail: rows.split_off(hidden),
+                hidden,
+                exit_code: result
+                    .metadata
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64),
+            }
+        }
+        "file.replace" => {
+            let old = string_argument(arguments, crate::runtime::REPLACE_OLD_ALIASES);
+            let new = string_argument(arguments, crate::runtime::REPLACE_NEW_ALIASES);
+            match (old, new) {
+                (Some(old), Some(new)) => ToolDetail::Diff {
+                    removed: old.lines().map(str::to_string).collect(),
+                    added: new.lines().map(str::to_string).collect(),
+                },
+                _ => ToolDetail::Summary,
+            }
+        }
+        _ => ToolDetail::Summary,
+    }
+}
+
+/// One-line result for the plain projection and summary-only cards.
+fn tool_result_summary(
+    name: &str,
+    arguments: &serde_json::Value,
+    result: &crate::runtime::ToolBatchResult,
+) -> Option<String> {
+    if result.ok {
+        match name {
+            // The file's first line says nothing about a read; its size does.
+            "file.read" => {
+                let lines = result.content.lines().count();
+                let truncated = result
+                    .metadata
+                    .get("truncated")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                return Some(format!(
+                    "{lines} lines{}",
+                    if truncated { " · truncated" } else { "" }
+                ));
+            }
+            "file.write" | "file.append" => {
+                if let Some(content) = string_argument(arguments, crate::runtime::CONTENT_ALIASES) {
+                    let verb = if name == "file.write" {
+                        "wrote"
+                    } else {
+                        "appended"
+                    };
+                    return Some(format!("{verb} {} lines", content.lines().count()));
+                }
+            }
+            _ => {}
+        }
+    }
+    generic_result_summary(result)
+}
+
+fn generic_result_summary(result: &crate::runtime::ToolBatchResult) -> Option<String> {
     if !result.ok {
         let error = result.error.clone().unwrap_or_else(|| "failed".to_string());
         return Some(crate::repl::summarize_one_line(&error, 100));

@@ -260,6 +260,31 @@ pub fn wrap_hanging(line: &Line, width: usize, indent: usize) -> Vec<Line> {
     rows
 }
 
+/// Cut a line to at most `width` columns, ending in `…` when anything was
+/// dropped. Grapheme-cluster and display-width aware; span styles survive.
+pub fn truncate(line: &Line, width: usize) -> Line {
+    if line.width() <= width {
+        return line.clone();
+    }
+    let budget = width.saturating_sub(1);
+    let mut used = 0usize;
+    let mut kept = Vec::new();
+    for cell in line_cells(line) {
+        if used + cell.width > budget {
+            break;
+        }
+        used += cell.width;
+        kept.push(cell);
+    }
+    let style = kept.last().map(|cell| cell.style).unwrap_or_default();
+    let mut truncated = cells_to_line(kept);
+    match truncated.spans.last_mut() {
+        Some(span) => span.text.push('…'),
+        None => truncated.spans.push(Span::styled("…", style)),
+    }
+    truncated
+}
+
 impl Style {
     /// Full SGR escape sequence for this style, or an empty string for
     /// plain text. Attribute order: bold, dim, italic, underline,

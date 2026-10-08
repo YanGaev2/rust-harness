@@ -429,7 +429,7 @@ impl ToolRuntime {
         mode: WriteMode,
     ) -> Result<ToolCallResult, RuntimeError> {
         let path = string_arg(&call.arguments, PATH_ALIASES)?;
-        let content = string_arg(&call.arguments, &["content", "text", "body", "contents"])?;
+        let content = string_arg(&call.arguments, CONTENT_ALIASES)?;
         let result = FileTool::new(&self.workspace).write_text(&path, &content, mode)?;
         Ok(ToolCallResult {
             id: call.id,
@@ -450,30 +450,8 @@ impl ToolRuntime {
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
         let path = string_arg(&call.arguments, PATH_ALIASES)?;
-        let old_text = string_arg(
-            &call.arguments,
-            &[
-                "old_text",
-                "old",
-                "find",
-                "search",
-                "old_string",
-                "old_str",
-                "text_to_replace",
-            ],
-        )?;
-        let new_text = string_arg(
-            &call.arguments,
-            &[
-                "new_text",
-                "new",
-                "replacement",
-                "replace",
-                "with",
-                "new_string",
-                "new_str",
-            ],
-        )?;
+        let old_text = string_arg(&call.arguments, REPLACE_OLD_ALIASES)?;
+        let new_text = string_arg(&call.arguments, REPLACE_NEW_ALIASES)?;
         let max_replacements =
             optional_usize_arg(&call.arguments, &["max_replacements", "limit", "count"])
                 .unwrap_or(1);
@@ -1156,15 +1134,34 @@ fn batch_mutates_shared_paths(calls: &[ToolCall]) -> bool {
     false
 }
 
-/// Path-argument aliases shared by the file executors and the batch conflict
-/// detector — a single list so the two can never drift apart.
-const PATH_ALIASES: &[&str] = &[
+/// Argument aliases shared by the executors, the batch conflict detector and
+/// the chat's tool cards — single lists so they can never drift apart.
+pub(crate) const PATH_ALIASES: &[&str] = &[
     "path",
     "file",
     "filename",
     "file_path",
     "filepath",
     "target_file",
+];
+pub(crate) const CONTENT_ALIASES: &[&str] = &["content", "text", "body", "contents"];
+pub(crate) const REPLACE_OLD_ALIASES: &[&str] = &[
+    "old_text",
+    "old",
+    "find",
+    "search",
+    "old_string",
+    "old_str",
+    "text_to_replace",
+];
+pub(crate) const REPLACE_NEW_ALIASES: &[&str] = &[
+    "new_text",
+    "new",
+    "replacement",
+    "replace",
+    "with",
+    "new_string",
+    "new_str",
 ];
 const MOVE_SOURCE_ALIASES: &[&str] = &["source", "from", "path", "file", "src", "source_path"];
 const MOVE_TARGET_ALIASES: &[&str] = &[

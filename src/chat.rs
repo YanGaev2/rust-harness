@@ -1740,7 +1740,7 @@ fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme, frame: usize) -> 
             model,
             workspace,
         } => banner_lines(version, model, workspace, theme),
-        ChatEntry::Assistant { text, .. } => markdown_lines(text, theme)
+        ChatEntry::Assistant { text, .. } => markdown_lines(text.trim_end(), theme)
             .into_iter()
             .map(|line| indent_line(line, "  "))
             .collect(),

@@ -1169,6 +1169,15 @@ fn assistant_answer_is_unmarked_and_code_copies_clean() {
 }
 
 #[test]
+fn answer_trailing_newlines_add_no_extra_blank_rows() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta("done.\n\n".to_string()));
+    let rows: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    // The answer row, then exactly one separator row.
+    assert_eq!(rows, vec!["  done.".to_string(), String::new()]);
+}
+
+#[test]
 fn ordered_list_items_hang_under_their_text() {
     let mut app = app();
     app.push_agent_event(&AgentEvent::FinalContentDelta(

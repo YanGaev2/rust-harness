@@ -138,6 +138,18 @@ pub struct ClipboardAttachment {
     pub prompt_fragment: String,
 }
 
+impl ClipboardAttachment {
+    /// The pasted text of a plain-text capture — the prompt fragment minus
+    /// its "clipboard text:" header. `None` for images and other kinds, so
+    /// consumers fall back to the full fragment.
+    pub fn inline_text(&self) -> Option<&str> {
+        if self.kind != "text" {
+            return None;
+        }
+        self.prompt_fragment.strip_prefix("clipboard text:\n")
+    }
+}
+
 #[derive(Debug)]
 pub enum ClipboardError {
     Io(std::io::Error),

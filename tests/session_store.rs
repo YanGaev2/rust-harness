@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::PathBuf;
 
-use harness_cli::agent::{AgentRunResult, AgentTrace, AgentTraceEvent, AgentTraceToolCall};
+use harness_cli::agent::{
+    AgentError, AgentRunResult, AgentTrace, AgentTraceEvent, AgentTraceToolCall,
+};
+use harness_cli::chat_client::{ChatClientError, WireEvent};
 use harness_cli::request::{ChatMessage, MessageToolCall};
 use harness_cli::runtime::ToolBatchResult;
 use harness_cli::session::{
@@ -55,13 +58,16 @@ fn canned_trace() -> AgentTrace {
 }
 
 /// The messages `append_run(canned_trace())` must persist, in provider order.
+/// The thinking record preceding the tool-call turn is also attached to that
+/// message, so a resumed session can keep replaying reasoning to the model.
 fn canned_trace_messages() -> Vec<ChatMessage> {
     vec![
         ChatMessage::assistant_tool_calls(vec![MessageToolCall::new(
             "call-1",
             "file_read",
             json!({"path": "src/main.rs"}),
-        )]),
+        )])
+        .with_reasoning("смотрю на падающий тест"),
         ChatMessage::tool_result(
             "call-1",
             serde_json::to_string(&ToolBatchResult {
@@ -300,6 +306,35 @@ fn canned_run_result() -> AgentRunResult {
 }
 
 #[test]
+fn failed_turn_keeps_user_message_and_partial_reply_in_history() {
+    // kimi-2, 2026-08-08: a stream timeout used to roll the in-memory history
+    // back to the last complete exchange — for a first turn, to nothing — so
+    // the follow-up "Продолжай" went out with an empty conversation. The
+    // failed turn (user message + partial assistant text and thinking) must
+    // stay in the history the next request is built from.
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = PathBuf::from("F:\\rust-harness");
+    let mut chat = ChatSession::start(Some(store_in(&dir)), &workspace, "kimi", "kimi-k3");
+
+    chat.begin_turn("сделай видеоредактор");
+    let messages = vec![
+        ChatMessage::user("сделай видеоредактор"),
+        ChatMessage::assistant("начал ответ").with_reasoning("долгое планирование"),
+    ];
+    let err = AgentError::Chat {
+        source: ChatClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "stream ended without completion",
+        )),
+        trace: Box::new(canned_trace()),
+        messages: messages.clone(),
+    };
+    chat.fail_turn(&err);
+
+    assert_eq!(chat.history(), messages);
+}
+
+#[test]
 fn chat_session_persists_turns_and_resumes_across_restarts() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = PathBuf::from("F:\\rust-harness");
@@ -423,4 +458,67 @@ fn workspace_slug_sanitizes_path_characters() {
         workspace_slug(&PathBuf::from("F:\\rust-harness")),
         "F--rust-harness"
     );
+}
+
+#[test]
+fn wire_log_appends_raw_wire_events_as_jsonl() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store_in(&dir);
+    let session = store
+        .create_session(&PathBuf::from(r"F:\demo"), "kimi", "kimi-k3")
+        .unwrap();
+    let log = store.wire_log_for(&session);
+
+    let url = "http://provider/v1/chat/completions";
+    log.append_event(WireEvent::Request {
+        url,
+        body: r#"{"model":"kimi-k3"}"#,
+    })
+    .unwrap();
+    log.append_event(WireEvent::SseData {
+        url,
+        data: r#"{"choices":[]}"#,
+    })
+    .unwrap();
+    log.append_event(WireEvent::Response {
+        url,
+        body: r#"{"choices":[]}"#,
+    })
+    .unwrap();
+
+    // Лог лежит в <root>/raw/ под тем же именем файла, что и сессия.
+    let expected = dir
+        .path()
+        .join("projects")
+        .join("test-workspace")
+        .join("raw")
+        .join(session.file_name());
+    assert_eq!(log.path(), expected.as_path());
+    let content = fs::read_to_string(&expected).unwrap();
+    let lines: Vec<Value> = content
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[0]["kind"], "request");
+    assert_eq!(lines[0]["url"], url);
+    assert_eq!(lines[0]["body"], r#"{"model":"kimi-k3"}"#);
+    assert!(lines[0]["ts"].is_string());
+    assert_eq!(lines[1]["kind"], "sse");
+    assert_eq!(lines[2]["kind"], "response");
+}
+
+#[test]
+fn chat_session_exposes_wire_log_only_when_persistence_is_active() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = PathBuf::from(r"F:\demo");
+
+    let chat = ChatSession::start(Some(store_in(&dir)), &workspace, "kimi", "kimi-k3");
+    let log = chat
+        .wire_log()
+        .expect("disk session must expose a wire log");
+    assert!(log.path().parent().unwrap().ends_with("raw"));
+
+    let memory_only = ChatSession::start(None, &workspace, "kimi", "kimi-k3");
+    assert!(memory_only.wire_log().is_none());
 }

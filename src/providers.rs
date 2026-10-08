@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -270,6 +269,17 @@ pub enum BuiltinProvider {
 }
 
 impl BuiltinProvider {
+    /// Every builtin family, in the order UIs list them. The single roster —
+    /// the setup TUI and `provider subscriptions` derive from it.
+    pub const ALL: &[Self] = &[
+        Self::Codex,
+        Self::Xiaomi,
+        Self::Glm,
+        Self::Kimi,
+        Self::Claude,
+        Self::DeepSeek,
+    ];
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "codex" => Some(Self::Codex),
@@ -426,36 +436,6 @@ pub fn builtin_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct ProviderRegistry {
-    providers: BTreeMap<String, ProviderConfig>,
-}
-
-impl ProviderRegistry {
-    pub fn with_builtin_subscriptions() -> Self {
-        let mut registry = Self::default();
-        for provider in [
-            BuiltinProvider::Codex,
-            BuiltinProvider::Xiaomi,
-            BuiltinProvider::Glm,
-            BuiltinProvider::Kimi,
-            BuiltinProvider::Claude,
-            BuiltinProvider::DeepSeek,
-        ] {
-            registry.add_provider(ProviderConfig::from_profile(provider.profile()));
-        }
-        registry
-    }
-
-    pub fn add_provider(&mut self, provider: ProviderConfig) {
-        self.providers.insert(provider.name.clone(), provider);
-    }
-
-    pub fn get(&self, name: &str) -> Option<&ProviderConfig> {
-        self.providers.get(name)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelChoice {
     AddAll,
@@ -513,6 +493,32 @@ impl ModelDiscovery {
 /// owned by exactly one provider, then a brand-new model on the active
 /// provider. Ambiguous model names fall through to the active provider so a
 /// duplicate name never silently switches providers.
+/// Resolve a `/model` argument shared by both front ends: a number is a
+/// 1-based index into the flattened (provider, model) menu, anything else
+/// goes through [`resolve_model_shorthand`].
+pub fn resolve_model_arg(
+    catalog: &[(String, Vec<String>)],
+    active_provider: &str,
+    arg: &str,
+) -> Result<(String, String), String> {
+    if let Ok(number) = arg.parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .and_then(|index| {
+                catalog
+                    .iter()
+                    .flat_map(|(provider, models)| {
+                        models
+                            .iter()
+                            .map(move |model| (provider.clone(), model.clone()))
+                    })
+                    .nth(index)
+            })
+            .ok_or_else(|| format!("no menu entry {number} (run /model to see the list)"));
+    }
+    resolve_model_shorthand(catalog, active_provider, arg)
+}
+
 pub fn resolve_model_shorthand(
     catalog: &[(String, Vec<String>)],
     active_provider: &str,

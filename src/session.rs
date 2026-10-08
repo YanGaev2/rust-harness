@@ -19,6 +19,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentError, AgentRunResult, AgentTrace, AgentTraceEvent};
+use crate::chat_client::WireEvent;
 use crate::request::{ChatMessage, MessageToolCall};
 
 /// Storage root for one workspace: `<root>/sessions/*.jsonl` + `<root>/traces/*.json`.
@@ -146,6 +147,13 @@ impl SessionStore {
         }))
     }
 
+    /// Raw wire log matched to a session: `<root>/raw/<session file name>`.
+    pub fn wire_log_for(&self, session: &Session) -> WireLog {
+        WireLog {
+            path: self.root.join("raw").join(session.file_name()),
+        }
+    }
+
     /// Persist one agent run: `traces/<ts>_<provider>_r<turn>.json`.
     pub fn write_trace(&self, wrapper: &TraceWrapper) -> Result<PathBuf, SessionError> {
         let traces = self.traces_dir();
@@ -203,6 +211,9 @@ impl Session {
     /// calls, results, and the final answer in provider order. The user message
     /// is NOT written here — `append_user` already did.
     pub fn append_run(&mut self, trace: &AgentTrace) -> Result<(), SessionError> {
+        // Thinking precedes its assistant turn in the trace; carrying it onto
+        // that message keeps reasoning replayable after a session resume.
+        let mut pending_thinking: Option<String> = None;
         for event in &trace.events {
             match event {
                 AgentTraceEvent::Thinking { content } => {
@@ -210,6 +221,7 @@ impl Session {
                         content: content.clone(),
                         ts: now_timestamp(),
                     })?;
+                    pending_thinking = Some(content.clone());
                 }
                 AgentTraceEvent::ModelToolCalls { calls, .. } => {
                     let tool_calls = calls
@@ -218,8 +230,12 @@ impl Session {
                             MessageToolCall::new(&call.id, &call.name, call.arguments.clone())
                         })
                         .collect();
+                    let mut message = ChatMessage::assistant_tool_calls(tool_calls);
+                    if let Some(thinking) = pending_thinking.take() {
+                        message = message.with_reasoning(thinking);
+                    }
                     self.append_record(SessionRecord::Message {
-                        message: ChatMessage::assistant_tool_calls(tool_calls),
+                        message,
                         ts: now_timestamp(),
                     })?;
                 }
@@ -233,8 +249,12 @@ impl Session {
                 }
                 AgentTraceEvent::FinalContent { content } => {
                     if let Some(content) = content {
+                        let mut message = ChatMessage::assistant(content);
+                        if let Some(thinking) = pending_thinking.take() {
+                            message = message.with_reasoning(thinking);
+                        }
                         self.append_record(SessionRecord::Message {
-                            message: ChatMessage::assistant(content),
+                            message,
                             ts: now_timestamp(),
                         })?;
                     }
@@ -376,6 +396,14 @@ impl ChatSession {
         self.history.clone()
     }
 
+    /// Raw wire log for the active disk session, when persistence is on.
+    /// The REPL feeds it via `AgentRunner::with_wire_tap`.
+    pub fn wire_log(&self) -> Option<WireLog> {
+        let store = self.store.as_ref()?;
+        let session = self.disk.as_ref()?;
+        Some(store.wire_log_for(session))
+    }
+
     /// Warnings and status lines accumulated since the last call; the UI drains
     /// and renders them however it likes.
     pub fn take_notices(&mut self) -> Vec<String> {
@@ -398,10 +426,18 @@ impl ChatSession {
         self.persist_run(&result.trace);
     }
 
-    /// A failed run still leaves a trace worth keeping (e.g. max tool rounds
-    /// exceeded); the in-memory history stays at the last complete exchange.
+    /// A failed run keeps what it can. When the error carries the
+    /// conversation (stream cut, cancel, max tool rounds), the in-memory
+    /// history adopts it — the user message and any partial assistant
+    /// text/thinking stay in context, so a follow-up "продолжай" resumes the
+    /// turn instead of starting from a blank conversation (kimi-2 loss,
+    /// 2026-08-08). Internal errors without messages keep the old behaviour:
+    /// history stays at the last complete exchange.
     pub fn fail_turn(&mut self, error: &AgentError) {
         self.turn += 1;
+        if let Some(messages) = error.messages() {
+            self.history = messages.to_vec();
+        }
         if let Some(trace) = error.trace() {
             self.persist_run(trace);
         }
@@ -437,6 +473,46 @@ impl ChatSession {
                     .push(format!("could not create session file: {err}"));
             }
         }
+    }
+}
+
+/// Append-only JSONL log of raw wire traffic (request/response bodies, SSE
+/// lines) for one session, `<root>/raw/<session file name>`. Insurance
+/// against parser bugs: whatever actually crossed the wire survives even
+/// when response parsing drops or mangles a field.
+#[derive(Debug, Clone)]
+pub struct WireLog {
+    path: PathBuf,
+}
+
+impl WireLog {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn append_event(&self, event: WireEvent<'_>) -> Result<(), SessionError> {
+        let (kind, url, body) = match event {
+            WireEvent::Request { url, body } => ("request", url, body),
+            WireEvent::Response { url, body } => ("response", url, body),
+            WireEvent::SseData { url, data } => ("sse", url, data),
+        };
+        let record = serde_json::json!({
+            "ts": now_timestamp(),
+            "kind": kind,
+            "url": url,
+            "body": body,
+        });
+        let mut line = record.to_string();
+        line.push('\n');
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
+        file.write_all(line.as_bytes())?;
+        Ok(())
     }
 }
 

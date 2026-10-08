@@ -42,6 +42,17 @@ impl From<io::Error> for TerminalError {
     }
 }
 
+/// Callers that carry a plain `io::Error` (both harness front ends do) fold
+/// the terminal error into it instead of hand-wrapping the message.
+impl From<TerminalError> for io::Error {
+    fn from(err: TerminalError) -> Self {
+        match err {
+            TerminalError::Io(err) => err,
+            other => io::Error::other(other.to_string()),
+        }
+    }
+}
+
 /// VT escape sequences. `move_to` takes 0-based coordinates (the escape
 /// itself is 1-based).
 pub mod esc {

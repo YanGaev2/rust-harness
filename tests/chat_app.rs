@@ -394,6 +394,55 @@ fn slash_paste_appears_in_command_suggestions() {
 }
 
 #[test]
+fn slash_retain_thinking_toggles_and_reports_state() {
+    // Default ON since 2026-08-08: the reasoning echo is required by the
+    // thinking models this harness targets (DeepSeek V4 / Kimi / MiMo), and
+    // it is what lets an interrupted turn resume with its thinking intact.
+    let mut app = app();
+    assert!(app.retain_thinking(), "retention must default on");
+
+    let action = submit_message(&mut app, "/retain-thinking");
+    assert_eq!(action, ChatAction::Continue);
+    assert!(!app.retain_thinking());
+    let (lines, _) = app.peek_scrollback(120);
+    let text = lines_text(&lines);
+    assert!(text.contains("retain thinking: off"), "{text}");
+
+    let action = submit_message(&mut app, "/retain-thinking");
+    assert_eq!(action, ChatAction::Continue);
+    assert!(app.retain_thinking());
+    let (lines, _) = app.peek_scrollback(120);
+    let text = lines_text(&lines);
+    assert!(text.contains("retain thinking: on"), "{text}");
+}
+
+#[test]
+fn stream_idle_note_appears_only_after_sustained_silence() {
+    // The note distinguishes "the model is silently generating a big tool
+    // call" from a frozen UI; short gaps between deltas must not flicker it.
+    use harness_cli::chat::stream_idle_note;
+
+    assert_eq!(stream_idle_note(0), None);
+    assert_eq!(stream_idle_note(14), None);
+    let note = stream_idle_note(42).expect("sustained silence earns a note");
+    assert!(note.contains("42s"), "{note}");
+
+    // A fresh busy turn starts with zero silence.
+    let mut app = app();
+    app.set_busy(true);
+    assert_eq!(app.stream_idle_secs(), 0);
+}
+
+#[test]
+fn slash_retain_thinking_appears_in_command_suggestions() {
+    let mut app = app();
+    type_text(&mut app, "/ret");
+    assert!(app.completion_visible());
+    let suggestions = app.completion_suggestions();
+    assert!(suggestions.contains(&"/retain-thinking".to_string()));
+}
+
+#[test]
 fn slash_model_returns_switch_action_without_echo() {
     let mut app = app();
     let action = submit_message(&mut app, "/model claude claude-sonnet-4.5");

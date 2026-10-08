@@ -17,7 +17,7 @@ use harness_tui::components::menu::{MenuItem, menu_lines};
 use harness_tui::components::spinner::spinner_lines;
 use harness_tui::components::status::status_line;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Color, Line, Span, Style, visible_width};
+use harness_tui::text::{Color, Line, Span, Style, visible_width, wrap_hanging};
 
 /// What the event loop should do after the app handled an input event.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,24 +70,14 @@ const GREEN: Color = Color::Ansi(2);
 const RED: Color = Color::Ansi(1);
 const LIGHT_GREEN: Color = Color::Ansi(10);
 
-fn dim_style() -> Style {
-    Style {
-        dim: true,
-        ..Style::default()
-    }
-}
-
-fn fg_style(color: Color) -> Style {
-    Style {
-        fg: color,
-        ..Style::default()
-    }
-}
-
-fn styled_line(text: impl Into<String>, style: Style) -> Line {
-    Line {
-        spans: vec![Span::styled(text, style)],
-    }
+/// Status note for a stream that stopped producing events while the run is
+/// still alive. Providers that buffer whole tool calls (baseten/Kimi) go
+/// legitimately silent for minutes; the note tells the user the harness is
+/// still listening. `None` under 15s so gaps between deltas never flicker.
+pub fn stream_idle_note(idle_seconds: u64) -> Option<String> {
+    (idle_seconds >= 15).then(|| {
+        format!("stream silent {idle_seconds}s — model may still be generating; Esc interrupts")
+    })
 }
 
 /// A slash command exposed in the chat session, used for both dispatch and
@@ -135,6 +125,11 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
         description: "show session token usage and estimated cost",
     },
     ChatCommand {
+        name: "/retain-thinking",
+        usage: "/retain-thinking",
+        description: "toggle replaying reasoning back to the model",
+    },
+    ChatCommand {
         name: "/help",
         usage: "/help",
         description: "show the command palette",
@@ -177,11 +172,13 @@ struct ToolEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatEntry {
     User(String),
-    Assistant(String),
-    /// A frozen-off continuation of a streaming assistant answer — same
-    /// hanging indent, no second `● ` marker (Qwen-style progressive
-    /// commit of long streams).
-    AssistantContinuation(String),
+    /// Streamed assistant output. `continued` marks a frozen-off tail of an
+    /// answer whose head already flushed — same hanging indent, no second
+    /// `● ` marker (Qwen-style progressive commit of long streams).
+    Assistant {
+        text: String,
+        continued: bool,
+    },
     Thinking(String),
     Tool(ToolEntry),
     System(String),
@@ -201,6 +198,7 @@ pub struct ChatApp {
     emitted: usize,
     streaming_assistant: bool,
     streaming_thinking: bool,
+    retain_thinking: bool,
     history: Vec<String>,
     history_cursor: Option<usize>,
     help_visible: bool,
@@ -212,6 +210,10 @@ pub struct ChatApp {
     busy: bool,
     /// When the current run started, for the elapsed time next to `Working…`.
     busy_since: Option<Instant>,
+    /// Last agent event of the current run: feeds the "stream silent Ns"
+    /// note, so a provider silently buffering a big tool call (baseten/Kimi)
+    /// is distinguishable from a frozen run.
+    stream_activity: Option<Instant>,
     spinner_frame: usize,
     /// Cumulative token usage across the whole REPL session (all runs),
     /// updated from `AgentEvent::UsageUpdated`; shown by `/cost`.
@@ -286,6 +288,10 @@ impl ChatApp {
             emitted: 0,
             streaming_assistant: false,
             streaming_thinking: false,
+            // On by default: the thinking models this harness targets
+            // (DeepSeek V4 / Kimi / MiMo) require the reasoning echo, and it
+            // is what lets an interrupted turn resume with its thinking.
+            retain_thinking: true,
             history: Vec::new(),
             history_cursor: None,
             help_visible: false,
@@ -293,6 +299,7 @@ impl ChatApp {
             completion_dismissed: false,
             busy: false,
             busy_since: None,
+            stream_activity: None,
             spinner_frame: 0,
             session_usage: crate::agent::UsageTotals::default(),
             run_usage_base: crate::agent::UsageTotals::default(),
@@ -365,15 +372,7 @@ impl ChatApp {
         }
         self.busy = busy;
         self.busy_since = busy.then(Instant::now);
-    }
-
-    /// Session-wide token totals (all runs so far).
-    pub fn session_usage(&self) -> crate::agent::UsageTotals {
-        self.session_usage
-    }
-
-    pub fn busy(&self) -> bool {
-        self.busy
+        self.stream_activity = busy.then(Instant::now);
     }
 
     /// Whole seconds the current run has been going (0 when idle).
@@ -386,6 +385,18 @@ impl ChatApp {
     /// Advance the spinner animation by one frame.
     pub fn tick(&mut self) {
         self.spinner_frame = self.spinner_frame.wrapping_add(1);
+    }
+
+    /// Whole seconds since the current run last produced an agent event
+    /// (0 when idle). Streams that flow keep this near zero; a provider
+    /// buffering a whole tool call lets it climb.
+    pub fn stream_idle_secs(&self) -> u64 {
+        if !self.busy {
+            return 0;
+        }
+        self.stream_activity
+            .map(|at| at.elapsed().as_secs())
+            .unwrap_or(0)
     }
 
     /// Whether the `/`-autocomplete menu is currently shown.
@@ -705,6 +716,16 @@ impl ChatApp {
             // Terminals often bind Ctrl+V themselves (Windows Terminal eats it
             // entirely for images), so the capture needs a key-free route.
             Some("paste") => ChatAction::CaptureClipboard,
+            Some("retain-thinking") => {
+                self.retain_thinking = !self.retain_thinking;
+                let status = if self.retain_thinking {
+                    "retain thinking: on — reasoning is replayed to the model (session-wide)"
+                } else {
+                    "retain thinking: off — reasoning stays in traces only"
+                };
+                self.push_system_line(status);
+                ChatAction::Continue
+            }
             Some("provider") => {
                 let label = self.provider_label.clone();
                 self.push_system_line(format!("active provider: {label}"));
@@ -872,27 +893,12 @@ impl ChatApp {
     /// `/model ARG` with a single token: menu number, provider name, model
     /// name, or a brand-new model for the active provider.
     fn switch_model_shorthand(&mut self, arg: &str) -> ChatAction {
-        if let Ok(number) = arg.parse::<usize>() {
-            let pairs = self.model_menu_pairs();
-            return match number.checked_sub(1).and_then(|i| pairs.get(i)) {
-                Some((provider, model)) => ChatAction::SwitchModel {
-                    provider: provider.clone(),
-                    model: model.clone(),
-                },
-                None => {
-                    self.push_system_line(format!(
-                        "no menu entry {number} (run /model to see the list)"
-                    ));
-                    ChatAction::Continue
-                }
-            };
-        }
-        if self.catalog.is_empty() {
+        if self.catalog.is_empty() && arg.parse::<usize>().is_err() {
             self.push_system_line("usage: /model [N | MODEL | PROVIDER MODEL]");
             return ChatAction::Continue;
         }
         let active = self.active_provider_name().to_string();
-        match crate::providers::resolve_model_shorthand(&self.catalog, &active, arg) {
+        match crate::providers::resolve_model_arg(&self.catalog, &active, arg) {
             Ok((provider, model)) => ChatAction::SwitchModel { provider, model },
             Err(err) => {
                 self.push_system_line(err);
@@ -927,6 +933,12 @@ impl ChatApp {
         }
     }
 
+    /// Current `/retain-thinking` state; the REPL passes it to each run's
+    /// `AgentRunner`, so a mid-session toggle applies from the next turn.
+    pub fn retain_thinking(&self) -> bool {
+        self.retain_thinking
+    }
+
     pub fn push_user_message(&mut self, message: &str) {
         self.transcript.push(ChatEntry::User(message.to_string()));
         self.streaming_assistant = false;
@@ -947,22 +959,30 @@ impl ChatApp {
     pub fn push_agent_event(&mut self, event: &crate::agent::AgentEvent) {
         use crate::agent::AgentEvent;
         self.tick();
+        self.stream_activity = Some(Instant::now());
+        // Usage ticks arrive between deltas and must not break a growing
+        // streaming block, so they bypass the flag reset below.
+        if let AgentEvent::UsageUpdated(totals) = event {
+            self.session_usage = self.run_usage_base.combined(*totals);
+            return;
+        }
+        // Every other event ends any live streaming block; the two streaming
+        // arms re-arm their own flag.
+        let was_thinking = std::mem::take(&mut self.streaming_thinking);
+        let was_assistant = std::mem::take(&mut self.streaming_assistant);
         match event {
             AgentEvent::Thinking(text) => {
                 // Coalesce streamed reasoning fragments into one growing block.
-                if self.streaming_thinking
+                if was_thinking
                     && let Some(ChatEntry::Thinking(existing)) = self.transcript.last_mut()
                 {
                     existing.push_str(text);
                 } else {
                     self.transcript.push(ChatEntry::Thinking(text.clone()));
-                    self.streaming_thinking = true;
                 }
-                self.streaming_assistant = false;
+                self.streaming_thinking = true;
             }
-            AgentEvent::UsageUpdated(totals) => {
-                self.session_usage = self.run_usage_base.combined(*totals);
-            }
+            AgentEvent::UsageUpdated(_) => unreachable!("handled above"),
             AgentEvent::ToolRoundStarted { round, tool_calls } => {
                 // A single-call round would just duplicate its tool card; only
                 // multi-call rounds earn a banner line.
@@ -971,8 +991,6 @@ impl ChatApp {
                         "tool round {round}: {tool_calls} call(s)"
                     )));
                 }
-                self.streaming_assistant = false;
-                self.streaming_thinking = false;
             }
             AgentEvent::ToolCallStarted {
                 id,
@@ -987,13 +1005,9 @@ impl ChatApp {
                     status: ToolStatus::Running,
                     summary: None,
                 }));
-                self.streaming_assistant = false;
-                self.streaming_thinking = false;
             }
             AgentEvent::ToolResult(result) => {
                 self.apply_tool_result(result);
-                self.streaming_assistant = false;
-                self.streaming_thinking = false;
             }
             AgentEvent::ProviderSwitched {
                 from_provider,
@@ -1005,21 +1019,20 @@ impl ChatApp {
                 self.transcript.push(ChatEntry::System(format!(
                     "⚠ provider switch: {from_provider}/{from_model} → {to_provider}/{to_model} ({reason})"
                 )));
-                self.streaming_assistant = false;
-                self.streaming_thinking = false;
             }
             AgentEvent::FinalContentDelta(delta) => {
-                self.streaming_thinking = false;
-                match (self.streaming_assistant, self.transcript.last_mut()) {
-                    (true, Some(ChatEntry::Assistant(text)))
-                    | (true, Some(ChatEntry::AssistantContinuation(text))) => {
+                match (was_assistant, self.transcript.last_mut()) {
+                    (true, Some(ChatEntry::Assistant { text, .. })) => {
                         text.push_str(delta);
                     }
                     _ => {
-                        self.transcript.push(ChatEntry::Assistant(delta.clone()));
-                        self.streaming_assistant = true;
+                        self.transcript.push(ChatEntry::Assistant {
+                            text: delta.clone(),
+                            continued: false,
+                        });
                     }
                 }
+                self.streaming_assistant = true;
             }
         }
     }
@@ -1096,6 +1109,9 @@ impl ChatApp {
         if self.busy {
             // Two rows: a blank spacer, then ` ⠋ Working… (5s)`.
             lines.extend(spinner_lines(self.spinner_frame, self.busy_elapsed_secs()));
+            if let Some(note) = stream_idle_note(self.stream_idle_secs()) {
+                lines.push(Line::styled(format!("   {note}"), Style::default().dim()));
+            }
         } else if has_live {
             lines.push(Line::default());
         }
@@ -1220,11 +1236,7 @@ impl ChatApp {
             return;
         };
         let streaming_text = match last {
-            ChatEntry::Assistant(text) | ChatEntry::AssistantContinuation(text)
-                if self.streaming_assistant =>
-            {
-                text
-            }
+            ChatEntry::Assistant { text, .. } if self.streaming_assistant => text,
             ChatEntry::Thinking(text) if self.streaming_thinking => text,
             _ => return,
         };
@@ -1234,17 +1246,19 @@ impl ChatApp {
         let Some(split) = safe_split_point(streaming_text) else {
             return;
         };
-        let entry = self.transcript.pop().expect("checked above");
-        match entry {
-            ChatEntry::Assistant(text) => {
+        // The head keeps its own continuation flag; the tail is always a
+        // continuation of the same visual block.
+        match self.transcript.pop().expect("checked above") {
+            ChatEntry::Assistant { text, continued } => {
                 let (head, tail) = split_at_boundary(&text, split);
-                self.transcript.push(ChatEntry::Assistant(head));
-                self.transcript.push(ChatEntry::AssistantContinuation(tail));
-            }
-            ChatEntry::AssistantContinuation(text) => {
-                let (head, tail) = split_at_boundary(&text, split);
-                self.transcript.push(ChatEntry::AssistantContinuation(head));
-                self.transcript.push(ChatEntry::AssistantContinuation(tail));
+                self.transcript.push(ChatEntry::Assistant {
+                    text: head,
+                    continued,
+                });
+                self.transcript.push(ChatEntry::Assistant {
+                    text: tail,
+                    continued: true,
+                });
             }
             ChatEntry::Thinking(text) => {
                 let (head, tail) = split_at_boundary(&text, split);
@@ -1260,8 +1274,11 @@ impl ChatApp {
     fn status_row(&self, width: usize) -> Line {
         let left = Line {
             spans: vec![
-                Span::styled(format!(" {}", self.provider_label), fg_style(CYAN)),
-                Span::styled(format!(" · {}", self.workspace.display()), dim_style()),
+                Span::styled(format!(" {}", self.provider_label), Style::fg(CYAN)),
+                Span::styled(
+                    format!(" · {}", self.workspace.display()),
+                    Style::default().dim(),
+                ),
             ],
         };
         let hint = if self.exit_armed {
@@ -1274,7 +1291,7 @@ impl ChatApp {
             "Enter send · Alt+Enter newline · / commands · Ctrl+V paste · Esc Esc exit "
         };
         let right = Line {
-            spans: vec![Span::styled(hint, dim_style())],
+            spans: vec![Span::styled(hint, Style::default().dim())],
         };
         status_line(width, left, right)
     }
@@ -1313,9 +1330,9 @@ fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
     let filtered = picker.filtered();
     let mut lines = Vec::new();
     if filtered.is_empty() {
-        lines.push(styled_line(
+        lines.push(Line::styled(
             format!("  no models match '{}' (Esc to close)", picker.filter),
-            dim_style(),
+            Style::default().dim(),
         ));
         return lines;
     }
@@ -1335,16 +1352,16 @@ fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
         let is_active = format!("{provider}/{model}") == active_label;
         let marker = if is_cursor { "→ " } else { "  " };
         let name_style = if is_cursor {
-            fg_style(CYAN)
+            Style::fg(CYAN)
         } else {
             Style::default()
         };
         let mut spans = vec![
             Span::styled(format!("{marker}{model} "), name_style),
-            Span::styled(format!("[{provider}]"), dim_style()),
+            Span::styled(format!("[{provider}]"), Style::default().dim()),
         ];
         if is_active {
-            spans.push(Span::styled(" ✓", fg_style(GREEN)));
+            spans.push(Span::styled(" ✓", Style::fg(GREEN)));
         }
         lines.push(Line { spans });
     }
@@ -1353,9 +1370,9 @@ fn model_picker_lines(picker: &ModelPicker, active_label: &str) -> Vec<Line> {
     } else {
         format!(" · {}", picker.filter)
     };
-    lines.push(styled_line(
+    lines.push(Line::styled(
         format!("  ({}/{}){filter_note}", cursor + 1, filtered.len()),
-        dim_style(),
+        Style::default().dim(),
     ));
     lines
 }
@@ -1400,17 +1417,23 @@ fn framed_lines(inner: Vec<Line>, width: usize) -> Vec<Line> {
     let inner_width = width - 2;
     let horizontal = "─".repeat(inner_width);
     let mut lines = Vec::with_capacity(inner.len() + 2);
-    lines.push(styled_line(format!("╭{horizontal}╮"), dim_style()));
+    lines.push(Line::styled(
+        format!("╭{horizontal}╮"),
+        Style::default().dim(),
+    ));
     for row in inner {
         let (mut spans, used) = clip_spans(row, inner_width);
-        spans.insert(0, Span::styled("│", dim_style()));
+        spans.insert(0, Span::styled("│", Style::default().dim()));
         if used < inner_width {
             spans.push(Span::raw(" ".repeat(inner_width - used)));
         }
-        spans.push(Span::styled("│", dim_style()));
+        spans.push(Span::styled("│", Style::default().dim()));
         lines.push(Line { spans });
     }
-    lines.push(styled_line(format!("╰{horizontal}╯"), dim_style()));
+    lines.push(Line::styled(
+        format!("╰{horizontal}╯"),
+        Style::default().dim(),
+    ));
     lines
 }
 
@@ -1452,7 +1475,7 @@ fn clip_spans(row: Line, max_width: usize) -> (Vec<Span>, usize) {
 
 /// The `/help` palette as plain panel lines.
 fn palette_lines() -> Vec<Line> {
-    let mut lines = vec![styled_line(
+    let mut lines = vec![Line::styled(
         "Commands",
         Style {
             bold: true,
@@ -1463,13 +1486,13 @@ fn palette_lines() -> Vec<Line> {
         lines.push(Line {
             spans: vec![
                 Span::raw(format!("  {:<22}", command.usage)),
-                Span::styled(command.description, dim_style()),
+                Span::styled(command.description, Style::default().dim()),
             ],
         });
     }
-    lines.push(styled_line(
+    lines.push(Line::styled(
         "Up/Down recall · Ctrl+V paste · Esc close",
-        dim_style(),
+        Style::default().dim(),
     ));
     lines
 }
@@ -1510,13 +1533,14 @@ fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
                 })
                 .collect()
         }
-        ChatEntry::Assistant(text) => {
-            // The accent marker leads the first markdown line; continuations
-            // are indented to the same column so the block hangs together.
+        ChatEntry::Assistant { text, continued } => {
+            // The accent marker leads the first markdown line of a fresh
+            // answer; a frozen-off tail carries no second marker, and every
+            // other line keeps the assistant hanging indent.
             let mut lines = Vec::new();
             for (index, line) in markdown_lines(text).into_iter().enumerate() {
-                if index == 0 {
-                    let mut spans = vec![Span::styled("● ", fg_style(CYAN))];
+                if index == 0 && !continued {
+                    let mut spans = vec![Span::styled("● ", Style::fg(CYAN))];
                     spans.extend(line.spans);
                     lines.push(Line { spans });
                 } else {
@@ -1524,14 +1548,6 @@ fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
                 }
             }
             lines
-        }
-        ChatEntry::AssistantContinuation(text) => {
-            // No marker — this is the tail of an answer whose head already
-            // flushed; every line keeps the assistant hanging indent.
-            markdown_lines(text)
-                .into_iter()
-                .map(|line| indent_line(line, "  "))
-                .collect()
         }
         ChatEntry::Thinking(text) => {
             // Reasoning renders as plain dim italic text with no badge — the
@@ -1555,7 +1571,7 @@ fn entry_styled_lines(entry: &ChatEntry) -> Vec<Line> {
                     ..Style::default()
                 }
             } else {
-                dim_style()
+                Style::default().dim()
             };
             vec![Line {
                 spans: vec![Span::styled("· ", style), Span::styled(text.clone(), style)],
@@ -1576,9 +1592,9 @@ fn tool_card_lines(tool: &ToolEntry) -> Vec<Line> {
     // The `●` marker carries the status color; the tool name stays neutral
     // bold so the eye scans markers, not a rainbow of glyphs.
     let marker_style = match tool.status {
-        ToolStatus::Running => dim_style(),
-        ToolStatus::Ok => fg_style(GREEN),
-        ToolStatus::Failed => fg_style(RED),
+        ToolStatus::Running => Style::default().dim(),
+        ToolStatus::Ok => Style::fg(GREEN),
+        ToolStatus::Failed => Style::fg(RED),
     };
     let mut spans = vec![
         Span::styled("● ", marker_style),
@@ -1591,11 +1607,17 @@ fn tool_card_lines(tool: &ToolEntry) -> Vec<Line> {
         ),
     ];
     if !tool.args.is_empty() {
-        spans.push(Span::styled(format!("({})", tool.args), dim_style()));
+        spans.push(Span::styled(
+            format!("({})", tool.args),
+            Style::default().dim(),
+        ));
     }
     let mut lines = vec![Line { spans }];
     if let Some(summary) = &tool.summary {
-        lines.push(styled_line(format!("  ⎿ {summary}"), dim_style()));
+        lines.push(Line::styled(
+            format!("  ⎿ {summary}"),
+            Style::default().dim(),
+        ));
     }
     lines
 }
@@ -1605,97 +1627,17 @@ fn tool_card_lines(tool: &ToolEntry) -> Vec<Line> {
 /// mid-word. Continuation rows hang-indent to the block's text column, so a
 /// wrapped turn stays visually inside its `>`/`●`/gutter block instead of
 /// snapping to x=0.
+/// Wrap one transcript row to the panel width with the chat's hanging
+/// indent: continuations align under the entry's leading marker. Width is
+/// measured in display columns (CJK/emoji take two), not chars.
 fn wrap_styled_line(line: Line, width: usize) -> Vec<Line> {
-    let width = width.max(1);
-    let chars: Vec<(char, Style)> = line
+    let indent = line
         .spans
         .iter()
-        .flat_map(|span| {
-            span.text
-                .chars()
-                .map(|ch| (ch, span.style))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    if chars.len() <= width {
-        return vec![line];
-    }
-
-    let indent = hanging_indent(&chars).min(width / 2);
-    let pad = " ".repeat(indent);
-    let mut rows = Vec::new();
-    let mut start = 0;
-    let mut first = true;
-    while start < chars.len() {
-        if !first {
-            // Drop leftover spaces at a break so the indent stays exact.
-            while start < chars.len() && chars[start].0 == ' ' {
-                start += 1;
-            }
-            if start == chars.len() {
-                break;
-            }
-        }
-        let avail = if first { width } else { width - indent };
-        let row_chars = if chars.len() - start <= avail {
-            let row = &chars[start..];
-            start = chars.len();
-            row
-        } else {
-            let window = &chars[start..start + avail];
-            match window.iter().rposition(|(ch, _)| *ch == ' ') {
-                Some(pos) if pos > 0 => {
-                    let row = &chars[start..start + pos];
-                    start += pos + 1; // the break space itself is consumed
-                    row
-                }
-                _ => {
-                    start += avail;
-                    window
-                }
-            }
-        };
-        let mut row = line_from_chars(row_chars);
-        if !first {
-            row.spans.insert(0, Span::raw(pad.clone()));
-        }
-        rows.push(row);
-        first = false;
-    }
-    rows
-}
-
-/// The hanging-indent width of a block line: its leading spaces and marker
-/// glyphs (`>`, `●`, `·`, `⎿`, `•`, `│`), i.e. the column where the text starts.
-fn hanging_indent(chars: &[(char, Style)]) -> usize {
-    chars
-        .iter()
-        .take_while(|(ch, _)| *ch == ' ' || matches!(ch, '>' | '●' | '·' | '⎿' | '•' | '│'))
-        .count()
-}
-
-/// Rebuild a styled line from `(char, style)` pairs, merging equal-style runs.
-fn line_from_chars(chars: &[(char, Style)]) -> Line {
-    let mut spans: Vec<Span> = Vec::new();
-    let mut buf = String::new();
-    let mut current: Option<Style> = None;
-    for (ch, style) in chars {
-        if current != Some(*style) {
-            if let Some(style) = current
-                && !buf.is_empty()
-            {
-                spans.push(Span::styled(std::mem::take(&mut buf), style));
-            }
-            current = Some(*style);
-        }
-        buf.push(*ch);
-    }
-    if let Some(style) = current
-        && !buf.is_empty()
-    {
-        spans.push(Span::styled(buf, style));
-    }
-    Line { spans }
+        .flat_map(|span| span.text.chars())
+        .take_while(|ch| *ch == ' ' || matches!(ch, '>' | '●' | '·' | '⎿' | '•' | '│'))
+        .count();
+    wrap_hanging(&line, width, indent)
 }
 
 /// Render a block of (lightweight) Markdown to styled lines: ATX headings,
@@ -1716,14 +1658,14 @@ fn markdown_lines(text: &str) -> Vec<Line> {
 
         if trimmed.starts_with("```") {
             in_code = !in_code;
-            lines.push(styled_line("  ┄┄┄", dim_style()));
+            lines.push(Line::styled("  ┄┄┄", Style::default().dim()));
             i += 1;
             continue;
         }
         if in_code {
             lines.push(Line {
                 spans: vec![
-                    Span::styled("│ ", dim_style()),
+                    Span::styled("│ ", Style::default().dim()),
                     Span::styled(raw, code_style()),
                 ],
             });
@@ -1758,13 +1700,13 @@ fn markdown_lines(text: &str) -> Vec<Line> {
                     ..Style::default()
                 }
             };
-            lines.push(styled_line(body, style));
+            lines.push(Line::styled(body, style));
             i += 1;
             continue;
         }
 
         if is_horizontal_rule(trimmed) || is_table_separator(trimmed) {
-            lines.push(styled_line("─".repeat(24), dim_style()));
+            lines.push(Line::styled("─".repeat(24), Style::default().dim()));
             i += 1;
             continue;
         }
@@ -1773,7 +1715,7 @@ fn markdown_lines(text: &str) -> Vec<Line> {
             let rest = &raw[indent + marker_len..];
             let mut spans = vec![Span::styled(
                 format!("{}• ", " ".repeat(indent)),
-                fg_style(CYAN),
+                Style::fg(CYAN),
             )];
             spans.extend(inline_spans(rest, base));
             lines.push(Line { spans });
@@ -1877,7 +1819,7 @@ fn table_lines(rows: &[&str], base: Style) -> Vec<Line> {
                 })
                 .collect::<Vec<_>>()
                 .join(&" ".repeat(GAP));
-            lines.push(styled_line(rule.trim_end(), dim_style()));
+            lines.push(Line::styled(rule.trim_end(), Style::default().dim()));
         }
     }
     lines
@@ -1999,15 +1941,14 @@ fn find_seq(chars: &[char], from: usize, target: char) -> Option<usize> {
 }
 
 fn code_style() -> Style {
-    fg_style(LIGHT_GREEN)
+    Style::fg(LIGHT_GREEN)
 }
 
 /// Plain-text projection of an entry for `transcript_text` (tests, non-TTY).
 fn entry_plain_lines(entry: &ChatEntry) -> Vec<String> {
     match entry {
         ChatEntry::User(text) => vec![format!("you: {text}")],
-        ChatEntry::Assistant(text) => vec![text.clone()],
-        ChatEntry::AssistantContinuation(text) => vec![text.clone()],
+        ChatEntry::Assistant { text, .. } => vec![text.clone()],
         ChatEntry::Thinking(text) => vec![format!("thinking: {text}")],
         ChatEntry::System(text) => vec![text.clone()],
         ChatEntry::Tool(tool) => {
@@ -2036,7 +1977,7 @@ fn compact_json_args(value: &serde_json::Value) -> String {
     if value.as_object().is_some_and(|map| map.is_empty()) || value.is_null() {
         return String::new();
     }
-    clip_text(&value.to_string(), 80)
+    crate::repl::summarize_one_line(&value.to_string(), 80)
 }
 
 /// The tool name shown on a card: the canonical `file.*`/`shell.exec` form
@@ -2048,7 +1989,7 @@ fn display_tool_name(name: &str) -> String {
 fn tool_result_summary(result: &crate::runtime::ToolBatchResult) -> Option<String> {
     if !result.ok {
         let error = result.error.clone().unwrap_or_else(|| "failed".to_string());
-        return Some(clip_text(&error, 100));
+        return Some(crate::repl::summarize_one_line(&error, 100));
     }
     let mut non_empty = result
         .content
@@ -2060,18 +2001,12 @@ fn tool_result_summary(result: &crate::runtime::ToolBatchResult) -> Option<Strin
     // directory listing looked like one folder), so surface the line count.
     let rest = non_empty.count();
     if rest == 0 {
-        Some(clip_text(first, 100))
+        Some(crate::repl::summarize_one_line(first, 100))
     } else {
-        Some(format!("{} lines · {}", rest + 1, clip_text(first, 80)))
-    }
-}
-
-fn clip_text(text: &str, max: usize) -> String {
-    let flattened = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flattened.chars().count() > max {
-        let clipped: String = flattened.chars().take(max.saturating_sub(1)).collect();
-        format!("{clipped}…")
-    } else {
-        flattened
+        Some(format!(
+            "{} lines · {}",
+            rest + 1,
+            crate::repl::summarize_one_line(first, 80)
+        ))
     }
 }

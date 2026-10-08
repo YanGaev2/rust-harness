@@ -1,6 +1,6 @@
 //! Setup TUI on the `harness-tui` library: the no-provider onboarding
-//! screen. The pure state machines (`TuiApp`, `SetupTuiApp`, the provider
-//! wizard) consume `harness_tui::input` key events, rendering produces
+//! screen. The pure state machines (`TuiApp`, the provider wizard) consume
+//! `harness_tui::input` key events, rendering produces
 //! `harness_tui::text::Line`s, and the terminal loop repaints a pinned
 //! bottom panel via `harness_tui::core::Screen`.
 
@@ -14,9 +14,10 @@ use harness_tui::components::select::select_lines;
 use harness_tui::components::status::status_line;
 use harness_tui::core::Screen;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::terminal::{self as tui_terminal, TerminalError};
+use harness_tui::terminal as tui_terminal;
 use harness_tui::text::{Color, Line, Span, Style};
 
+use crate::providers::BuiltinProvider;
 use crate::repl::InputPump;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,15 +262,14 @@ impl ProviderWizard {
         match key.code {
             KeyCode::Up => {
                 if self.selected_provider == 0 {
-                    self.selected_provider = BUILTIN_PROVIDER_NAMES.len() - 1;
+                    self.selected_provider = BuiltinProvider::ALL.len() - 1;
                 } else {
                     self.selected_provider -= 1;
                 }
                 TuiAction::Continue
             }
             KeyCode::Down => {
-                self.selected_provider =
-                    (self.selected_provider + 1) % BUILTIN_PROVIDER_NAMES.len();
+                self.selected_provider = (self.selected_provider + 1) % BuiltinProvider::ALL.len();
                 TuiAction::Continue
             }
             KeyCode::Enter => {
@@ -329,7 +329,9 @@ impl ProviderWizard {
                     return TuiAction::Continue;
                 }
                 TuiAction::SaveProvider(TuiProviderDraft {
-                    name: BUILTIN_PROVIDER_NAMES[self.selected_provider].to_string(),
+                    name: BuiltinProvider::ALL[self.selected_provider]
+                        .name()
+                        .to_string(),
                     base_url: self.base_url.trim().to_string(),
                     api_key: self.api_key.trim().to_string(),
                     model: self.model.trim().to_string(),
@@ -363,9 +365,16 @@ impl ProviderWizard {
     }
 
     fn apply_provider_defaults(&mut self) {
-        let defaults = provider_defaults(BUILTIN_PROVIDER_NAMES[self.selected_provider]);
-        self.base_url = defaults.base_url.to_string();
-        self.model = defaults.model.to_string();
+        // Canonical profile data only: families the profiles deliberately
+        // leave without a base_url get an empty field the user must fill.
+        let profile = BuiltinProvider::ALL[self.selected_provider].profile();
+        self.base_url = profile.base_url.unwrap_or_default().to_string();
+        self.model = profile
+            .model_hints
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .to_string();
         self.base_url_edited = false;
         self.api_key_edited = false;
         self.model_edited = false;
@@ -447,198 +456,13 @@ fn command_registry() -> &'static [CommandEntry] {
     ]
 }
 
-const BUILTIN_PROVIDER_NAMES: &[&str] = &["codex", "xiaomi", "glm", "kimi", "claude", "deepseek"];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProviderDefaults {
-    base_url: &'static str,
-    model: &'static str,
-}
-
-fn provider_defaults(name: &str) -> ProviderDefaults {
-    match name {
-        "codex" => ProviderDefaults {
-            base_url: "https://api.openai.com/v1",
-            model: "gpt-5-codex",
-        },
-        "xiaomi" => ProviderDefaults {
-            base_url: "https://api.xiaomi.com/v1",
-            model: "xiaomi-lm",
-        },
-        "glm" => ProviderDefaults {
-            base_url: "https://open.bigmodel.cn/api/paas/v4",
-            model: "glm-4.5",
-        },
-        "kimi" => ProviderDefaults {
-            base_url: "https://api.moonshot.ai/v1",
-            model: "kimi-k2",
-        },
-        "claude" => ProviderDefaults {
-            base_url: "https://api.anthropic.com/v1",
-            model: "claude-sonnet-4.5",
-        },
-        "deepseek" => ProviderDefaults {
-            base_url: "https://api.deepseek.com/v1",
-            model: "deepseek-v4-pro",
-        },
-        _ => ProviderDefaults {
-            base_url: "",
-            model: "",
-        },
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetupTuiAction {
-    Continue,
-    ProviderAdd,
-    Exit,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SetupTuiApp {
-    command_name: String,
-    config_path: PathBuf,
-    workspace: PathBuf,
-    input: String,
-    status_message: String,
-    /// Two-step Esc exit, same contract as `TuiApp`/`ChatApp`.
-    exit_armed: bool,
-}
-
-impl SetupTuiApp {
-    pub fn new(
-        command_name: impl Into<String>,
-        config_path: impl Into<PathBuf>,
-        workspace: impl Into<PathBuf>,
-    ) -> Self {
-        Self {
-            command_name: command_name.into(),
-            config_path: config_path.into(),
-            workspace: workspace.into(),
-            input: String::new(),
-            status_message: "Type /provider add to configure a provider inside this interface."
-                .to_string(),
-            exit_armed: false,
-        }
-    }
-
-    pub fn input(&self) -> &str {
-        &self.input
-    }
-
-    pub fn status_message(&self) -> &str {
-        &self.status_message
-    }
-
-    pub fn handle_key(&mut self, key: KeyEvent) -> SetupTuiAction {
-        if key.code != KeyCode::Esc {
-            self.exit_armed = false;
-        }
-        match key.code {
-            KeyCode::Char('c') if key.mods.ctrl => {
-                self.status_message = "Setup cancelled.".to_string();
-                SetupTuiAction::Exit
-            }
-            KeyCode::Esc => {
-                if self.exit_armed {
-                    self.status_message = "Setup cancelled.".to_string();
-                    return SetupTuiAction::Exit;
-                }
-                self.exit_armed = true;
-                self.status_message = "Press Esc again to exit.".to_string();
-                SetupTuiAction::Continue
-            }
-            KeyCode::Enter => self.submit_command(),
-            KeyCode::Backspace => {
-                self.input.pop();
-                SetupTuiAction::Continue
-            }
-            KeyCode::Char(ch) if !key.mods.ctrl => {
-                self.input.push(ch);
-                SetupTuiAction::Continue
-            }
-            _ => SetupTuiAction::Continue,
-        }
-    }
-
-    pub fn handle_paste(&mut self, text: &str) -> SetupTuiAction {
-        self.input.push_str(&sanitize_pasted_line(text));
-        SetupTuiAction::Continue
-    }
-
-    fn submit_command(&mut self) -> SetupTuiAction {
-        let command = self.input.trim().to_string();
-        self.input.clear();
-
-        match command.as_str() {
-            "" => SetupTuiAction::Continue,
-            "/provider add" => {
-                self.status_message = "Provider setup starting...".to_string();
-                SetupTuiAction::ProviderAdd
-            }
-            "/providers" | "/provider subscriptions" => {
-                self.status_message =
-                    "Built-in providers: codex, xiaomi, glm, kimi, claude, deepseek.".to_string();
-                SetupTuiAction::Continue
-            }
-            "/help" => {
-                self.status_message =
-                    "Commands: /provider add, /providers, /help, /exit.".to_string();
-                SetupTuiAction::Continue
-            }
-            "/exit" | "/quit" => {
-                self.status_message = "Setup cancelled.".to_string();
-                SetupTuiAction::Exit
-            }
-            other => {
-                self.status_message =
-                    format!("Unknown command: {other}. Type /help for available commands.");
-                SetupTuiAction::Continue
-            }
-        }
-    }
-}
-
-pub fn run_setup_tui(
-    command_name: impl Into<String>,
-    config_path: impl Into<PathBuf>,
-    workspace: impl Into<PathBuf>,
-) -> Result<SetupTuiAction, TuiError> {
-    tui_terminal::install_panic_restore();
-    let mut screen = Screen::stdout().map_err(terminal_error)?;
-    screen.clear_screen().map_err(TuiError::Io)?;
-    let mut app = SetupTuiApp::new(command_name, config_path, workspace);
-    let mut pump = InputPump::start();
-
-    loop {
-        let panel = setup_tui_lines(&app, screen.width() as usize);
-        draw_panel(&mut screen, panel)?;
-        let events = pump
-            .poll(Duration::from_millis(400))
-            .map_err(TuiError::Io)?;
-        check_resize(&mut screen)?;
-        for event in events {
-            let action = match event {
-                Event::Key(key) => app.handle_key(key),
-                Event::Paste(text) => app.handle_paste(&text),
-                _ => SetupTuiAction::Continue,
-            };
-            if action != SetupTuiAction::Continue {
-                let _ = screen.release();
-                return Ok(action);
-            }
-        }
-    }
-}
-
 pub fn run_tui(
     command_name: impl Into<String>,
     config_path: impl Into<PathBuf>,
     workspace: impl Into<PathBuf>,
 ) -> Result<TuiAction, TuiError> {
     tui_terminal::install_panic_restore();
-    let mut screen = Screen::stdout().map_err(terminal_error)?;
+    let mut screen = Screen::stdout().map_err(|err| TuiError::Io(err.into()))?;
     screen.clear_screen().map_err(TuiError::Io)?;
     let mut app = TuiApp::new(command_name, config_path, workspace);
     let mut pump = InputPump::start();
@@ -689,10 +513,6 @@ fn check_resize(screen: &mut Screen) -> Result<(), TuiError> {
     Ok(())
 }
 
-fn terminal_error(err: TerminalError) -> TuiError {
-    TuiError::Io(io::Error::other(err.to_string()))
-}
-
 /// Full panel for the `TuiApp` screen. When the provider wizard is open
 /// its step content replaces the command list.
 pub fn setup_lines(app: &TuiApp, width: usize) -> Vec<Line> {
@@ -713,29 +533,16 @@ pub fn setup_lines(app: &TuiApp, width: usize) -> Vec<Line> {
     lines
 }
 
-/// Full panel for the simpler `SetupTuiApp` screen (no dialog).
-pub fn setup_tui_lines(app: &SetupTuiApp, width: usize) -> Vec<Line> {
-    let mut lines = header_lines(&app.command_name);
-    lines.extend(overview_lines(
-        &app.workspace,
-        &app.config_path,
-        &app.status_message,
-    ));
-    lines.push(Line::raw(""));
-    lines.extend(command_lines());
-    lines.push(Line::raw(""));
-    lines.push(input_line(&app.input, true));
-    lines.push(footer_line(width));
-    lines
-}
-
 fn header_lines(command_name: &str) -> Vec<Line> {
     vec![
         Line {
             spans: vec![
-                Span::styled(format!(" {command_name} "), title_style()),
+                Span::styled(
+                    format!(" {command_name} "),
+                    Style::fg(Color::Ansi(0)).bg(Color::Ansi(6)).bold(),
+                ),
                 Span::raw(" "),
-                Span::styled("no provider configured", warn_style()),
+                Span::styled("no provider configured", Style::fg(Color::Ansi(3)).bold()),
             ],
         },
         Line::raw(""),
@@ -746,21 +553,21 @@ fn overview_lines(workspace: &Path, config_path: &Path, status_message: &str) ->
     vec![
         Line {
             spans: vec![
-                Span::styled("workspace ", label_style()),
+                Span::styled("workspace ", Style::fg(Color::Ansi(7)).bold()),
                 Span::raw(display_path(workspace)),
             ],
         },
         Line {
             spans: vec![
-                Span::styled("config    ", label_style()),
+                Span::styled("config    ", Style::fg(Color::Ansi(7)).bold()),
                 Span::raw(display_path(config_path)),
             ],
         },
         Line::raw(""),
-        styled_line("No provider is configured yet.", emphasis_style()),
+        Line::styled("No provider is configured yet.", Style::default().bold()),
         Line::raw("Configure one here, then this launch continues into the REPL."),
         Line::raw(""),
-        styled_line(status_message, status_style()),
+        Line::styled(status_message, Style::fg(Color::Ansi(6))),
     ]
 }
 
@@ -769,7 +576,10 @@ fn command_lines() -> Vec<Line> {
         .iter()
         .map(|entry| Line {
             spans: vec![
-                Span::styled(format!("{:<15}", entry.names[0]), command_style()),
+                Span::styled(
+                    format!("{:<15}", entry.names[0]),
+                    Style::fg(Color::Ansi(2)).bold(),
+                ),
                 Span::raw(command_description(entry.command)),
             ],
         })
@@ -777,41 +587,54 @@ fn command_lines() -> Vec<Line> {
 }
 
 fn wizard_lines(wizard: &ProviderWizard) -> Vec<Line> {
-    let mut lines = vec![styled_line(wizard.title(), emphasis_style()), Line::raw("")];
+    let mut lines = vec![
+        Line::styled(wizard.title(), Style::default().bold()),
+        Line::raw(""),
+    ];
     match wizard.step {
         ProviderWizardStep::Provider => {
-            lines.push(styled_line("Select provider", emphasis_style()));
+            lines.push(Line::styled("Select provider", Style::default().bold()));
             lines.push(Line::raw(""));
-            lines.extend(select_lines(
-                BUILTIN_PROVIDER_NAMES,
-                wizard.selected_provider,
-            ));
+            let names: Vec<&str> = BuiltinProvider::ALL
+                .iter()
+                .map(|provider| provider.name())
+                .collect();
+            lines.extend(select_lines(&names, wizard.selected_provider));
             lines.push(Line::raw(""));
-            lines.push(styled_line(
+            lines.push(Line::styled(
                 "Up/Down move  Enter accept  Esc close",
-                hint_style(),
+                Style::default().dim(),
             ));
         }
         ProviderWizardStep::BaseUrl => {
-            lines.push(styled_line("Base URL", emphasis_style()));
+            lines.push(Line::styled("Base URL", Style::default().bold()));
             lines.push(Line::raw(""));
             lines.push(Line::raw(wizard.base_url.clone()));
             lines.push(Line::raw(""));
-            lines.push(styled_line("Enter accept  Esc close", hint_style()));
+            lines.push(Line::styled(
+                "Enter accept  Esc close",
+                Style::default().dim(),
+            ));
         }
         ProviderWizardStep::ApiKey => {
-            lines.push(styled_line("API key", emphasis_style()));
+            lines.push(Line::styled("API key", Style::default().bold()));
             lines.push(Line::raw(""));
             lines.push(Line::raw(mask_secret(&wizard.api_key)));
             lines.push(Line::raw(""));
-            lines.push(styled_line("Enter accept  Esc close", hint_style()));
+            lines.push(Line::styled(
+                "Enter accept  Esc close",
+                Style::default().dim(),
+            ));
         }
         ProviderWizardStep::Model => {
-            lines.push(styled_line("Model", emphasis_style()));
+            lines.push(Line::styled("Model", Style::default().bold()));
             lines.push(Line::raw(""));
             lines.push(Line::raw(wizard.model.clone()));
             lines.push(Line::raw(""));
-            lines.push(styled_line("Enter save  Esc close", hint_style()));
+            lines.push(Line::styled(
+                "Enter save  Esc close",
+                Style::default().dim(),
+            ));
         }
     }
     lines
@@ -837,68 +660,8 @@ fn footer_line(width: usize) -> Line {
     status_line(
         width,
         Line::default(),
-        styled_line("Esc Esc / Ctrl+C exit", hint_style()),
+        Line::styled("Esc Esc / Ctrl+C exit", Style::default().dim()),
     )
-}
-
-fn styled_line(text: impl Into<String>, style: Style) -> Line {
-    Line {
-        spans: vec![Span::styled(text, style)],
-    }
-}
-
-fn title_style() -> Style {
-    Style {
-        fg: Color::Ansi(0),
-        bg: Color::Ansi(6),
-        bold: true,
-        ..Style::default()
-    }
-}
-
-fn warn_style() -> Style {
-    Style {
-        fg: Color::Ansi(3),
-        bold: true,
-        ..Style::default()
-    }
-}
-
-fn label_style() -> Style {
-    Style {
-        fg: Color::Ansi(7),
-        bold: true,
-        ..Style::default()
-    }
-}
-
-fn emphasis_style() -> Style {
-    Style {
-        bold: true,
-        ..Style::default()
-    }
-}
-
-fn command_style() -> Style {
-    Style {
-        fg: Color::Ansi(2),
-        bold: true,
-        ..Style::default()
-    }
-}
-
-fn status_style() -> Style {
-    Style {
-        fg: Color::Ansi(6),
-        ..Style::default()
-    }
-}
-
-fn hint_style() -> Style {
-    Style {
-        dim: true,
-        ..Style::default()
-    }
 }
 
 fn command_description(command: TuiCommand) -> &'static str {

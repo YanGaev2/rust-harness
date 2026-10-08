@@ -3,7 +3,9 @@ use std::fmt;
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::thread::{self, JoinHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -40,6 +42,19 @@ impl ShellTool {
     }
 
     pub fn run(&self, command: &str) -> Result<ShellOutput, ShellError> {
+        self.run_with_cancel(command, None)
+    }
+
+    /// `run` with cooperative cancellation: when `cancel` flips to true
+    /// (Esc/Ctrl+C in the UI), the child is killed and the captured output
+    /// comes back inside [`ShellError::Cancelled`]. Only the direct shell
+    /// process is killed — like the timeout path, this is not a tree kill,
+    /// so a build the command started keeps running detached.
+    pub fn run_with_cancel(
+        &self,
+        command: &str,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<ShellOutput, ShellError> {
         // Windows shells encode their piped streams with the OEM code page
         // (CP866 on Russian Windows) — the model would receive mojibake
         // error text and retry blindly. Switching the console to UTF-8
@@ -78,34 +93,42 @@ impl ShellTool {
                 break status;
             }
 
+            if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ShellError::Cancelled {
+                    output: self.drain_output(None, stdout_reader, stderr_reader)?,
+                });
+            }
+
             if started.elapsed() >= self.timeout {
                 let _ = child.kill();
                 let _ = child.wait();
-                let stdout = join_pipe_reader(stdout_reader)?;
-                let stderr = join_pipe_reader(stderr_reader)?;
                 return Err(ShellError::TimedOut {
                     timeout: self.timeout,
-                    output: ShellOutput {
-                        program: self.profile.program().to_string(),
-                        exit_code: None,
-                        stdout: stdout.content,
-                        stderr: stderr.content,
-                        stdout_truncated: stdout.truncated,
-                        stderr_truncated: stderr.truncated,
-                        max_output_bytes: self.max_output_bytes,
-                    },
+                    output: self.drain_output(None, stdout_reader, stderr_reader)?,
                 });
             }
 
             thread::sleep(Duration::from_millis(5));
         };
 
-        let stdout = join_pipe_reader(stdout_reader)?;
-        let stderr = join_pipe_reader(stderr_reader)?;
+        self.drain_output(status.code(), stdout_reader, stderr_reader)
+    }
 
+    /// Fold both pipe captures into the final output shape. Called once the
+    /// direct child is gone (exited, or killed by timeout/cancel).
+    fn drain_output(
+        &self,
+        exit_code: Option<i32>,
+        stdout: Arc<Mutex<PipeState>>,
+        stderr: Arc<Mutex<PipeState>>,
+    ) -> Result<ShellOutput, ShellError> {
+        let stdout = collect_pipe_capture(stdout)?;
+        let stderr = collect_pipe_capture(stderr)?;
         Ok(ShellOutput {
             program: self.profile.program().to_string(),
-            exit_code: status.code(),
+            exit_code,
             stdout: stdout.content,
             stderr: stderr.content,
             stdout_truncated: stdout.truncated,
@@ -132,6 +155,10 @@ pub enum ShellError {
         timeout: Duration,
         output: ShellOutput,
     },
+    /// The user interrupted the command (Esc/Ctrl+C); partial output kept.
+    Cancelled {
+        output: ShellOutput,
+    },
     Io(std::io::Error),
 }
 
@@ -144,6 +171,12 @@ impl fmt::Display for ShellError {
                 output.stdout.len(),
                 output.stderr.len()
             ),
+            Self::Cancelled { output } => write!(
+                f,
+                "shell command cancelled by user; captured stdout={} bytes stderr={} bytes",
+                output.stdout.len(),
+                output.stderr.len()
+            ),
             Self::Io(err) => write!(f, "{err}"),
         }
     }
@@ -153,7 +186,7 @@ impl Error for ShellError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Io(err) => Some(err),
-            Self::TimedOut { .. } => None,
+            Self::TimedOut { .. } | Self::Cancelled { .. } => None,
         }
     }
 }
@@ -164,63 +197,97 @@ struct BoundedPipeOutput {
     truncated: bool,
 }
 
-fn spawn_pipe_reader<R>(
-    pipe: Option<R>,
-    max_bytes: usize,
-) -> JoinHandle<Result<BoundedPipeOutput, std::io::Error>>
+/// How long to keep waiting for pipe EOF once the direct child is gone.
+/// Background processes the command left behind (servers started via
+/// `Start-Process`, `cmd &`) inherit the pipe's write end and can hold it
+/// open indefinitely — observed live as a 21-minute freeze after powershell
+/// itself had exited. Past the grace the captured bytes are returned as-is
+/// and the reader thread is abandoned; it exits on its own when the orphan
+/// finally closes the pipe.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(300);
+
+#[derive(Default)]
+struct PipeState {
+    bytes: Vec<u8>,
+    truncated: bool,
+    done: bool,
+    error: Option<std::io::Error>,
+}
+
+fn spawn_pipe_reader<R>(pipe: Option<R>, max_bytes: usize) -> Arc<Mutex<PipeState>>
 where
     R: Read + Send + 'static,
 {
-    thread::spawn(move || read_pipe_bounded(pipe, max_bytes))
+    let state = Arc::new(Mutex::new(PipeState::default()));
+    let shared = state.clone();
+    thread::spawn(move || read_pipe_into_state(pipe, max_bytes, &shared));
+    state
 }
 
-fn join_pipe_reader(
-    reader: JoinHandle<Result<BoundedPipeOutput, std::io::Error>>,
-) -> Result<BoundedPipeOutput, ShellError> {
-    reader
-        .join()
-        .map_err(|_| ShellError::Io(std::io::Error::other("shell output reader panicked")))?
-        .map_err(ShellError::Io)
+/// A poisoned pipe state still holds valid captured bytes — degrade to using
+/// them rather than panicking inside a tool worker (the scheduler treats a
+/// dead worker as a bug in the harness itself).
+fn lock_state(state: &Mutex<PipeState>) -> MutexGuard<'_, PipeState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-fn read_pipe_bounded(
-    pipe: Option<impl Read>,
-    max_bytes: usize,
-) -> Result<BoundedPipeOutput, std::io::Error> {
+/// Wait for the reader to see EOF, but only up to [`PIPE_DRAIN_GRACE`]; a
+/// pipe kept open by an orphaned grandchild must not stall the tool result.
+fn collect_pipe_capture(state: Arc<Mutex<PipeState>>) -> Result<BoundedPipeOutput, ShellError> {
+    let deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    while !lock_state(&state).done && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+
+    let mut state = lock_state(&state);
+    if let Some(error) = state.error.take() {
+        return Err(ShellError::Io(error));
+    }
+    Ok(BoundedPipeOutput {
+        content: decode_console_bytes(&state.bytes),
+        truncated: state.truncated,
+    })
+}
+
+fn read_pipe_into_state(pipe: Option<impl Read>, max_bytes: usize, state: &Mutex<PipeState>) {
+    let mark_done = |error: Option<std::io::Error>| {
+        let mut state = lock_state(state);
+        state.error = error;
+        state.done = true;
+    };
+
     let Some(mut pipe) = pipe else {
-        return Ok(BoundedPipeOutput {
-            content: String::new(),
-            truncated: false,
-        });
+        mark_done(None);
+        return;
     };
 
     let max_bytes = max_bytes.max(1);
-    let mut captured = Vec::with_capacity(max_bytes.min(8192));
     let mut buffer = [0_u8; 8192];
-    let mut truncated = false;
 
     loop {
-        let read = pipe.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
+        let read = match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(error) => {
+                mark_done(Some(error));
+                return;
+            }
+        };
 
-        let remaining = max_bytes.saturating_sub(captured.len());
+        let mut state = lock_state(state);
+        let remaining = max_bytes.saturating_sub(state.bytes.len());
         if remaining > 0 {
             let kept = read.min(remaining);
-            captured.extend_from_slice(&buffer[..kept]);
+            state.bytes.extend_from_slice(&buffer[..kept]);
             if kept < read {
-                truncated = true;
+                state.truncated = true;
             }
         } else {
-            truncated = true;
+            state.truncated = true;
         }
     }
 
-    Ok(BoundedPipeOutput {
-        content: decode_console_bytes(&captured),
-        truncated,
-    })
+    mark_done(None);
 }
 
 /// Decode captured pipe bytes: UTF-8 first, then (Windows) the console's

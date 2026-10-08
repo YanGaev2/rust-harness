@@ -32,7 +32,7 @@ fn tool_specs_declare_measured_parameter_schemas() {
     // is silent. The schemas advertise the exact names it already sends in
     // combat (file_path, pattern, old_string/new_string) and pin the
     // timeout unit to seconds — the one place its priors are split.
-    let specs = ToolRuntime::tool_specs();
+    let specs = ToolRuntime::tool_specs_with_shell(Some(&ShellProfile::native()));
     let schema_of = |name: &str| {
         specs
             .iter()
@@ -350,7 +350,7 @@ fn tools_are_advertised_under_model_prior_names() {
     // Probe of DeepSeek priors (probe_all_tools, 2026-07-12): the model
     // thinks in verb_noun names — advertise the names it already knows
     // instead of making it translate ours.
-    let names: Vec<String> = ToolRuntime::tool_specs()
+    let names: Vec<String> = ToolRuntime::tool_specs_with_shell(Some(&ShellProfile::native()))
         .iter()
         .map(|spec| spec.name().to_string())
         .collect();

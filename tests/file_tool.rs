@@ -9,14 +9,12 @@ fn write_text_does_not_require_a_prior_read_and_records_previous_content() {
         .write_text("src\\nested/notes.txt", "hello", WriteMode::Replace)
         .unwrap();
     assert!(created.created);
-    assert!(!created.required_prior_read);
     assert_eq!(created.previous_len, None);
 
     let updated = tool
         .write_text("src/nested/notes.txt", "hello v2", WriteMode::Replace)
         .unwrap();
     assert!(!updated.created);
-    assert!(!updated.required_prior_read);
     assert_eq!(updated.previous_len, Some(5));
 
     let written =
@@ -260,7 +258,9 @@ fn search_text_finds_matches_with_line_numbers_and_limits_large_files() {
     )
     .unwrap();
 
-    let result = tool.search_text("src", "needle", 2, 1024).unwrap();
+    let result = tool
+        .search_text_with_context("src", "needle", 2, 1024, 0)
+        .unwrap();
 
     assert_eq!(result.matches.len(), 2);
     assert_eq!(result.matches[0].path, "src/a.txt");

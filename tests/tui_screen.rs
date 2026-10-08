@@ -2,10 +2,7 @@ use std::path::PathBuf;
 
 use harness_cli::cli;
 use harness_cli::providers::{CachePolicy, ChatApiFormat};
-use harness_cli::tui::{
-    SetupTuiAction, SetupTuiApp, TuiAction, TuiApp, TuiCommand, TuiProviderDraft, setup_lines,
-    setup_tui_lines,
-};
+use harness_cli::tui::{TuiAction, TuiApp, TuiCommand, TuiProviderDraft, setup_lines};
 use harness_tui::input::{KeyCode, KeyEvent};
 use harness_tui::text::Line;
 
@@ -13,10 +10,10 @@ use harness_tui::text::Line;
 fn setup_tui_accepts_provider_add_command() {
     let mut app = setup_app();
 
-    type_text(&mut app, "/provider add");
+    type_text_tui(&mut app, "/provider add");
     let action = app.handle_key(key(KeyCode::Enter));
 
-    assert_eq!(action, SetupTuiAction::ProviderAdd);
+    assert_eq!(action, TuiAction::Command(TuiCommand::ProviderAdd));
     assert_eq!(app.input(), "");
     assert!(app.status_message().contains("Provider setup"));
 }
@@ -24,9 +21,9 @@ fn setup_tui_accepts_provider_add_command() {
 #[test]
 fn setup_tui_renders_status_paths_commands_and_prompt() {
     let mut app = setup_app();
-    type_text(&mut app, "/providers");
+    type_text_tui(&mut app, "/providers");
 
-    let screen = lines_text(&setup_tui_lines(&app, 96));
+    let screen = lines_text(&setup_lines(&app, 96));
     assert!(screen.contains("harness"));
     assert!(screen.contains("no provider configured"));
     assert!(screen.contains("workspace"));
@@ -82,6 +79,33 @@ fn tui_provider_add_runs_inside_wizard_and_returns_provider_draft() {
 }
 
 #[test]
+fn wizard_defaults_come_from_builtin_profiles() {
+    let mut app = setup_app();
+
+    type_text_tui(&mut app, "/provider add");
+    app.handle_key(key(KeyCode::Enter)); // open wizard
+    app.handle_key(key(KeyCode::Down)); // codex -> xiaomi
+    app.handle_key(key(KeyCode::Down)); // xiaomi -> glm
+    app.handle_key(key(KeyCode::Enter)); // pick glm -> base URL step
+    app.handle_key(key(KeyCode::Enter)); // accept default base URL -> API key step
+    type_text_tui(&mut app, "sk-test");
+    app.handle_key(key(KeyCode::Enter)); // -> model step
+    let action = app.handle_key(key(KeyCode::Enter)); // accept default model -> save
+
+    // The wizard must offer the canonical profile data (providers.rs), not a
+    // private copy — the copy had already drifted to open.bigmodel.cn/glm-4.5.
+    assert_eq!(
+        action,
+        TuiAction::SaveProvider(TuiProviderDraft {
+            name: "glm".to_string(),
+            base_url: "https://api.z.ai/api/paas/v4".to_string(),
+            api_key: "sk-test".to_string(),
+            model: "glm-5.2".to_string(),
+        })
+    );
+}
+
+#[test]
 fn tui_paste_fills_api_key_field_in_wizard_and_strips_newline() {
     let mut app = TuiApp::new(
         "harness",
@@ -91,7 +115,10 @@ fn tui_paste_fills_api_key_field_in_wizard_and_strips_newline() {
 
     type_text_tui(&mut app, "/provider add");
     app.handle_key(key(KeyCode::Enter)); // open wizard on the provider step
-    app.handle_key(key(KeyCode::Enter)); // accept first provider -> base URL step
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Down)); // codex -> ... -> deepseek
+    }
+    app.handle_key(key(KeyCode::Enter)); // pick deepseek -> base URL step
     app.handle_key(key(KeyCode::Enter)); // accept default base URL -> API key step
 
     // Clipboards routinely include a trailing newline. A bracketed paste must
@@ -111,7 +138,7 @@ fn tui_paste_fills_api_key_field_in_wizard_and_strips_newline() {
 #[test]
 fn setup_tui_esc_arms_then_second_esc_exits() {
     let mut app = setup_app();
-    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Continue);
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Continue);
     assert!(
         app.status_message().contains("Press Esc again"),
         "{}",
@@ -119,9 +146,9 @@ fn setup_tui_esc_arms_then_second_esc_exits() {
     );
     // Any other key disarms the confirmation…
     app.handle_key(key(KeyCode::Char('x')));
-    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Continue);
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Continue);
     // …and a straight double Esc exits.
-    assert_eq!(app.handle_key(key(KeyCode::Esc)), SetupTuiAction::Exit);
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), TuiAction::Exit);
 }
 
 #[test]
@@ -263,8 +290,8 @@ fn cli_finishes_setup_from_tui_save_provider_action() {
     assert!(loaded.provider("deepseek").is_some());
 }
 
-fn setup_app() -> SetupTuiApp {
-    SetupTuiApp::new(
+fn setup_app() -> TuiApp {
+    TuiApp::new(
         "harness",
         PathBuf::from("C:/config/providers.json"),
         PathBuf::from("C:/work/project"),
@@ -272,12 +299,6 @@ fn setup_app() -> SetupTuiApp {
 }
 
 fn type_text_tui(app: &mut TuiApp, text: &str) {
-    for ch in text.chars() {
-        app.handle_key(key(KeyCode::Char(ch)));
-    }
-}
-
-fn type_text(app: &mut SetupTuiApp, text: &str) {
     for ch in text.chars() {
         app.handle_key(key(KeyCode::Char(ch)));
     }

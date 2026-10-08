@@ -1385,6 +1385,39 @@ fn agent_run_command_accepts_max_tool_concurrency_limit() {
 }
 
 #[test]
+fn agent_run_command_accepts_retain_thinking_flag() {
+    let root = tempfile::tempdir().unwrap();
+    let config_path = root.path().join("providers.json");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut output = Vec::new();
+
+    let err = cli::run(
+        vec![
+            "harness-cli".to_string(),
+            "agent".to_string(),
+            "run".to_string(),
+            "--config".to_string(),
+            config_path.display().to_string(),
+            "--workspace".to_string(),
+            workspace.display().to_string(),
+            "--provider".to_string(),
+            "local".to_string(),
+            "--model".to_string(),
+            "deepseek-v4-pro".to_string(),
+            "--message".to_string(),
+            "loop tools".to_string(),
+            "--retain-thinking".to_string(),
+        ],
+        &mut output,
+    )
+    .unwrap_err();
+
+    // The flag itself parses; the failure is the missing provider config.
+    assert!(err.to_string().contains("unknown provider: local"));
+}
+
+#[test]
 fn agent_run_command_accepts_tool_timeout_limit() {
     let root = tempfile::tempdir().unwrap();
     let config_path = root.path().join("providers.json");

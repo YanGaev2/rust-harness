@@ -134,6 +134,21 @@ fn timeout_408_switches() {
     assert_eq!(c.action, FailureAction::SwitchProvider);
 }
 
+#[test]
+fn transport_errors_retry_in_place_before_switching() {
+    // Обрыв соединения/таймаут чтения чаще всего транзиентен (LB перезапустил
+    // апстрим, сеть мигнула): пара быстрых повторов на месте дешевле, чем
+    // сразу жечь цепочку. Исчерпанные повторы agent-цикл и так превращает
+    // в переключение.
+    let io = ChatClientError::Io(std::io::Error::other("connection reset"));
+    let c = classify(&io);
+    assert_eq!(c.reason, FailureReason::Transport);
+    assert_eq!(
+        c.action,
+        FailureAction::RetrySameProvider { after_seconds: 1 }
+    );
+}
+
 // ---------------------------------------------------------------- цепочка
 
 use harness_cli::failover::FallbackChain;

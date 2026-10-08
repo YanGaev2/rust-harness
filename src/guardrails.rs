@@ -28,6 +28,8 @@ const IDEMPOTENT_TOOLS: &[&str] = &[
     "file.hash",
     "file.stat",
     "attachment.read",
+    "web.search",
+    "web.fetch",
 ];
 
 pub fn is_idempotent(canonical_tool: &str) -> bool {

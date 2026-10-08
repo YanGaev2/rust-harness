@@ -81,10 +81,14 @@ pub fn classify(err: &ChatClientError) -> ClassifiedError {
             retry_after_seconds,
             ..
         } => classify_status(*code, body, *retry_after_seconds),
-        // Сеть/хост недоступны: другой base_url цепочки может быть жив.
+        // Обрыв соединения / чтения чаще транзиентен (LB перезапустил
+        // апстрим, сеть мигнула): пара быстрых повторов на месте дешевле
+        // немедленного переключения. Исчерпанные повторы agent-цикл сам
+        // превращает в переключение, так что цепочка остаётся запасным
+        // выходом для стойко мёртвого хоста.
         ChatClientError::Http(_) | ChatClientError::Io(_) => ClassifiedError {
             reason: FailureReason::Transport,
-            action: FailureAction::SwitchProvider,
+            action: FailureAction::RetrySameProvider { after_seconds: 1 },
         },
         // Битый JSON — наш парсер или сломанный провайдер; переключение
         // спрятало бы баг, который надо чинить.

@@ -14,6 +14,7 @@ use harness_tui::terminal as tui_terminal;
 
 use crate::agent::{AgentError, AgentEvent, AgentRunner};
 use crate::chat::{BusyAction, ChatAction, ChatApp, busy_action};
+use crate::chat_client::WireTap;
 use crate::clipboard::{
     AttachmentStore, ClipboardAttachment, ClipboardCapture, ClipboardError, ClipboardSource,
     SystemClipboard,
@@ -149,14 +150,9 @@ impl ReplSession {
     }
 
     fn apply_attachment(&mut self, attachment: &ClipboardAttachment) {
-        if attachment.kind == "text" {
-            if let Some(text) = attachment.prompt_fragment.strip_prefix("clipboard text:\n") {
-                self.input.push_str(text);
-            } else {
-                self.push_prompt_fragment(&attachment.prompt_fragment);
-            }
-        } else {
-            self.push_prompt_fragment(&attachment.prompt_fragment);
+        match attachment.inline_text() {
+            Some(text) => self.input.push_str(text),
+            None => self.push_prompt_fragment(&attachment.prompt_fragment),
         }
     }
 
@@ -261,11 +257,7 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
     } = options;
     let mut active_provider = provider;
     let mut active_model = model;
-    let mut catalog = if provider_catalog.is_empty() {
-        vec![active_provider.clone()]
-    } else {
-        provider_catalog
-    };
+    let mut catalog = provider_catalog;
 
     // Raw mode needs a real console; a fully piped run (tests, scripts,
     // `echo … | harness repl > out`) has none, and cooked pipe input is
@@ -297,7 +289,7 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
         render_event_feedback(&repl_event, session.input(), output)?;
 
         match action {
-            ReplAction::Continue => {}
+            ReplAction::Continue => continue,
             ReplAction::Exit => {
                 writeln!(output)?;
                 break;
@@ -305,8 +297,6 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
             ReplAction::CommandError(err) => {
                 writeln!(output)?;
                 writeln!(output, "{err}")?;
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::SwitchModel(selection) => {
                 writeln!(output)?;
@@ -320,33 +310,12 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                     }
                     Err(err) => writeln!(output, "{err}")?,
                 }
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::SwitchModelShorthand(arg) => {
                 writeln!(output)?;
                 let pairs = catalog_pairs(&catalog);
-                let flat: Vec<(String, String)> = pairs
-                    .iter()
-                    .flat_map(|(provider, models)| {
-                        models
-                            .iter()
-                            .map(move |model| (provider.clone(), model.clone()))
-                    })
-                    .collect();
-                let resolved = match arg.parse::<usize>() {
-                    Ok(number) => number
-                        .checked_sub(1)
-                        .and_then(|i| flat.get(i).cloned())
-                        .ok_or_else(|| {
-                            format!("no menu entry {number} (run /model to see the list)")
-                        }),
-                    Err(_) => crate::providers::resolve_model_shorthand(
-                        &pairs,
-                        active_provider.name(),
-                        &arg,
-                    ),
-                };
+                let resolved =
+                    crate::providers::resolve_model_arg(&pairs, active_provider.name(), &arg);
                 match resolved.and_then(|(provider_name, model)| {
                     let selection = ReplModelSelection {
                         provider_name,
@@ -364,8 +333,6 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                     }
                     Err(err) => writeln!(output, "{err}")?,
                 }
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::ShowModels => {
                 writeln!(output)?;
@@ -387,8 +354,6 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                     output,
                     "switch: /model N, /model MODEL, /model PROVIDER MODEL (new model names are saved)"
                 )?;
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::HistorySearch(matches) => {
                 writeln!(output)?;
@@ -403,8 +368,6 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                         )?;
                     }
                 }
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::NewSession => {
                 writeln!(output)?;
@@ -413,23 +376,23 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                 for notice in chat.take_notices() {
                     writeln!(output, "{notice}")?;
                 }
-                write!(output, "> ")?;
-                output.flush()?;
             }
             ReplAction::Submit(submission) => {
                 writeln!(output)?;
                 let mut render_error = None;
-                let mut runner =
-                    AgentRunner::new(active_provider.clone(), active_model.clone(), &workspace)
-                        .with_timeout(timeout)
-                        .with_max_tool_rounds(max_rounds)
-                        .with_history(chat.history());
-                if let Some(max_tool_concurrency) = max_tool_concurrency {
-                    runner = runner.with_max_tool_concurrency(max_tool_concurrency);
-                }
-                if let Some(tool_timeout) = tool_timeout {
-                    runner = runner.with_tool_batch_timeout(tool_timeout);
-                }
+                let runner = build_runner(
+                    &active_provider,
+                    &active_model,
+                    &workspace,
+                    &chat,
+                    max_tool_concurrency,
+                    tool_timeout,
+                )
+                .with_timeout(timeout)
+                .with_max_tool_rounds(max_rounds)
+                // Same default as the TUI: thinking models need the
+                // reasoning echo on every assistant turn.
+                .with_retain_thinking(true);
 
                 chat.begin_turn(&submission.message);
                 let run = runner.run_with_events(submission.message, |event| {
@@ -453,10 +416,10 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
                     writeln!(output, "{notice}")?;
                 }
                 writeln!(output)?;
-                write!(output, "> ")?;
-                output.flush()?;
             }
         }
+        write!(output, "> ")?;
+        output.flush()?;
     }
 
     Ok(())
@@ -481,14 +444,10 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     } = options;
     let mut active_provider = provider;
     let mut active_model = model;
-    let mut catalog = if provider_catalog.is_empty() {
-        vec![active_provider.clone()]
-    } else {
-        provider_catalog
-    };
+    let mut catalog = provider_catalog;
 
     tui_terminal::install_panic_restore();
-    let mut screen = Screen::stdout().map_err(tui_io_error)?;
+    let mut screen = Screen::stdout().map_err(|err| ReplError::Io(err.into()))?;
     // Start from a clean viewport with the panel pinned to the bottom
     // edge (the reference-tool chat layout): committed content
     // accumulates just above the editor instead of hanging at the top.
@@ -585,18 +544,18 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                 ChatAction::Submit(message) => {
                     app.set_busy(true);
                     draw_chat(&mut screen, &mut app)?;
-                    let mut runner =
-                        AgentRunner::new(active_provider.clone(), active_model.clone(), &workspace)
-                            .with_timeout(timeout)
-                            .with_max_tool_rounds(max_rounds)
-                            .with_streaming(true)
-                            .with_history(chat.history());
-                    if let Some(max_tool_concurrency) = max_tool_concurrency {
-                        runner = runner.with_max_tool_concurrency(max_tool_concurrency);
-                    }
-                    if let Some(tool_timeout) = tool_timeout {
-                        runner = runner.with_tool_batch_timeout(tool_timeout);
-                    }
+                    let runner = build_runner(
+                        &active_provider,
+                        &active_model,
+                        &workspace,
+                        &chat,
+                        max_tool_concurrency,
+                        tool_timeout,
+                    )
+                    .with_timeout(timeout)
+                    .with_max_tool_rounds(max_rounds)
+                    .with_streaming(true)
+                    .with_retain_thinking(app.retain_thinking());
 
                     // The run executes on a worker thread while this loop keeps
                     // draining agent events into the transcript and polling the
@@ -645,8 +604,14 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                             app.push_system_line("Interrupted by user");
                         }
                         Err(err) => {
+                            let turn_kept = err.messages().is_some();
                             chat.fail_turn(&err);
                             app.push_system_line(format!("error: {err}"));
+                            if turn_kept {
+                                app.push_system_line(
+                                    "turn kept in history — send a follow-up to resume",
+                                );
+                            }
                         }
                     }
                     for notice in chat.take_notices() {
@@ -662,10 +627,6 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
 
     let _ = screen.release();
     Ok(())
-}
-
-fn tui_io_error(err: tui_terminal::TerminalError) -> ReplError {
-    ReplError::Io(io::Error::other(err.to_string()))
 }
 
 /// One frame: commit finalized transcript rows into native scrollback
@@ -896,14 +857,11 @@ fn capture_into_chat(
 ) {
     match capture.capture(clipboard) {
         Ok(Some(attachment)) => {
-            if attachment.kind == "text" {
-                if let Some(text) = attachment.prompt_fragment.strip_prefix("clipboard text:\n") {
-                    app.apply_clipboard_text(text);
-                } else {
-                    app.apply_clipboard_text(&attachment.prompt_fragment);
-                }
-            } else {
-                app.apply_clipboard_text(&attachment.prompt_fragment);
+            let text = attachment
+                .inline_text()
+                .unwrap_or(&attachment.prompt_fragment);
+            app.apply_clipboard_text(text);
+            if attachment.kind != "text" {
                 app.push_system_line(format!("attached {} from clipboard", attachment.kind));
             }
         }
@@ -983,6 +941,35 @@ pub fn resolve_model_selection(
 
 /// The `(provider, models)` view of the catalog used by shorthand
 /// resolution and the `/model` menus.
+/// The runner core both front ends share: session history, optional tool
+/// limits, and the wire tap into the session's raw log. Callers chain their
+/// own timeout/rounds/streaming/retain-thinking on top.
+fn build_runner(
+    provider: &ProviderConfig,
+    model: &str,
+    workspace: &Path,
+    chat: &ChatSession,
+    max_tool_concurrency: Option<usize>,
+    tool_timeout: Option<Duration>,
+) -> AgentRunner {
+    let mut runner = AgentRunner::new(provider.clone(), model.to_string(), workspace)
+        .with_history(chat.history());
+    if let Some(max_tool_concurrency) = max_tool_concurrency {
+        runner = runner.with_max_tool_concurrency(max_tool_concurrency);
+    }
+    if let Some(tool_timeout) = tool_timeout {
+        runner = runner.with_tool_batch_timeout(tool_timeout);
+    }
+    if let Some(wire_log) = chat.wire_log() {
+        // Отказ диска не должен ронять чат — та же политика,
+        // что у остальной персистентности.
+        runner = runner.with_wire_tap(WireTap::new(move |event| {
+            let _ = wire_log.append_event(event);
+        }));
+    }
+    runner
+}
+
 fn catalog_pairs(catalog: &[ProviderConfig]) -> Vec<(String, Vec<String>)> {
     catalog
         .iter()
@@ -1106,7 +1093,7 @@ struct RawModeGuard {
 impl RawModeGuard {
     fn enable() -> Result<Self, ReplError> {
         Ok(Self {
-            _handle: tui_terminal::raw_mode().map_err(tui_io_error)?,
+            _handle: tui_terminal::raw_mode().map_err(|err| ReplError::Io(err.into()))?,
         })
     }
 }

@@ -13,6 +13,11 @@ pub struct ChatMessage {
     content: String,
     tool_call_id: Option<String>,
     tool_calls: Vec<MessageToolCall>,
+    /// Chain-of-thought captured from the provider's response. Always stored
+    /// on assistant turns; whether it is replayed to the provider is decided
+    /// per request by `RequestEnvelope::retain_thinking`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -22,6 +27,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -31,6 +37,7 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: None,
             tool_calls: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -40,6 +47,7 @@ impl ChatMessage {
             content: String::new(),
             tool_call_id: None,
             tool_calls,
+            reasoning: None,
         }
     }
 
@@ -49,7 +57,13 @@ impl ChatMessage {
             content: content.into(),
             tool_call_id: Some(tool_call_id.into()),
             tool_calls: Vec::new(),
+            reasoning: None,
         }
+    }
+
+    pub fn with_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.reasoning = Some(reasoning.into());
+        self
     }
 
     pub fn role(&self) -> &str {
@@ -66,6 +80,10 @@ impl ChatMessage {
 
     pub fn tool_calls(&self) -> &[MessageToolCall] {
         &self.tool_calls
+    }
+
+    pub fn reasoning(&self) -> Option<&str> {
+        self.reasoning.as_deref()
     }
 }
 
@@ -145,6 +163,9 @@ pub struct RequestEnvelope {
     cache_mode: CacheMode,
     tools: Vec<ToolSpec>,
     messages: Vec<ChatMessage>,
+    /// Replay stored assistant reasoning back to the provider. Off by
+    /// default; not part of the stable cache prefix.
+    retain_thinking: bool,
 }
 
 impl RequestEnvelope {
@@ -156,6 +177,7 @@ impl RequestEnvelope {
             cache_mode: CacheMode::None,
             tools: Vec::new(),
             messages: Vec::new(),
+            retain_thinking: false,
         }
     }
 
@@ -176,6 +198,11 @@ impl RequestEnvelope {
 
     pub fn with_messages(mut self, messages: Vec<ChatMessage>) -> Self {
         self.messages = messages;
+        self
+    }
+
+    pub fn with_retain_thinking(mut self, retain_thinking: bool) -> Self {
+        self.retain_thinking = retain_thinking;
         self
     }
 
@@ -208,6 +235,10 @@ impl RequestEnvelope {
 
     pub fn messages(&self) -> &[ChatMessage] {
         &self.messages
+    }
+
+    pub fn retain_thinking(&self) -> bool {
+        self.retain_thinking
     }
 }
 

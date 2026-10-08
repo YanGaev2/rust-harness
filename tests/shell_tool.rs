@@ -1,4 +1,6 @@
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use harness_cli::tools::shell::{ShellError, ShellTool};
 
@@ -148,6 +150,88 @@ fn shell_tool_truncates_large_stderr_without_timing_out() {
     assert_eq!(output.stdout, "");
     assert!(!output.stdout_truncated);
     assert_eq!(output.max_output_bytes, 2048);
+}
+
+#[test]
+fn shell_tool_returns_after_child_exits_even_if_background_process_holds_pipe() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(10));
+    // The spawned background process inherits the shell's stdout/stderr pipe
+    // handles (observed live: `Start-Process node server.js` with redirects
+    // kept the agent frozen for 21+ minutes after powershell itself exited).
+    // The tool must return once its direct child is gone, not wait for EOF.
+    let command = native_spawn_detached_command();
+
+    let started = Instant::now();
+    let output = tool.run(command).unwrap();
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "run() blocked for {elapsed:?} on a pipe held by the background child"
+    );
+    assert_eq!(output.exit_code, Some(0));
+    assert!(
+        output.stdout.contains("spawned"),
+        "stdout lost pre-exit output: {:?}",
+        output.stdout
+    );
+}
+
+#[test]
+fn shell_tool_cancel_flag_kills_running_command() {
+    let root = tempfile::tempdir().unwrap();
+    // Timeout far above the cancel point: the early return must come from
+    // the flag, not from the timeout machinery.
+    let tool = ShellTool::native(root.path(), Duration::from_secs(30));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let setter = {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            cancel.store(true, Ordering::SeqCst);
+        })
+    };
+
+    let started = Instant::now();
+    let err = tool
+        .run_with_cancel(native_long_sleep_command(), Some(&cancel))
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    setter.join().unwrap();
+
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "cancel did not interrupt the command: took {elapsed:?}"
+    );
+    match err {
+        ShellError::Cancelled { output } => assert_eq!(output.exit_code, None),
+        other => panic!("expected cancelled error, got {other}"),
+    }
+}
+
+#[cfg(windows)]
+fn native_long_sleep_command() -> &'static str {
+    "Start-Sleep -Seconds 30"
+}
+
+#[cfg(target_os = "linux")]
+fn native_long_sleep_command() -> &'static str {
+    "sleep 30"
+}
+
+#[cfg(windows)]
+fn native_spawn_detached_command() -> &'static str {
+    // Redirects force UseShellExecute=false → CreateProcess inherits ALL
+    // inheritable handles, including our capture pipes — the live repro.
+    "Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep -Seconds 8' \
+     -RedirectStandardOutput out.log -RedirectStandardError err.log -WindowStyle Hidden; \
+     Write-Output spawned"
+}
+
+#[cfg(target_os = "linux")]
+fn native_spawn_detached_command() -> &'static str {
+    "sleep 8 & printf spawned"
 }
 
 #[cfg(windows)]

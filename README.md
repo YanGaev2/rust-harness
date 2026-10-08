@@ -223,6 +223,13 @@ returns a final answer. Add `--stream` to consume the response over SSE
 harness agent run --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --message "write notes.txt" --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000 --stream
 ```
 
+Add `--retain-thinking` to replay each assistant turn's reasoning back to the
+provider (`reasoning_content` on OpenAI-compatible APIs, an unsigned `thinking`
+block on Anthropic-format ones). Off by default — reasoning is always captured
+in traces and session files either way. Thinking-mode DeepSeek V4 / Kimi / MiMo
+require the echo-back on tool-call turns, so switch it on for those models; the
+Responses format has no replayable form and ignores the flag.
+
 Save a full JSON trace and a separate tool-error report for an agent run:
 
 ```powershell
@@ -276,7 +283,8 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   Up/Down select, Tab completes, Esc closes, Enter runs. Typing `/model ` extends
   the menu with the saved provider/model pairs themselves.
   Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/paste`,
-  `/history QUERY`, `/clear`, `/new`, `/cost`, `/help`, `/exit`.
+  `/history QUERY`, `/clear`, `/new`, `/cost`, `/retain-thinking`, `/help`,
+  `/exit`.
 - **Interactive model picker**: `/model` alone opens a selector under the
   input — `→ deepseek-v4-pro [deepseek] ✓` rows (cursor arrow, dimmed provider,
   check on the active pair) with a `(K/N)` counter; Up/Down move, typing
@@ -339,8 +347,10 @@ variable; default `~/.harness`):
 ├── sessions/
 │   ├── 2026-07-11T09-15-42Z_a1b2c3.jsonl   # one session = one append-only JSONL
 │   └── last                                 # pointer to the session resumed on launch
-└── traces/
-    └── 2026-07-11T09-15-42Z_deepseek_r3.json  # one agent run = one raw trace
+├── traces/
+│   └── 2026-07-11T09-15-42Z_deepseek_r3.json  # one agent run = one raw trace
+└── raw/
+    └── 2026-07-11T09-15-42Z_a1b2c3.jsonl   # raw wire log, same file name as the session
 ```
 
 - **Session JSONL**: first line is a `meta` header (session id, workspace,
@@ -356,6 +366,12 @@ variable; default `~/.harness`):
   `session_id`, and `turn` — one file per run, success or failure, including
   one-shot `agent run`. Feed these to an LLM (or scripts) to compare models and
   spot bad tool calls offline.
+- **Raw wire log**: every provider request body, blocking response body, and
+  SSE `data:` line (including `[DONE]`) is appended pre-parse as
+  `{ts, kind, url, body}` JSONL — insurance against parser bugs: whatever
+  actually crossed the wire survives even when response parsing drops a field.
+  Bodies only, headers (and auth keys) are never written. On automatically in
+  the REPL/TUI whenever session persistence is active.
 - Persistence failures never kill the chat: they surface as warnings and the
   conversation continues in memory.
 
@@ -382,6 +398,22 @@ Execute a bounded-concurrency batch of tool calls:
 ```powershell
 harness tool batch --workspace . --max-concurrency 4 --timeout-ms 10000 '[{"id":"one","name":"write_file","arguments":{"file":"one.txt","text":"1"}}]'
 ```
+
+Search the public web (keyless DuckDuckGo scraper; result titles, URLs, snippets):
+
+```powershell
+harness tool call --workspace . web_search '{"query":"rust ureq timeout","count":5}'
+```
+
+Fetch a page as readable text (HTML stripped, entities decoded, output bounded):
+
+```powershell
+harness tool call --workspace . web_fetch '{"url":"https://blog.rust-lang.org/","max_chars":4000}'
+```
+
+In agent runs both tools are advertised automatically (`web_search`/`web_fetch`,
+probe-aligned names) and follow the provider's proxy policy; `harness tool call`
+goes direct.
 
 Capture the current system clipboard as a prompt-ready attachment:
 
@@ -501,8 +533,33 @@ Planned:
 - Native shell command timeout, per-call `timeout_ms`, and bounded stdout/stderr
   capture so tool execution does not hang on full pipes or retain unbounded
   command output.
-- Timed-out shell commands kill the child process, join bounded stdout/stderr
-  readers, and retain captured output metadata for diagnostics.
+- Timed-out shell commands kill the child process and retain captured output
+  metadata for diagnostics. Pipe readers are drained with a short grace period,
+  never joined to EOF: a background process the command left behind (a server
+  started via `Start-Process`/`&`) inherits the pipe and would otherwise freeze
+  the agent until it exits.
+- Esc/Ctrl+C during an agent turn cancels a running `shell.exec`: the shared
+  cancel flag reaches the tool runtime, the shell child is killed, and the
+  partial output comes back in the cancelled result.
+- SSE idle timeout has a **300s floor**: providers that buffer whole tool
+  calls (baseten/Kimi) go legitimately silent for minutes while the model
+  writes a large file; connect/header phases keep the snappy request timeout.
+  While the stream is silent ≥15s the chat shows a dimmed
+  `stream silent Ns — model may still be generating; Esc interrupts` note.
+- Truncated streams surface as errors instead of shorter answers: an in-band
+  SSE `{"error":...}` event maps onto the HTTP-error taxonomy for the failover
+  classifier, and EOF without `[DONE]`/`finish_reason` is `UnexpectedEof`.
+  Transport errors get up to two quick in-place retries before the fallback
+  chain is consulted — unless deltas already reached the user, in which case
+  the turn fails fast (no silent replay that would duplicate visible text).
+- **A failed or interrupted turn keeps its conversation**: the error carries
+  the messages up to the cut (user message + a partial assistant turn with
+  any streamed text and thinking), the session history adopts them, and the
+  partial thinking is echoed back to the API on the next request. A follow-up
+  "продолжай" resumes the turn instead of starting from a blank context.
+- Reasoning retention is **on by default** in the chat TUI and line REPL
+  (`/retain-thinking` toggles it): DeepSeek V4 / Kimi / MiMo thinking modes
+  require the echo-back on every assistant turn.
 - Bounded tool scheduler for concurrent batch execution with order-preserving JSON results
   and optional batch deadlines that mark unfinished calls as cancelled results.
 - Multi-turn agent runner that appends assistant tool-call messages, executes tools,

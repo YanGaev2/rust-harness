@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -13,6 +15,7 @@ use crate::request::ToolSpec;
 use crate::tools::attachments::{AttachmentError, AttachmentTool};
 use crate::tools::files::{FileTool, ToolError, WriteMode};
 use crate::tools::shell::{DEFAULT_MAX_OUTPUT_BYTES, ShellError, ShellTool};
+use crate::tools::web::{DEFAULT_FETCH_MAX_CHARS, DEFAULT_SEARCH_COUNT, WebError, WebTool};
 
 const DEFAULT_FILE_READ_MAX_BYTES: usize = 1024 * 1024;
 const DEFAULT_FILE_TAIL_MAX_BYTES: usize = 64 * 1024;
@@ -118,6 +121,9 @@ pub struct ToolRuntime {
     workspace: PathBuf,
     shell_timeout: Duration,
     shell_profile: Option<ShellProfile>,
+    web_proxy: Option<String>,
+    web_search_base: Option<String>,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ToolRuntime {
@@ -126,7 +132,32 @@ impl ToolRuntime {
             workspace: workspace.into(),
             shell_timeout: Duration::from_secs(30),
             shell_profile: Some(ShellProfile::native()),
+            web_proxy: None,
+            web_search_base: None,
+            cancel: None,
         }
+    }
+
+    /// Cooperative cancellation shared with the agent loop: a long-running
+    /// `shell.exec` watches the flag and kills its child when it flips.
+    pub fn with_cancel_flag(mut self, cancel: Arc<AtomicBool>) -> Self {
+        self.cancel = Some(cancel);
+        self
+    }
+
+    /// Proxy for the web tools, in the chat client's vocabulary
+    /// (`None`/"none" direct, "env" opt-in, otherwise a URL). The agent loop
+    /// passes the session provider's resolved proxy so web traffic follows
+    /// the same egress policy as chat traffic.
+    pub fn with_web_proxy(mut self, proxy: Option<String>) -> Self {
+        self.web_proxy = proxy;
+        self
+    }
+
+    /// Override the web search endpoint (tests point this at a mock server).
+    pub fn with_web_search_base(mut self, base: impl Into<String>) -> Self {
+        self.web_search_base = Some(base.into());
+        self
     }
 
     pub fn with_shell_timeout(mut self, timeout: Duration) -> Self {
@@ -140,14 +171,6 @@ impl ToolRuntime {
     pub fn with_shell_profile(mut self, profile: Option<ShellProfile>) -> Self {
         self.shell_profile = profile;
         self
-    }
-
-    /// Tools as advertised to the model: wire names follow the model's own
-    /// priors (see [`wire_tool_name`]); the runtime keeps dotted canonical
-    /// names internally. Assumes the compile-time native shell; prefer
-    /// [`ToolRuntime::tool_specs_with_shell`] with the detected profile.
-    pub fn tool_specs() -> Vec<ToolSpec> {
-        Self::tool_specs_with_shell(Some(&ShellProfile::native()))
     }
 
     /// Tool specs with the shell tool described by (and gated on) the shell
@@ -300,6 +323,29 @@ impl ToolRuntime {
                     &[MAX_BYTES],
                 ),
             ),
+            // Probe 2026-08-01: without web tools models bend grep_search or
+            // shell curl into web duty; the descriptions below draw the
+            // public-web / workspace-files line explicitly to prevent that.
+            spec(
+                "web.search",
+                "Search the public web (not workspace files) and return result titles, URLs, and snippets.",
+                tool_schema(
+                    &[("query", "string", "The search query")],
+                    &[("count", "integer", "Max results to return (default 8)")],
+                ),
+            ),
+            spec(
+                "web.fetch",
+                "Fetch a public http(s) URL and return its readable text content (HTML is converted to plain text, output is bounded).",
+                tool_schema(
+                    &[("url", "string", "The http(s) URL to fetch")],
+                    &[(
+                        "max_chars",
+                        "integer",
+                        "Cap for the returned text (default 20000)",
+                    )],
+                ),
+            ),
         ];
         if let Some(profile) = shell {
             specs.push(
@@ -348,6 +394,8 @@ impl ToolRuntime {
             "file.move" => self.execute_file_move(call, repaired),
             "attachment.read" => self.execute_attachment_read(call, repaired),
             "shell.exec" => self.execute_shell(call, repaired),
+            "web.search" => self.execute_web_search(call, repaired),
+            "web.fetch" => self.execute_web_fetch(call, repaired),
             _ => Err(RuntimeError::UnknownTool(call.name)),
         }
     }
@@ -380,17 +428,7 @@ impl ToolRuntime {
         tool_name: &str,
         mode: WriteMode,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
+        let path = string_arg(&call.arguments, PATH_ALIASES)?;
         let content = string_arg(&call.arguments, &["content", "text", "body", "contents"])?;
         let result = FileTool::new(&self.workspace).write_text(&path, &content, mode)?;
         Ok(ToolCallResult {
@@ -402,7 +440,6 @@ impl ToolRuntime {
             metadata: json!({
                 "created": result.created,
                 "previous_len": result.previous_len,
-                "required_prior_read": result.required_prior_read,
             }),
         })
     }
@@ -412,17 +449,7 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
+        let path = string_arg(&call.arguments, PATH_ALIASES)?;
         let old_text = string_arg(
             &call.arguments,
             &[
@@ -511,38 +538,44 @@ impl ToolRuntime {
         })
     }
 
+    /// Skeleton shared by the single-path file executors: pull the path from
+    /// its aliases, run the op, stamp the constant result fields once.
+    fn file_op(
+        &self,
+        call: ToolCall,
+        repaired_name: bool,
+        tool_name: &str,
+        run: impl FnOnce(FileTool, &Value, &str) -> Result<(String, Value), RuntimeError>,
+    ) -> Result<ToolCallResult, RuntimeError> {
+        let path = string_arg(&call.arguments, PATH_ALIASES)?;
+        let (content, metadata) = run(FileTool::new(&self.workspace), &call.arguments, &path)?;
+        Ok(ToolCallResult {
+            id: call.id,
+            tool_name: tool_name.to_string(),
+            ok: true,
+            repaired: repaired_name,
+            content,
+            metadata,
+        })
+    }
+
     fn execute_file_read(
         &self,
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
-        let max_bytes = optional_usize_arg(&call.arguments, &["max_bytes", "limit"])
-            .unwrap_or(DEFAULT_FILE_READ_MAX_BYTES);
-        let result = FileTool::new(&self.workspace).read_text_bounded(&path, max_bytes)?;
-        Ok(ToolCallResult {
-            id: call.id,
-            tool_name: "file.read".to_string(),
-            ok: true,
-            repaired: repaired_name,
-            content: result.content,
-            metadata: json!({
+        self.file_op(call, repaired_name, "file.read", |tool, args, path| {
+            let max_bytes = optional_usize_arg(args, &["max_bytes", "limit"])
+                .unwrap_or(DEFAULT_FILE_READ_MAX_BYTES);
+            let result = tool.read_text_bounded(path, max_bytes)?;
+            let metadata = json!({
                 "path": result.path,
                 "bytes_read": result.bytes_read,
                 "total_bytes": result.total_bytes,
                 "truncated": result.truncated,
                 "max_bytes": max_bytes,
-            }),
+            });
+            Ok((result.content, metadata))
         })
     }
 
@@ -551,30 +584,15 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
-        let result = FileTool::new(&self.workspace).hash_file(&path)?;
-        Ok(ToolCallResult {
-            id: call.id,
-            tool_name: "file.hash".to_string(),
-            ok: true,
-            repaired: repaired_name,
-            content: result.hash.clone(),
-            metadata: json!({
+        self.file_op(call, repaired_name, "file.hash", |tool, _args, path| {
+            let result = tool.hash_file(path)?;
+            let metadata = json!({
                 "path": result.path,
                 "bytes": result.bytes,
                 "algorithm": result.algorithm,
                 "hash": result.hash,
-            }),
+            });
+            Ok((result.hash, metadata))
         })
     }
 
@@ -583,36 +601,22 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
-        let result = FileTool::new(&self.workspace).stat_path(&path)?;
-        Ok(ToolCallResult {
-            id: call.id,
-            tool_name: "file.stat".to_string(),
-            ok: true,
-            repaired: repaired_name,
-            content: format!(
+        self.file_op(call, repaired_name, "file.stat", |tool, _args, path| {
+            let result = tool.stat_path(path)?;
+            let content = format!(
                 "{} {}",
                 if result.is_dir { "dir" } else { "file" },
                 result.path
-            ),
-            metadata: json!({
+            );
+            let metadata = json!({
                 "path": result.path,
                 "is_file": result.is_file,
                 "is_dir": result.is_dir,
                 "len": result.len,
                 "readonly": result.readonly,
                 "modified_unix_seconds": result.modified_unix_seconds,
-            }),
+            });
+            Ok((content, metadata))
         })
     }
 
@@ -621,35 +625,20 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
-        let max_bytes = optional_usize_arg(&call.arguments, &["max_bytes", "limit"])
-            .unwrap_or(DEFAULT_FILE_TAIL_MAX_BYTES);
-        let max_lines = optional_usize_arg(&call.arguments, &["max_lines", "lines"]);
-        let result = FileTool::new(&self.workspace).tail_text(&path, max_bytes, max_lines)?;
-        Ok(ToolCallResult {
-            id: call.id,
-            tool_name: "file.tail".to_string(),
-            ok: true,
-            repaired: repaired_name,
-            content: result.content,
-            metadata: json!({
+        self.file_op(call, repaired_name, "file.tail", |tool, args, path| {
+            let max_bytes = optional_usize_arg(args, &["max_bytes", "limit"])
+                .unwrap_or(DEFAULT_FILE_TAIL_MAX_BYTES);
+            let max_lines = optional_usize_arg(args, &["max_lines", "lines"]);
+            let result = tool.tail_text(path, max_bytes, max_lines)?;
+            let metadata = json!({
                 "path": result.path,
                 "bytes_read": result.bytes_read,
                 "total_bytes": result.total_bytes,
                 "truncated_prefix": result.truncated_prefix,
                 "max_bytes": max_bytes,
                 "max_lines": max_lines,
-            }),
+            });
+            Ok((result.content, metadata))
         })
     }
 
@@ -702,7 +691,7 @@ impl ToolRuntime {
         let repair = repair_shell_command(&command, &self.workspace, is_powershell);
         let output = ShellTool::with_profile(&self.workspace, shell_timeout, profile)
             .with_output_limit(max_output_bytes)
-            .run(&repair.command)?;
+            .run_with_cancel(&repair.command, self.cancel.as_deref())?;
 
         let ok = output.exit_code == Some(0);
         // stderr carries the reason on failure (and cargo-style tools log there
@@ -751,6 +740,100 @@ impl ToolRuntime {
             repaired: repaired_name || !notes.is_empty(),
             content,
             metadata,
+        })
+    }
+
+    fn web_tool(&self) -> WebTool {
+        let mut tool = WebTool::new().with_proxy(self.web_proxy.clone());
+        if let Some(base) = &self.web_search_base {
+            tool = tool.with_search_base(base);
+        }
+        tool
+    }
+
+    fn execute_web_search(
+        &self,
+        call: ToolCall,
+        repaired_name: bool,
+    ) -> Result<ToolCallResult, RuntimeError> {
+        let query = string_arg(
+            &call.arguments,
+            &["query", "q", "search", "search_term", "keywords", "text"],
+        )?;
+        let count = optional_usize_arg(
+            &call.arguments,
+            &["count", "max_results", "limit", "num_results"],
+        )
+        .unwrap_or(DEFAULT_SEARCH_COUNT);
+        let results = self.web_tool().search(&query, count)?;
+        let content = if results.is_empty() {
+            format!("(no web results for \"{query}\")")
+        } else {
+            results
+                .iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    format!(
+                        "{}. {}\n   {}\n   {}",
+                        index + 1,
+                        result.title,
+                        result.url,
+                        result.snippet
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        Ok(ToolCallResult {
+            id: call.id,
+            tool_name: "web.search".to_string(),
+            ok: true,
+            repaired: repaired_name,
+            content,
+            metadata: json!({
+                "query": query,
+                "results": results.len(),
+                "engine": "duckduckgo",
+            }),
+        })
+    }
+
+    fn execute_web_fetch(
+        &self,
+        call: ToolCall,
+        repaired_name: bool,
+    ) -> Result<ToolCallResult, RuntimeError> {
+        let url = string_arg(
+            &call.arguments,
+            &["url", "uri", "link", "page", "address", "target_url"],
+        )?;
+        let max_chars = optional_usize_arg(
+            &call.arguments,
+            &["max_chars", "max_length", "limit", "max_bytes"],
+        )
+        .unwrap_or(DEFAULT_FETCH_MAX_CHARS);
+        let result = self.web_tool().fetch(&url, max_chars)?;
+        // An empty page must not come back as "": a bare result makes the
+        // model re-verify with extra calls (same lesson as quiet shell runs).
+        let content = if result.text.trim().is_empty() {
+            "(page fetched but no readable text was extracted)".to_string()
+        } else {
+            result.text.clone()
+        };
+        Ok(ToolCallResult {
+            id: call.id,
+            tool_name: "web.fetch".to_string(),
+            ok: true,
+            repaired: repaired_name,
+            content,
+            metadata: json!({
+                "url": result.url,
+                "content_type": result.content_type,
+                "bytes_downloaded": result.bytes_downloaded,
+                "body_truncated": result.body_truncated,
+                "text_truncated": result.text_truncated,
+                "max_chars": max_chars,
+            }),
         })
     }
 
@@ -888,28 +971,14 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let path = string_arg(
-            &call.arguments,
-            &[
-                "path",
-                "file",
-                "filename",
-                "file_path",
-                "filepath",
-                "target_file",
-            ],
-        )?;
-        let result = FileTool::new(&self.workspace).delete_path(&path)?;
-        Ok(ToolCallResult {
-            id: call.id,
-            tool_name: "file.delete".to_string(),
-            ok: true,
-            repaired: repaired_name,
-            content: format!("deleted {}", result.path),
-            metadata: json!({
+        self.file_op(call, repaired_name, "file.delete", |tool, _args, path| {
+            let result = tool.delete_path(path)?;
+            let content = format!("deleted {}", result.path);
+            let metadata = json!({
                 "path": result.path,
                 "was_dir": result.was_dir,
-            }),
+            });
+            Ok((content, metadata))
         })
     }
 
@@ -918,21 +987,8 @@ impl ToolRuntime {
         call: ToolCall,
         repaired_name: bool,
     ) -> Result<ToolCallResult, RuntimeError> {
-        let source = string_arg(
-            &call.arguments,
-            &["source", "from", "path", "file", "src", "source_path"],
-        )?;
-        let target = string_arg(
-            &call.arguments,
-            &[
-                "target",
-                "to",
-                "destination",
-                "dest",
-                "target_path",
-                "destination_path",
-            ],
-        )?;
+        let source = string_arg(&call.arguments, MOVE_SOURCE_ALIASES)?;
+        let target = string_arg(&call.arguments, MOVE_TARGET_ALIASES)?;
         let overwrite =
             optional_bool_arg(&call.arguments, &["overwrite", "replace"]).unwrap_or(false);
         let result = FileTool::new(&self.workspace).move_path(&source, &target, overwrite)?;
@@ -1100,27 +1156,30 @@ fn batch_mutates_shared_paths(calls: &[ToolCall]) -> bool {
     false
 }
 
-/// The workspace paths a call will touch (normalized for comparison) and
-/// whether it mutates them. Alias lists mirror the executors'.
-fn call_conflict_paths(call: &ToolCall) -> (Vec<String>, bool) {
-    const PATH_ALIASES: &[&str] = &[
-        "path",
-        "file",
-        "filename",
-        "file_path",
-        "filepath",
-        "target_file",
-    ];
-    const MOVE_SOURCE_ALIASES: &[&str] = &["source", "from", "path", "file", "src", "source_path"];
-    const MOVE_TARGET_ALIASES: &[&str] = &[
-        "target",
-        "to",
-        "destination",
-        "dest",
-        "target_path",
-        "destination_path",
-    ];
+/// Path-argument aliases shared by the file executors and the batch conflict
+/// detector — a single list so the two can never drift apart.
+const PATH_ALIASES: &[&str] = &[
+    "path",
+    "file",
+    "filename",
+    "file_path",
+    "filepath",
+    "target_file",
+];
+const MOVE_SOURCE_ALIASES: &[&str] =
+    &["source", "from", "path", "file", "src", "source_path"];
+const MOVE_TARGET_ALIASES: &[&str] = &[
+    "target",
+    "to",
+    "destination",
+    "dest",
+    "target_path",
+    "destination_path",
+];
 
+/// The workspace paths a call will touch (normalized for comparison) and
+/// whether it mutates them.
+fn call_conflict_paths(call: &ToolCall) -> (Vec<String>, bool) {
     let Ok(resolution) = ToolResolution::from_name(&call.name) else {
         return (Vec::new(), false);
     };
@@ -1167,6 +1226,7 @@ pub enum RuntimeError {
     File(ToolError),
     Attachment(AttachmentError),
     Shell(ShellError),
+    Web(WebError),
 }
 
 impl fmt::Display for RuntimeError {
@@ -1180,6 +1240,7 @@ impl fmt::Display for RuntimeError {
             Self::File(err) => write!(f, "{err}"),
             Self::Attachment(err) => write!(f, "{err}"),
             Self::Shell(err) => write!(f, "{err}"),
+            Self::Web(err) => write!(f, "{err}"),
         }
     }
 }
@@ -1190,6 +1251,7 @@ impl Error for RuntimeError {
             Self::File(err) => Some(err),
             Self::Attachment(err) => Some(err),
             Self::Shell(err) => Some(err),
+            Self::Web(err) => Some(err),
             _ => None,
         }
     }
@@ -1213,6 +1275,12 @@ impl From<ShellError> for RuntimeError {
     }
 }
 
+impl From<WebError> for RuntimeError {
+    fn from(value: WebError) -> Self {
+        Self::Web(value)
+    }
+}
+
 /// The name a canonical tool is advertised under to the model — its wire
 /// name. These are the names DeepSeek (and models trained on the same
 /// harness culture) produce unprompted, measured by the priors probe
@@ -1233,6 +1301,12 @@ pub fn wire_tool_name(canonical: &str) -> &'static str {
         "file.move" => "move_file",
         "attachment.read" => "get_image",
         "shell.exec" => "run_shell_command",
+        // Probe 2026-08-01: luna reproduces the `web_search {query}` schema
+        // from memory, qwen3.6-35b scans its toolset for "web_search or
+        // similar", and all three lineages call web_search/web_fetch 9/9
+        // clean when advertised under these names.
+        "web.search" => "web_search",
+        "web.fetch" => "web_fetch",
         _ => "unknown_tool",
     }
 }
@@ -1294,6 +1368,10 @@ fn canonical_tool_for(alias: &str) -> Option<&'static str> {
         }
         "shell.exec" | "shell_exec" | "run_command" | "shell" | "run_shell_command"
         | "run_shell" => "shell.exec",
+        "web.search" | "web_search" | "websearch" | "search_web" | "google_web_search"
+        | "internet_search" | "online_search" | "search_internet" => "web.search",
+        "web.fetch" | "web_fetch" | "webfetch" | "fetch" | "fetch_url" | "fetch_page"
+        | "get_url" | "read_url" | "open_url" | "browse" | "curl" | "http_get" => "web.fetch",
         _ => return None,
     })
 }
@@ -1473,138 +1551,6 @@ struct ArgumentRepair {
 /// детерминированно на t=0.0/0.8) и вариации с объектом внутри.
 const ENVELOPE_KEYS: &[&str] = &["parameters", "arguments", "args", "input"];
 
-/// Починить почти-JSON текст: сырой парс, затем экранирование control-chars
-/// в строках, срез висячих запятых и докрытие незакрытых скобок (bounded).
-/// Возвращает распарсенное значение; `None` — текст не спасти.
-fn repair_json_text(raw: &str) -> Option<Value> {
-    let raw = raw.trim();
-    if raw.is_empty() {
-        return None;
-    }
-    if let Ok(value) = serde_json::from_str::<Value>(raw) {
-        return Some(value);
-    }
-    let mut text = escape_control_chars_in_strings(raw);
-    text = strip_trailing_commas(&text);
-    let closers = missing_json_closers(&text);
-    // Больше 8 недостающих закрывашек — это не обрезанный стримом вызов,
-    // а мусор; чинить его дальше рискованнее, чем вернуть как есть.
-    if closers.len() > 8 {
-        return None;
-    }
-    text.push_str(&closers);
-    serde_json::from_str::<Value>(&text).ok()
-}
-
-/// Закрывашки для незакрытых `{`/`[` (и висячей кавычки), вычисленные одним
-/// проходом с учётом строковых литералов и экранирования.
-fn missing_json_closers(text: &str) -> String {
-    let mut stack = Vec::new();
-    let mut in_string = false;
-    let mut escaped = false;
-    for ch in text.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => stack.push('}'),
-            '[' => stack.push(']'),
-            '}' | ']' => {
-                stack.pop();
-            }
-            _ => {}
-        }
-    }
-    let mut out = String::new();
-    if in_string {
-        out.push('"');
-    }
-    while let Some(closer) = stack.pop() {
-        out.push(closer);
-    }
-    out
-}
-
-/// `\n`/`\t`/`\r` живьём внутри строковых литералов -> экранированные
-/// последовательности (аналог питоновского `json.loads(strict=False)`).
-fn escape_control_chars_in_strings(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for ch in text.chars() {
-        if in_string {
-            if escaped {
-                escaped = false;
-                out.push(ch);
-                continue;
-            }
-            match ch {
-                '\\' => {
-                    escaped = true;
-                    out.push(ch);
-                }
-                '"' => {
-                    in_string = false;
-                    out.push(ch);
-                }
-                '\n' => out.push_str("\\n"),
-                '\t' => out.push_str("\\t"),
-                '\r' => out.push_str("\\r"),
-                _ => out.push(ch),
-            }
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Запятая перед `}`/`]` (вне строк) выбрасывается — частый артефакт
-/// генерации у GLM/llama.cpp-стека.
-fn strip_trailing_commas(text: &str) -> String {
-    let chars: Vec<char> = text.chars().collect();
-    let mut out = String::with_capacity(text.len());
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, &ch) in chars.iter().enumerate() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            out.push(ch);
-            continue;
-        }
-        if ch == '"' {
-            in_string = true;
-            out.push(ch);
-            continue;
-        }
-        if ch == ',' {
-            let next_meaning = chars[index + 1..].iter().find(|c| !c.is_whitespace());
-            if matches!(next_meaning, Some('}') | Some(']')) {
-                continue;
-            }
-        }
-        out.push(ch);
-    }
-    out
-}
-
 fn repair_tool_arguments(canonical: &str, arguments: Value) -> ArgumentRepair {
     match arguments {
         Value::String(raw) => raw_tool_arguments(canonical, &raw).unwrap_or(ArgumentRepair {
@@ -1627,9 +1573,8 @@ fn repair_tool_arguments(canonical: &str, arguments: Value) -> ArgumentRepair {
                 let key = object.keys().next().expect("single key").clone();
                 let replacement = match object.get(&key).expect("single value") {
                     Value::Object(map) => Some(map.clone()),
-                    Value::String(raw) => {
-                        repair_json_text(raw).and_then(|value| value.as_object().cloned())
-                    }
+                    Value::String(raw) => crate::json_repair::repair_json_text(raw)
+                        .and_then(|value| value.as_object().cloned()),
                     _ => None,
                 };
                 if let Some(map) = replacement {
@@ -1688,7 +1633,7 @@ fn raw_tool_arguments(canonical: &str, raw: &str) -> Option<ArgumentRepair> {
 
     // Почти-JSON (висячая запятая, недокрытые скобки, сырые control-chars):
     // чинится и исполняется с флагом repaired — модель увидит и исправится.
-    if let Some(Value::Object(map)) = repair_json_text(raw) {
+    if let Some(Value::Object(map)) = crate::json_repair::repair_json_text(raw) {
         return Some(ArgumentRepair {
             arguments: Value::Object(map),
             repaired: true,
@@ -1708,6 +1653,8 @@ fn raw_tool_arguments(canonical: &str, raw: &str) -> Option<ArgumentRepair> {
         | "attachment.read" => "path",
         "file.list" => "path",
         "file.search" => "query",
+        "web.search" => "query",
+        "web.fetch" => "url",
         _ => return None,
     };
 
@@ -1748,9 +1695,14 @@ fn parse_raw_key_value_arguments(raw: &str) -> Option<Map<String, Value>> {
 }
 
 fn split_key_value(value: &str) -> Option<(&str, &str)> {
-    let (key, value) = value.split_once(':').or_else(|| value.split_once('='))?;
+    let (key, rest) = value.split_once(':').or_else(|| value.split_once('='))?;
+    // "scheme://host" is a URL, not a key:value pair — a bare url argument
+    // for web.fetch must fall through to the single-argument repair instead.
+    if rest.trim_start().starts_with("//") {
+        return None;
+    }
     let key = key.trim();
-    let value = value.trim().trim_matches('"').trim_matches('\'');
+    let value = rest.trim().trim_matches('"').trim_matches('\'');
     (!key.is_empty() && !value.is_empty()).then_some((key, value))
 }
 
@@ -1777,30 +1729,28 @@ fn string_arg(value: &Value, names: &[&'static str]) -> Result<String, RuntimeEr
     })
 }
 
-fn optional_string_arg(value: &Value, names: &[&str]) -> Option<String> {
+/// First argument matching any alias, run through `coerce` — the shared
+/// mechanism behind the typed `optional_*_arg` helpers.
+fn first_arg<T>(value: &Value, names: &[&str], coerce: fn(&Value) -> Option<T>) -> Option<T> {
     names
         .iter()
-        .find_map(|name| value.get(*name).and_then(Value::as_str))
-        .map(ToOwned::to_owned)
+        .find_map(|name| value.get(*name).and_then(coerce))
+}
+
+fn optional_string_arg(value: &Value, names: &[&str]) -> Option<String> {
+    first_arg(value, names, |value| value.as_str().map(str::to_owned))
 }
 
 fn optional_usize_arg(value: &Value, names: &[&str]) -> Option<usize> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(coerce_u64))
-        .and_then(|value| usize::try_from(value).ok())
+    first_arg(value, names, coerce_u64).and_then(|value| usize::try_from(value).ok())
 }
 
 fn optional_u64_arg(value: &Value, names: &[&str]) -> Option<u64> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(coerce_u64))
+    first_arg(value, names, coerce_u64)
 }
 
 fn optional_bool_arg(value: &Value, names: &[&str]) -> Option<bool> {
-    names
-        .iter()
-        .find_map(|name| value.get(*name).and_then(coerce_bool))
+    first_arg(value, names, coerce_bool)
 }
 
 fn coerce_u64(value: &Value) -> Option<u64> {
@@ -1885,6 +1835,8 @@ fn canonical_tool_usage(canonical: &str) -> &'static str {
         "file.search" => r#"{"query": "<text>", "path": "<dir>"}"#,
         "file.move" => r#"{"source": "<file>", "destination": "<file>"}"#,
         "shell.exec" => r#"{"command": "<text>"}"#,
+        "web.search" => r#"{"query": "<text>"}"#,
+        "web.fetch" => r#"{"url": "<https://…>"}"#,
         _ => "",
     }
 }

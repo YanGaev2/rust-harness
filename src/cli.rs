@@ -49,7 +49,7 @@ where
     let mut input = stdin.lock();
 
     if args.len() <= 1 && stdin.is_terminal() && stdout.is_terminal() {
-        return default_terminal_launch(&command_name, &mut input, &mut stdout);
+        return default_launch(&command_name, true, &mut input, &mut stdout);
     }
 
     run_with_input(args, &mut input, &mut stdout)
@@ -106,7 +106,7 @@ where
         }
         [command, rest @ ..] if command == "diagnostics" => diagnostics_command(rest, output),
         [command, rest @ ..] if command == "repl" => repl(rest, output),
-        [] => default_launch(&command_name, input, output),
+        [] => default_launch(&command_name, false, input, output),
         _ => Err(CliError::Usage(help(&command_name))),
     }
 }
@@ -355,31 +355,12 @@ pub fn finish_tui_setup_action<W: Write>(
     }
 }
 
-fn default_launch<R, W>(command_name: &str, input: &mut R, output: &mut W) -> Result<(), CliError>
-where
-    R: BufRead,
-    W: Write,
-{
-    let config_path = default_config_path();
-    let workspace = env::current_dir().map_err(CliError::Io)?;
-    match resolve_default_launch(&config_path, &workspace, command_name)? {
-        DefaultLaunch::Repl(launch) => run_repl_launch(launch, output),
-        DefaultLaunch::Setup(launch) => {
-            let launch = run_default_setup_interface(
-                launch.config_path,
-                launch.workspace,
-                &launch.command_name,
-                input,
-                output,
-            )?;
-            run_repl_launch(launch, output)
-        }
-    }
-}
-
-fn default_terminal_launch<R, W>(
+/// No-args launch: REPL when a provider exists, otherwise onboarding —
+/// the setup TUI on a terminal, the line interface on a pipe.
+fn default_launch<R, W>(
     command_name: &str,
-    _input: &mut R,
+    terminal: bool,
+    input: &mut R,
     output: &mut W,
 ) -> Result<(), CliError>
 where
@@ -391,14 +372,24 @@ where
     match resolve_default_launch(&config_path, &workspace, command_name)? {
         DefaultLaunch::Repl(launch) => run_repl_launch(launch, output),
         DefaultLaunch::Setup(launch) => {
-            let action = run_tui(&launch.command_name, &launch.config_path, &launch.workspace)?;
-            let launch = finish_tui_setup_action(
-                action,
-                launch.config_path,
-                launch.workspace,
-                &launch.command_name,
-                output,
-            )?;
+            let launch = if terminal {
+                let action = run_tui(&launch.command_name, &launch.config_path, &launch.workspace)?;
+                finish_tui_setup_action(
+                    action,
+                    launch.config_path,
+                    launch.workspace,
+                    &launch.command_name,
+                    output,
+                )?
+            } else {
+                run_default_setup_interface(
+                    launch.config_path,
+                    launch.workspace,
+                    &launch.command_name,
+                    input,
+                    output,
+                )?
+            };
             run_repl_launch(launch, output)
         }
     }
@@ -455,14 +446,7 @@ fn provider_list<W: Write>(args: &[String], output: &mut W) -> Result<(), CliErr
 }
 
 fn provider_subscriptions<W: Write>(output: &mut W) -> Result<(), CliError> {
-    for provider in [
-        BuiltinProvider::Codex,
-        BuiltinProvider::Xiaomi,
-        BuiltinProvider::Glm,
-        BuiltinProvider::Kimi,
-        BuiltinProvider::Claude,
-        BuiltinProvider::DeepSeek,
-    ] {
+    for provider in BuiltinProvider::ALL {
         let profile = provider.profile();
         writeln!(
             output,
@@ -509,7 +493,8 @@ fn tool_batch<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError>
     Ok(())
 }
 
-fn chat_once<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
+/// Shared prologue of `chat once` / `chat stream`: flags → provider → envelope.
+fn chat_request(args: &[String]) -> Result<(ProviderConfig, RequestEnvelope, Duration), CliError> {
     let flags = ChatOnceFlags::parse(args)?;
     let config = ConfigStore::new(flags.config_path).load()?;
     let provider = config
@@ -523,29 +508,20 @@ fn chat_once<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> 
             crate::platform::ShellProfile::detected(),
         ))
         .with_messages(vec![ChatMessage::user(flags.message)]);
+    Ok((provider, envelope, flags.timeout))
+}
 
-    let response = ProviderChatClient::new(flags.timeout).send(&provider, &envelope)?;
+fn chat_once<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
+    let (provider, envelope, timeout) = chat_request(args)?;
+    let response = ProviderChatClient::new(timeout).send(&provider, &envelope)?;
     serde_json::to_writer(&mut *output, &response).map_err(CliError::Json)?;
     writeln!(output)?;
     Ok(())
 }
 
 fn chat_stream<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
-    let flags = ChatOnceFlags::parse(args)?;
-    let config = ConfigStore::new(flags.config_path).load()?;
-    let provider = config
-        .provider(&flags.provider_name)
-        .cloned()
-        .ok_or_else(|| CliError::Usage(format!("unknown provider: {}", flags.provider_name)))?;
-    let envelope = RequestEnvelope::new(provider.name(), flags.model)
-        .with_system_prompt(DEFAULT_SYSTEM_PROMPT)
-        .with_cache_mode(CacheMode::ProviderPrefix)
-        .with_tools(ToolRuntime::tool_specs_with_shell(
-            crate::platform::ShellProfile::detected(),
-        ))
-        .with_messages(vec![ChatMessage::user(flags.message)]);
-
-    ProviderChatClient::new(flags.timeout).stream_text(&provider, &envelope, |delta| {
+    let (provider, envelope, timeout) = chat_request(args)?;
+    ProviderChatClient::new(timeout).stream_text(&provider, &envelope, |delta| {
         let _ = write!(output, "{delta}");
         let _ = output.flush();
     })?;
@@ -566,7 +542,8 @@ fn agent_run<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> 
     let mut runner = AgentRunner::new(provider, flags.model, flags.workspace)
         .with_timeout(flags.timeout)
         .with_max_tool_rounds(flags.max_rounds)
-        .with_streaming(flags.stream);
+        .with_streaming(flags.stream)
+        .with_retain_thinking(flags.retain_thinking);
     if let Some(max_tool_concurrency) = flags.max_tool_concurrency {
         runner = runner.with_max_tool_concurrency(max_tool_concurrency);
     }
@@ -903,20 +880,23 @@ fn save_provider<W: Write>(
     Ok(())
 }
 
-pub fn provider_config_from_tui_draft(draft: TuiProviderDraft) -> ProviderConfig {
-    let mut provider = if let Some(builtin) = BuiltinProvider::from_name(&draft.name) {
+/// Provider seeded from the builtin profile when the name matches a family,
+/// plain otherwise.
+fn provider_from_profile(name: String, url: String, key: String) -> ProviderConfig {
+    if let Some(builtin) = BuiltinProvider::from_name(&name) {
         let profile = builtin.profile();
-        ProviderConfig::new(profile.name, draft.base_url, draft.api_key)
+        ProviderConfig::new(profile.name, url, key)
             .with_auth_scheme(profile.auth_scheme)
             .with_cache_policy(profile.cache_policy)
             .with_chat_api(profile.chat_api)
             .with_key_env(profile.key_env)
     } else {
-        ProviderConfig::new(draft.name, draft.base_url, draft.api_key)
-    };
+        ProviderConfig::new(name, url, key)
+    }
+}
 
-    provider = provider.with_model(draft.model);
-    provider
+pub fn provider_config_from_tui_draft(draft: TuiProviderDraft) -> ProviderConfig {
+    provider_from_profile(draft.name, draft.base_url, draft.api_key).with_model(draft.model)
 }
 
 fn selected_models(discovery: &ModelDiscovery, selection: &str) -> Result<Vec<String>, CliError> {
@@ -999,96 +979,52 @@ struct ProviderFlags {
 
 impl ProviderFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut flags = Self::default();
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--config" => {
-                    flags.config = Some(PathBuf::from(required_value(args, index, "--config")?));
-                    index += 2;
-                }
-                "--name" => {
-                    flags.name = Some(required_value(args, index, "--name")?);
-                    index += 2;
-                }
-                "--url" => {
-                    flags.url = Some(required_value(args, index, "--url")?);
-                    index += 2;
-                }
-                "--key" => {
-                    flags.key = Some(required_value(args, index, "--key")?);
-                    index += 2;
-                }
-                "--key-env" => {
-                    flags.key_env = Some(required_value(args, index, "--key-env")?);
-                    index += 2;
-                }
-                "--auth" => {
-                    flags.auth = Some(required_value(args, index, "--auth")?);
-                    index += 2;
-                }
-                "--auth-header" => {
-                    flags.auth_header = Some(required_value(args, index, "--auth-header")?);
-                    index += 2;
-                }
-                "--chat-api" => {
-                    flags.chat_api = Some(parse_chat_api_format(required_value(
-                        args,
-                        index,
-                        "--chat-api",
-                    )?)?);
-                    index += 2;
-                }
-                "--cache" => {
-                    flags.cache = Some(required_value(args, index, "--cache")?);
-                    index += 2;
-                }
-                "--cache-header" => {
-                    flags.cache_header = Some(required_value(args, index, "--cache-header")?);
-                    index += 2;
-                }
-                "--cache-hit-field" => {
-                    flags.cache_hit_field = Some(required_value(args, index, "--cache-hit-field")?);
-                    index += 2;
-                }
-                "--cache-miss-field" => {
-                    flags.cache_miss_field =
-                        Some(required_value(args, index, "--cache-miss-field")?);
-                    index += 2;
-                }
-                "--cache-ttl" => {
-                    flags.cache_ttl = Some(required_value(args, index, "--cache-ttl")?);
-                    index += 2;
-                }
-                "--proxy" => {
-                    flags.proxy = Some(required_value(args, index, "--proxy")?);
-                    index += 2;
-                }
-                "--model" => {
-                    flags.models.push(required_value(args, index, "--model")?);
-                    index += 2;
-                }
-                "--add-all" => {
-                    flags.add_all = true;
-                    index += 1;
-                }
-                "--interactive" => {
-                    flags.interactive = true;
-                    index += 1;
-                }
-                "--timeout-ms" => {
-                    flags.timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--timeout-ms")?,
-                        "--timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
-        Ok(flags)
+        let raw = RawFlags::parse(
+            args,
+            &["--add-all", "--interactive"],
+            &[
+                "--config",
+                "--name",
+                "--url",
+                "--key",
+                "--key-env",
+                "--auth",
+                "--auth-header",
+                "--chat-api",
+                "--cache",
+                "--cache-header",
+                "--cache-hit-field",
+                "--cache-miss-field",
+                "--cache-ttl",
+                "--proxy",
+                "--model",
+                "--timeout-ms",
+            ],
+            false,
+        )?;
+        Ok(Self {
+            config: raw.path("--config"),
+            name: raw.string("--name"),
+            url: raw.string("--url"),
+            key: raw.string("--key"),
+            key_env: raw.string("--key-env"),
+            auth: raw.string("--auth"),
+            auth_header: raw.string("--auth-header"),
+            chat_api: raw
+                .string("--chat-api")
+                .map(parse_chat_api_format)
+                .transpose()?,
+            cache: raw.string("--cache"),
+            cache_header: raw.string("--cache-header"),
+            cache_hit_field: raw.string("--cache-hit-field"),
+            cache_miss_field: raw.string("--cache-miss-field"),
+            cache_ttl: raw.string("--cache-ttl"),
+            models: raw.strings("--model"),
+            proxy: raw.string("--proxy"),
+            add_all: raw.switch("--add-all"),
+            interactive: raw.switch("--interactive"),
+            timeout: raw.duration_ms("--timeout-ms")?,
+        })
     }
 
     fn provider(&self) -> Result<ProviderConfig, CliError> {
@@ -1108,16 +1044,7 @@ impl ProviderFlags {
             return Err(CliError::Usage("missing --key or --key-env".to_string()));
         }
 
-        let mut provider = if let Some(builtin) = BuiltinProvider::from_name(&name) {
-            let profile = builtin.profile();
-            ProviderConfig::new(profile.name, url, key)
-                .with_auth_scheme(profile.auth_scheme)
-                .with_cache_policy(profile.cache_policy)
-                .with_chat_api(profile.chat_api)
-                .with_key_env(profile.key_env)
-        } else {
-            ProviderConfig::new(name, url, key)
-        };
+        let mut provider = provider_from_profile(name, url, key);
         if let Some(key_env) = &self.key_env {
             provider = provider.with_key_env(key_env);
         }
@@ -1210,22 +1137,101 @@ struct ProviderListFlags {
 
 impl ProviderListFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut config_path = None;
-        let mut index = 0;
+        let raw = RawFlags::parse(args, &[], &["--config"], false)?;
+        Ok(Self {
+            config_path: raw.path("--config").unwrap_or_else(default_config_path),
+        })
+    }
+}
 
+/// Pre-tokenized flag arguments: one pass splits `--flag value` pairs,
+/// boolean switches, and positionals, and every typed `*Flags` struct then
+/// reads its fields declaratively. This is the shared mechanism behind the
+/// deliberate no-clap slicing style, not a new dependency.
+struct RawFlags {
+    values: Vec<(&'static str, String)>,
+    switches: Vec<&'static str>,
+    positionals: Vec<String>,
+}
+
+impl RawFlags {
+    /// `switches` take no value; every flag in `valued` requires one.
+    /// Positional tokens are collected when `positionals` is true and
+    /// rejected as `unknown option` otherwise (matching the old parsers).
+    fn parse(
+        args: &[String],
+        switches: &'static [&'static str],
+        valued: &'static [&'static str],
+        positionals: bool,
+    ) -> Result<Self, CliError> {
+        let mut flags = Self {
+            values: Vec::new(),
+            switches: Vec::new(),
+            positionals: Vec::new(),
+        };
+        let mut index = 0;
         while index < args.len() {
-            match args[index].as_str() {
-                "--config" => {
-                    config_path = Some(PathBuf::from(required_value(args, index, "--config")?));
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
+            let arg = args[index].as_str();
+            if let Some(switch) = switches.iter().find(|name| **name == arg) {
+                flags.switches.push(switch);
+                index += 1;
+            } else if let Some(flag) = valued.iter().find(|name| **name == arg) {
+                flags
+                    .values
+                    .push((flag, required_value(args, index, flag)?));
+                index += 2;
+            } else if positionals && !arg.starts_with("--") {
+                flags.positionals.push(args[index].clone());
+                index += 1;
+            } else {
+                return Err(CliError::Usage(format!("unknown option: {arg}")));
             }
         }
+        Ok(flags)
+    }
 
-        Ok(Self {
-            config_path: config_path.unwrap_or_else(default_config_path),
-        })
+    /// Last occurrence wins — same override semantics the loop parsers had.
+    fn string(&self, flag: &str) -> Option<String> {
+        self.values
+            .iter()
+            .rev()
+            .find(|(name, _)| *name == flag)
+            .map(|(_, value)| value.clone())
+    }
+
+    /// Every occurrence, in order (`--model` may repeat).
+    fn strings(&self, flag: &str) -> Vec<String> {
+        self.values
+            .iter()
+            .filter(|(name, _)| *name == flag)
+            .map(|(_, value)| value.clone())
+            .collect()
+    }
+
+    fn path(&self, flag: &str) -> Option<PathBuf> {
+        self.string(flag).map(PathBuf::from)
+    }
+
+    fn switch(&self, flag: &str) -> bool {
+        self.switches.contains(&flag)
+    }
+
+    fn usize_flag(&self, flag: &str) -> Result<Option<usize>, CliError> {
+        self.string(flag)
+            .map(|value| parse_usize_flag(value, flag))
+            .transpose()
+    }
+
+    fn u64_flag(&self, flag: &str) -> Result<Option<u64>, CliError> {
+        self.string(flag)
+            .map(|value| parse_u64_flag(value, flag))
+            .transpose()
+    }
+
+    fn duration_ms(&self, flag: &str) -> Result<Option<Duration>, CliError> {
+        self.string(flag)
+            .map(|value| parse_duration_ms_flag(value, flag))
+            .transpose()
     }
 }
 
@@ -1298,34 +1304,18 @@ struct ToolCallFlags {
 
 impl ToolCallFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut workspace = env::current_dir().map_err(CliError::Io)?;
-        let mut positionals = Vec::new();
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--workspace" => {
-                    workspace = PathBuf::from(required_value(args, index, "--workspace")?);
-                    index += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(CliError::Usage(format!("unknown option: {other}")));
-                }
-                _ => {
-                    positionals.push(args[index].clone());
-                    index += 1;
-                }
-            }
-        }
-
+        let raw = RawFlags::parse(args, &[], &["--workspace"], true)?;
+        let mut positionals = raw.positionals.clone();
         if positionals.len() != 2 {
             return Err(CliError::Usage(
                 "tool call requires TOOL_NAME and JSON_ARGS".to_string(),
             ));
         }
-
         Ok(Self {
-            workspace,
+            workspace: match raw.path("--workspace") {
+                Some(workspace) => workspace,
+                None => env::current_dir().map_err(CliError::Io)?,
+            },
             tool_name: positionals.remove(0),
             arguments: positionals.remove(0),
         })
@@ -1342,64 +1332,25 @@ struct ToolBatchFlags {
 
 impl ToolBatchFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut workspace = env::current_dir().map_err(CliError::Io)?;
-        let mut max_concurrency = None;
-        let mut timeout = None;
-        let mut positionals = Vec::new();
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--workspace" => {
-                    workspace = PathBuf::from(required_value(args, index, "--workspace")?);
-                    index += 2;
-                }
-                "--max-concurrency" => {
-                    let value = required_value(args, index, "--max-concurrency")?;
-                    let parsed = value.parse::<usize>().map_err(|_| {
-                        CliError::Usage("--max-concurrency must be a positive integer".to_string())
-                    })?;
-                    if parsed == 0 {
-                        return Err(CliError::Usage(
-                            "--max-concurrency must be a positive integer".to_string(),
-                        ));
-                    }
-                    max_concurrency = Some(parsed);
-                    index += 2;
-                }
-                "--timeout-ms" => {
-                    let value = required_value(args, index, "--timeout-ms")?;
-                    let parsed = value.parse::<u64>().map_err(|_| {
-                        CliError::Usage("--timeout-ms must be a positive integer".to_string())
-                    })?;
-                    if parsed == 0 {
-                        return Err(CliError::Usage(
-                            "--timeout-ms must be a positive integer".to_string(),
-                        ));
-                    }
-                    timeout = Some(Duration::from_millis(parsed));
-                    index += 2;
-                }
-                other if other.starts_with("--") => {
-                    return Err(CliError::Usage(format!("unknown option: {other}")));
-                }
-                _ => {
-                    positionals.push(args[index].clone());
-                    index += 1;
-                }
-            }
-        }
-
+        let raw = RawFlags::parse(
+            args,
+            &[],
+            &["--workspace", "--max-concurrency", "--timeout-ms"],
+            true,
+        )?;
+        let mut positionals = raw.positionals.clone();
         if positionals.len() != 1 {
             return Err(CliError::Usage(
                 "tool batch requires JSON_ARRAY_OF_TOOL_CALLS".to_string(),
             ));
         }
-
         Ok(Self {
-            workspace,
-            max_concurrency: max_concurrency.unwrap_or(4),
-            timeout,
+            workspace: match raw.path("--workspace") {
+                Some(workspace) => workspace,
+                None => env::current_dir().map_err(CliError::Io)?,
+            },
+            max_concurrency: raw.usize_flag("--max-concurrency")?.unwrap_or(4),
+            timeout: raw.duration_ms("--timeout-ms")?,
             calls: positionals.remove(0),
         })
     }
@@ -1416,48 +1367,26 @@ struct ChatOnceFlags {
 
 impl ChatOnceFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut config_path = None;
-        let mut provider_name = None;
-        let mut model = None;
-        let mut message = None;
-        let mut timeout = None;
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--config" => {
-                    config_path = Some(PathBuf::from(required_value(args, index, "--config")?));
-                    index += 2;
-                }
-                "--provider" => {
-                    provider_name = Some(required_value(args, index, "--provider")?);
-                    index += 2;
-                }
-                "--model" => {
-                    model = Some(required_value(args, index, "--model")?);
-                    index += 2;
-                }
-                "--message" => {
-                    message = Some(required_value(args, index, "--message")?);
-                    index += 2;
-                }
-                "--timeout-ms" => {
-                    timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--timeout-ms")?,
-                        "--timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
+        let raw = RawFlags::parse(
+            args,
+            &[],
+            &[
+                "--config",
+                "--provider",
+                "--model",
+                "--message",
+                "--timeout-ms",
+            ],
+            false,
+        )?;
         Ok(Self {
-            config_path: config_path.unwrap_or_else(default_config_path),
-            provider_name: required_flag(provider_name.as_deref(), "--provider")?,
-            model: required_flag(model.as_deref(), "--model")?,
-            message: required_flag(message.as_deref(), "--message")?,
-            timeout: timeout.unwrap_or(Duration::from_secs(60)),
+            config_path: raw.path("--config").unwrap_or_else(default_config_path),
+            provider_name: required_flag(raw.string("--provider").as_deref(), "--provider")?,
+            model: required_flag(raw.string("--model").as_deref(), "--model")?,
+            message: required_flag(raw.string("--message").as_deref(), "--message")?,
+            timeout: raw
+                .duration_ms("--timeout-ms")?
+                .unwrap_or(Duration::from_secs(60)),
         })
     }
 }
@@ -1476,105 +1405,47 @@ struct AgentRunFlags {
     trace_path: Option<PathBuf>,
     tool_errors_path: Option<PathBuf>,
     stream: bool,
+    retain_thinking: bool,
 }
 
 impl AgentRunFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut config_path = None;
-        let mut workspace = None;
-        let mut provider_name = None;
-        let mut model = None;
-        let mut message = None;
-        let mut timeout = None;
-        let mut max_rounds = None;
-        let mut max_tool_concurrency = None;
-        let mut tool_timeout = None;
-        let mut trace_path = None;
-        let mut tool_errors_path = None;
-        let mut stream = false;
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--config" => {
-                    config_path = Some(PathBuf::from(required_value(args, index, "--config")?));
-                    index += 2;
-                }
-                "--workspace" => {
-                    workspace = Some(PathBuf::from(required_value(args, index, "--workspace")?));
-                    index += 2;
-                }
-                "--provider" => {
-                    provider_name = Some(required_value(args, index, "--provider")?);
-                    index += 2;
-                }
-                "--model" => {
-                    model = Some(required_value(args, index, "--model")?);
-                    index += 2;
-                }
-                "--message" => {
-                    message = Some(required_value(args, index, "--message")?);
-                    index += 2;
-                }
-                "--timeout-ms" => {
-                    timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--timeout-ms")?,
-                        "--timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                "--max-rounds" => {
-                    max_rounds = Some(parse_usize_flag(
-                        required_value(args, index, "--max-rounds")?,
-                        "--max-rounds",
-                    )?);
-                    index += 2;
-                }
-                "--max-tool-concurrency" => {
-                    max_tool_concurrency = Some(parse_usize_flag(
-                        required_value(args, index, "--max-tool-concurrency")?,
-                        "--max-tool-concurrency",
-                    )?);
-                    index += 2;
-                }
-                "--tool-timeout-ms" => {
-                    tool_timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--tool-timeout-ms")?,
-                        "--tool-timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                "--trace" => {
-                    trace_path = Some(PathBuf::from(required_value(args, index, "--trace")?));
-                    index += 2;
-                }
-                "--tool-errors" => {
-                    tool_errors_path =
-                        Some(PathBuf::from(required_value(args, index, "--tool-errors")?));
-                    index += 2;
-                }
-                "--stream" => {
-                    stream = true;
-                    index += 1;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
+        let raw = RawFlags::parse(
+            args,
+            &["--stream", "--retain-thinking"],
+            &[
+                "--config",
+                "--workspace",
+                "--provider",
+                "--model",
+                "--message",
+                "--timeout-ms",
+                "--max-rounds",
+                "--max-tool-concurrency",
+                "--tool-timeout-ms",
+                "--trace",
+                "--tool-errors",
+            ],
+            false,
+        )?;
         Ok(Self {
-            config_path: config_path.unwrap_or_else(default_config_path),
-            workspace: workspace
+            config_path: raw.path("--config").unwrap_or_else(default_config_path),
+            workspace: raw
+                .path("--workspace")
                 .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            provider_name: required_flag(provider_name.as_deref(), "--provider")?,
-            model: required_flag(model.as_deref(), "--model")?,
-            message: required_flag(message.as_deref(), "--message")?,
-            timeout: timeout.unwrap_or(Duration::from_secs(60)),
-            max_rounds: max_rounds.unwrap_or(4),
-            max_tool_concurrency,
-            tool_timeout,
-            trace_path,
-            tool_errors_path,
-            stream,
+            provider_name: required_flag(raw.string("--provider").as_deref(), "--provider")?,
+            model: required_flag(raw.string("--model").as_deref(), "--model")?,
+            message: required_flag(raw.string("--message").as_deref(), "--message")?,
+            timeout: raw
+                .duration_ms("--timeout-ms")?
+                .unwrap_or(Duration::from_secs(60)),
+            max_rounds: raw.usize_flag("--max-rounds")?.unwrap_or(4),
+            max_tool_concurrency: raw.usize_flag("--max-tool-concurrency")?,
+            tool_timeout: raw.duration_ms("--tool-timeout-ms")?,
+            trace_path: raw.path("--trace"),
+            tool_errors_path: raw.path("--tool-errors"),
+            stream: raw.switch("--stream"),
+            retain_thinking: raw.switch("--retain-thinking"),
         })
     }
 }
@@ -1587,28 +1458,12 @@ struct ClipboardPasteFlags {
 
 impl ClipboardPasteFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut workspace = None;
-        let mut text = None;
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--workspace" => {
-                    workspace = Some(PathBuf::from(required_value(args, index, "--workspace")?));
-                    index += 2;
-                }
-                "--text" => {
-                    text = Some(required_value(args, index, "--text")?);
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
+        let raw = RawFlags::parse(args, &[], &["--workspace", "--text"], false)?;
         Ok(Self {
-            workspace: workspace
+            workspace: raw
+                .path("--workspace")
                 .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            text,
+            text: raw.string("--text"),
         })
     }
 }
@@ -1627,79 +1482,37 @@ struct ReplFlags {
 
 impl ReplFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut config_path = None;
-        let mut workspace = None;
-        let mut provider_name = None;
-        let mut model = None;
-        let mut timeout = None;
-        let mut max_rounds = None;
-        let mut max_tool_concurrency = None;
-        let mut tool_timeout = None;
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--config" => {
-                    config_path = Some(PathBuf::from(required_value(args, index, "--config")?));
-                    index += 2;
-                }
-                "--workspace" => {
-                    workspace = Some(PathBuf::from(required_value(args, index, "--workspace")?));
-                    index += 2;
-                }
-                "--provider" => {
-                    provider_name = Some(required_value(args, index, "--provider")?);
-                    index += 2;
-                }
-                "--model" => {
-                    model = Some(required_value(args, index, "--model")?);
-                    index += 2;
-                }
-                "--timeout-ms" => {
-                    timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--timeout-ms")?,
-                        "--timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                "--max-rounds" => {
-                    max_rounds = Some(parse_usize_flag(
-                        required_value(args, index, "--max-rounds")?,
-                        "--max-rounds",
-                    )?);
-                    index += 2;
-                }
-                "--max-tool-concurrency" => {
-                    max_tool_concurrency = Some(parse_usize_flag(
-                        required_value(args, index, "--max-tool-concurrency")?,
-                        "--max-tool-concurrency",
-                    )?);
-                    index += 2;
-                }
-                "--tool-timeout-ms" => {
-                    tool_timeout = Some(parse_duration_ms_flag(
-                        required_value(args, index, "--tool-timeout-ms")?,
-                        "--tool-timeout-ms",
-                    )?);
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
+        let raw = RawFlags::parse(
+            args,
+            &[],
+            &[
+                "--config",
+                "--workspace",
+                "--provider",
+                "--model",
+                "--timeout-ms",
+                "--max-rounds",
+                "--max-tool-concurrency",
+                "--tool-timeout-ms",
+            ],
+            false,
+        )?;
         Ok(Self {
-            config_path: config_path.unwrap_or_else(default_config_path),
-            workspace: workspace
+            config_path: raw.path("--config").unwrap_or_else(default_config_path),
+            workspace: raw
+                .path("--workspace")
                 .unwrap_or_else(|| env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            provider_name,
-            model,
-            timeout: timeout.unwrap_or(Duration::from_secs(60)),
+            provider_name: raw.string("--provider"),
+            model: raw.string("--model"),
+            timeout: raw
+                .duration_ms("--timeout-ms")?
+                .unwrap_or(Duration::from_secs(60)),
             // Interactive chat is not round-capped by default: an exploring
             // agent legitimately needs many tool rounds, and a hard error mid-
             // conversation loses the turn. `--max-rounds N` still applies a cap.
-            max_rounds: max_rounds.unwrap_or(usize::MAX),
-            max_tool_concurrency,
-            tool_timeout,
+            max_rounds: raw.usize_flag("--max-rounds")?.unwrap_or(usize::MAX),
+            max_tool_concurrency: raw.usize_flag("--max-tool-concurrency")?,
+            tool_timeout: raw.duration_ms("--tool-timeout-ms")?,
         })
     }
 }
@@ -1713,39 +1526,16 @@ struct DiagnosticsFlags {
 
 impl DiagnosticsFlags {
     fn parse(args: &[String]) -> Result<Self, CliError> {
-        let mut binary_path = None;
-        let mut max_binary_bytes = None;
-        let mut max_rss_bytes = None;
-        let mut index = 0;
-
-        while index < args.len() {
-            match args[index].as_str() {
-                "--binary" => {
-                    binary_path = Some(PathBuf::from(required_value(args, index, "--binary")?));
-                    index += 2;
-                }
-                "--max-binary-bytes" => {
-                    max_binary_bytes = Some(parse_u64_flag(
-                        required_value(args, index, "--max-binary-bytes")?,
-                        "--max-binary-bytes",
-                    )?);
-                    index += 2;
-                }
-                "--max-rss-bytes" => {
-                    max_rss_bytes = Some(parse_u64_flag(
-                        required_value(args, index, "--max-rss-bytes")?,
-                        "--max-rss-bytes",
-                    )?);
-                    index += 2;
-                }
-                other => return Err(CliError::Usage(format!("unknown option: {other}"))),
-            }
-        }
-
+        let raw = RawFlags::parse(
+            args,
+            &[],
+            &["--binary", "--max-binary-bytes", "--max-rss-bytes"],
+            false,
+        )?;
         Ok(Self {
-            binary_path,
-            max_binary_bytes,
-            max_rss_bytes,
+            binary_path: raw.path("--binary"),
+            max_binary_bytes: raw.u64_flag("--max-binary-bytes")?,
+            max_rss_bytes: raw.u64_flag("--max-rss-bytes")?,
         })
     }
 
@@ -1775,15 +1565,8 @@ fn parse_u64_flag(value: String, flag: &str) -> Result<u64, CliError> {
 }
 
 fn parse_usize_flag(value: String, flag: &str) -> Result<usize, CliError> {
-    let parsed = value
-        .parse::<usize>()
-        .map_err(|_| CliError::Usage(format!("{flag} must be a positive integer")))?;
-    if parsed == 0 {
-        return Err(CliError::Usage(format!(
-            "{flag} must be a positive integer"
-        )));
-    }
-    Ok(parsed)
+    usize::try_from(parse_u64_flag(value, flag)?)
+        .map_err(|_| CliError::Usage(format!("{flag} must be a positive integer")))
 }
 
 fn parse_duration_ms_flag(value: String, flag: &str) -> Result<Duration, CliError> {
@@ -1812,7 +1595,7 @@ fn help(command_name: &str) -> String {
             "  {command_name} chat stream --config PATH --provider NAME --model MODEL --message TEXT [--timeout-ms N]"
         ),
         format!(
-            "  {command_name} agent run --config PATH --workspace PATH --provider NAME --model MODEL --message TEXT [--timeout-ms N] [--max-rounds N] [--max-tool-concurrency N] [--tool-timeout-ms N] [--trace PATH] [--tool-errors PATH] [--stream]"
+            "  {command_name} agent run --config PATH --workspace PATH --provider NAME --model MODEL --message TEXT [--timeout-ms N] [--max-rounds N] [--max-tool-concurrency N] [--tool-timeout-ms N] [--trace PATH] [--tool-errors PATH] [--stream] [--retain-thinking]"
         ),
         format!(
             "  {command_name} repl --config PATH --workspace PATH --provider NAME --model MODEL [--timeout-ms N] [--max-rounds N] [--max-tool-concurrency N] [--tool-timeout-ms N]"

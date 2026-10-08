@@ -30,6 +30,34 @@ impl Style {
     pub fn is_plain(&self) -> bool {
         *self == Style::default()
     }
+
+    /// Foreground-colored style; chain the attribute builders below.
+    pub fn fg(color: Color) -> Self {
+        Style {
+            fg: color,
+            ..Style::default()
+        }
+    }
+
+    pub fn bg(mut self, color: Color) -> Self {
+        self.bg = color;
+        self
+    }
+
+    pub fn bold(mut self) -> Self {
+        self.bold = true;
+        self
+    }
+
+    pub fn dim(mut self) -> Self {
+        self.dim = true;
+        self
+    }
+
+    pub fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
 }
 
 /// A run of text with a single style.
@@ -68,6 +96,12 @@ impl Line {
         }
     }
 
+    pub fn styled(text: impl Into<String>, style: Style) -> Self {
+        Line {
+            spans: vec![Span::styled(text, style)],
+        }
+    }
+
     /// Visible width of the whole line in terminal columns.
     pub fn width(&self) -> usize {
         self.spans
@@ -89,10 +123,24 @@ pub fn visible_width(text: &str) -> usize {
 }
 
 /// One grapheme cluster with its display width and inherited style.
+#[derive(Clone, Copy)]
 struct Cell<'a> {
     grapheme: &'a str,
     width: usize,
     style: Style,
+}
+
+fn line_cells(line: &Line) -> Vec<Cell<'_>> {
+    line.spans
+        .iter()
+        .flat_map(|span| {
+            span.text.graphemes(true).map(move |grapheme| Cell {
+                grapheme,
+                width: visible_width(grapheme),
+                style: span.style,
+            })
+        })
+        .collect()
 }
 
 /// Greedy word wrap. Breaks at spaces (the break space is consumed),
@@ -103,17 +151,7 @@ pub fn wrap(line: &Line, width: usize) -> Vec<Line> {
         return vec![line.clone()];
     }
 
-    let cells: Vec<Cell<'_>> = line
-        .spans
-        .iter()
-        .flat_map(|span| {
-            span.text.graphemes(true).map(move |grapheme| Cell {
-                grapheme,
-                width: visible_width(grapheme),
-                style: span.style,
-            })
-        })
-        .collect();
+    let cells = line_cells(line);
 
     let mut lines: Vec<Vec<Cell<'_>>> = Vec::new();
     let mut current: Vec<Cell<'_>> = Vec::new();
@@ -157,6 +195,69 @@ pub fn wrap(line: &Line, width: usize) -> Vec<Line> {
     }
 
     lines.into_iter().map(cells_to_line).collect()
+}
+
+/// Greedy word wrap with a hanging indent: continuation rows are prefixed
+/// with `indent` spaces (clamped to half the width) and leftover break
+/// spaces are consumed so the indent stays exact. Grapheme-cluster and
+/// display-width aware — CJK and emoji count their real column width.
+pub fn wrap_hanging(line: &Line, width: usize, indent: usize) -> Vec<Line> {
+    let width = width.max(1);
+    if line.width() <= width {
+        return vec![line.clone()];
+    }
+    let indent = indent.min(width / 2);
+    let pad = " ".repeat(indent);
+    let cells = line_cells(line);
+
+    let mut rows = Vec::new();
+    let mut start = 0usize;
+    let mut first = true;
+    while start < cells.len() {
+        if !first {
+            // Drop leftover spaces at a break so the indent stays exact.
+            while start < cells.len() && cells[start].grapheme == " " {
+                start += 1;
+            }
+            if start == cells.len() {
+                break;
+            }
+        }
+        let avail = if first { width } else { width - indent };
+        // Fit as many cells as the row budget allows.
+        let mut end = start;
+        let mut used = 0usize;
+        while end < cells.len() && used + cells[end].width <= avail {
+            used += cells[end].width;
+            end += 1;
+        }
+        let row_end = if end == cells.len() {
+            end
+        } else {
+            match cells[start..end]
+                .iter()
+                .rposition(|cell| cell.grapheme == " ")
+            {
+                Some(pos) if pos > 0 => start + pos,
+                // No break point (or an over-wide cell): hard-break, always
+                // advancing at least one cell.
+                _ => end.max(start + 1),
+            }
+        };
+        let mut row = cells_to_line(cells[start..row_end].to_vec());
+        if !first {
+            row.spans.insert(0, Span::raw(pad.clone()));
+        }
+        rows.push(row);
+        // A break exactly on a space consumes it.
+        start = if row_end < cells.len() && cells[row_end].grapheme == " " {
+            row_end + 1
+        } else {
+            row_end
+        };
+        first = false;
+    }
+    rows
 }
 
 impl Style {

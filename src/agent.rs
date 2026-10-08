@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::chat_client::{ChatClientError, ChatToolCall, ProviderChatClient, StreamDelta};
+use crate::chat_client::{ChatClientError, ChatToolCall, ProviderChatClient, StreamDelta, WireTap};
 use crate::failover::{FailureAction, classify};
 use crate::guardrails::{GuardrailController, GuardrailDecision};
 use crate::prompt::agent_system_prompt;
@@ -25,8 +25,10 @@ pub struct AgentRunner {
     max_tool_concurrency: Option<usize>,
     tool_batch_timeout: Option<Duration>,
     stream: bool,
+    retain_thinking: bool,
     history: Vec<ChatMessage>,
     cancel: Option<Arc<AtomicBool>>,
+    wire_tap: Option<WireTap>,
     /// Цепочка (провайдер, модель) на случай quota/5xx у текущего бэкенда;
     /// порядок = приоритет. Пустая цепочка = поведение как раньше.
     fallback: Vec<(ProviderConfig, String)>,
@@ -47,10 +49,19 @@ impl AgentRunner {
             max_tool_concurrency: None,
             tool_batch_timeout: None,
             stream: false,
+            retain_thinking: false,
             history: Vec::new(),
             cancel: None,
+            wire_tap: None,
             fallback: Vec::new(),
         }
+    }
+
+    /// Mirror raw provider traffic (request/response bodies, SSE lines) into
+    /// `tap` — feeds the session's wire log so parser bugs cannot lose data.
+    pub fn with_wire_tap(mut self, wire_tap: WireTap) -> Self {
+        self.wire_tap = Some(wire_tap);
+        self
     }
 
     /// Fallback-цепочка: при классифицированной как «переключаемой» ошибке
@@ -76,12 +87,13 @@ impl AgentRunner {
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
-    fn cancelled(mut trace: AgentTrace) -> AgentError {
+    fn cancelled(mut trace: AgentTrace, messages: Vec<ChatMessage>) -> AgentError {
         trace.events.push(AgentTraceEvent::Error {
             message: "interrupted by user".to_string(),
         });
         AgentError::Cancelled {
             trace: Box::new(trace),
+            messages,
         }
     }
 
@@ -97,6 +109,14 @@ impl AgentRunner {
     /// (OpenAI-compatible providers; others transparently fall back to blocking).
     pub fn with_streaming(mut self, stream: bool) -> Self {
         self.stream = stream;
+        self
+    }
+
+    /// Replay stored assistant reasoning back to the provider (session-wide).
+    /// Off by default: thinking then lives only in traces. DeepSeek V4 / Kimi /
+    /// MiMo thinking modes require the echo-back and want this on.
+    pub fn with_retain_thinking(mut self, retain_thinking: bool) -> Self {
+        self.retain_thinking = retain_thinking;
         self
     }
 
@@ -136,13 +156,24 @@ impl AgentRunner {
         if let Some(cancel) = &self.cancel {
             client = client.with_cancel_flag(cancel.clone());
         }
+        if let Some(tap) = &self.wire_tap {
+            client = client.with_wire_tap(tap.clone());
+        }
         // One probe per process; prompt, tool description, and execution all
         // agree on the same interpreter (the model writes whichever dialect
         // it is told about — telling it wrong is worse than not telling).
         let shell = crate::platform::ShellProfile::detected();
-        let runtime = ToolRuntime::new(&self.workspace)
+        let mut runtime = ToolRuntime::new(&self.workspace)
             .with_shell_timeout(self.timeout)
-            .with_shell_profile(shell.cloned());
+            .with_shell_profile(shell.cloned())
+            // Web tools follow the session provider's egress policy (the
+            // resolved proxy already folds in the config-wide default).
+            .with_web_proxy(self.provider.proxy().map(str::to_string));
+        // Esc/Ctrl+C must reach a shell command that is already running, not
+        // only the checks between rounds — the same flag goes to the tools.
+        if let Some(cancel) = &self.cancel {
+            runtime = runtime.with_cancel_flag(cancel.clone());
+        }
         // Built once per run: constant within the session, so the cache prefix
         // over the system prompt stays stable across rounds.
         let system_prompt = agent_system_prompt(&self.workspace, shell);
@@ -167,12 +198,14 @@ impl AgentRunner {
 
         loop {
             if self.is_cancelled() {
-                return Err(Self::cancelled(trace));
+                return Err(Self::cancelled(trace, messages.clone()));
             }
-            // When streaming, thinking and answer fragments are emitted live as
-            // they arrive; the flags below stop us re-emitting the full text again.
-            let mut reasoning_streamed = false;
-            let mut content_streamed = false;
+            // Streamed thinking/answer fragments, accumulated. Non-empty means
+            // deltas already reached the user (so the full text must not be
+            // re-emitted), and when the stream dies mid-answer the buffers ride
+            // out on the error so the turn survives in the conversation.
+            let mut partial_reasoning = String::new();
+            let mut partial_content = String::new();
             // До двух повторов на месте при коротком Retry-After; счётчик
             // обнуляется при переключении на следующий бэкенд цепочки.
             let mut retries_in_place = 0u32;
@@ -183,15 +216,16 @@ impl AgentRunner {
                     .with_system_prompt(&system_prompt)
                     .with_cache_mode(CacheMode::ProviderPrefix)
                     .with_tools(ToolRuntime::tool_specs_with_shell(shell))
-                    .with_messages(messages.clone());
+                    .with_messages(messages.clone())
+                    .with_retain_thinking(self.retain_thinking);
                 let attempt = if self.stream {
                     client.stream_chat(&current_provider, &envelope, |delta| match delta {
                         StreamDelta::Reasoning(chunk) if !chunk.is_empty() => {
-                            reasoning_streamed = true;
+                            partial_reasoning.push_str(chunk);
                             on_event(AgentEvent::Thinking(chunk.to_string()));
                         }
                         StreamDelta::Content(chunk) if !chunk.is_empty() => {
-                            content_streamed = true;
+                            partial_content.push_str(chunk);
                             on_event(AgentEvent::FinalContentDelta(chunk.to_string()));
                         }
                         _ => {}
@@ -205,21 +239,30 @@ impl AgentRunner {
                 };
 
                 let classified = classify(&err);
-                let wants_switch = match classified.action {
-                    FailureAction::RetrySameProvider { after_seconds } => {
-                        if retries_in_place < 2 {
-                            retries_in_place += 1;
-                            std::thread::sleep(Duration::from_secs(after_seconds.min(10)));
-                            if self.is_cancelled() {
-                                return Err(Self::cancelled(trace));
+                // Once deltas have reached the user, a silent retry or provider
+                // switch would duplicate the visible text and re-burn the whole
+                // generation (hermes rule: no silent replay after output).
+                // Fall through to the error exit, which keeps the partial turn.
+                let streamed_already = !partial_reasoning.is_empty() || !partial_content.is_empty();
+                let wants_switch = if streamed_already {
+                    false
+                } else {
+                    match classified.action {
+                        FailureAction::RetrySameProvider { after_seconds } => {
+                            if retries_in_place < 2 {
+                                retries_in_place += 1;
+                                std::thread::sleep(Duration::from_secs(after_seconds.min(10)));
+                                if self.is_cancelled() {
+                                    return Err(Self::cancelled(trace, messages.clone()));
+                                }
+                                continue;
                             }
-                            continue;
+                            // Ретраи не помогли — трактуем как переключаемую.
+                            true
                         }
-                        // Ретраи не помогли — трактуем как переключаемую.
-                        true
+                        FailureAction::SwitchProvider => true,
+                        FailureAction::Fail => false,
                     }
-                    FailureAction::SwitchProvider => true,
-                    FailureAction::Fail => false,
                 };
                 if wants_switch {
                     // Пропускаем записи, совпадающие с только что упавшим
@@ -254,25 +297,48 @@ impl AgentRunner {
                         continue;
                     }
                 }
-                return Err(err.into());
+                // Terminal failure: keep the conversation (and any partial
+                // thinking/text) on the error so the turn is not lost — the
+                // next user message continues from here instead of a reset.
+                record_partial_turn(&mut trace, &partial_reasoning, &partial_content);
+                trace.events.push(AgentTraceEvent::Error {
+                    message: err.to_string(),
+                });
+                return Err(AgentError::Chat {
+                    source: err,
+                    trace: Box::new(trace),
+                    messages: with_partial_turn(
+                        messages.clone(),
+                        &partial_reasoning,
+                        &partial_content,
+                    ),
+                });
             };
 
             // Esc during a streamed answer: the client already stopped reading
-            // between chunks; drop the partial response instead of acting on it.
+            // between chunks; drop the partial response from this round's flow
+            // but keep it in the carried conversation for a later "continue".
             if self.is_cancelled() {
-                return Err(Self::cancelled(trace));
+                record_partial_turn(&mut trace, &partial_reasoning, &partial_content);
+                return Err(Self::cancelled(
+                    trace,
+                    with_partial_turn(messages.clone(), &partial_reasoning, &partial_content),
+                ));
             }
 
             trace.record_usage(&response.usage);
             on_event(AgentEvent::UsageUpdated(trace.usage));
 
-            if let Some(reasoning) = response
+            // Kept beyond the trace: the reasoning also rides on the assistant
+            // history message, so retention can replay it in later requests.
+            let reasoning = response
                 .reasoning
                 .as_deref()
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
-            {
-                if !reasoning_streamed {
+                .map(str::to_string);
+            if let Some(reasoning) = reasoning.as_deref() {
+                if partial_reasoning.is_empty() {
                     on_event(AgentEvent::Thinking(reasoning.to_string()));
                 }
                 trace.events.push(AgentTraceEvent::Thinking {
@@ -282,7 +348,7 @@ impl AgentRunner {
 
             if response.tool_calls.is_empty() {
                 if let Some(content) = response.content.as_deref()
-                    && !content_streamed
+                    && partial_content.is_empty()
                 {
                     on_event(AgentEvent::FinalContentDelta(content.to_string()));
                 }
@@ -290,7 +356,11 @@ impl AgentRunner {
                     content: response.content.clone(),
                 });
                 if let Some(content) = response.content.as_deref() {
-                    messages.push(ChatMessage::assistant(content));
+                    let mut message = ChatMessage::assistant(content);
+                    if let Some(reasoning) = reasoning {
+                        message = message.with_reasoning(reasoning);
+                    }
+                    messages.push(message);
                 }
                 return Ok(AgentRunResult {
                     final_content: response.content,
@@ -319,6 +389,7 @@ impl AgentRunner {
                 return Err(AgentError::MaxToolRoundsExceeded {
                     max: self.max_tool_rounds,
                     trace: Box::new(trace),
+                    messages: messages.clone(),
                 });
             }
 
@@ -335,9 +406,13 @@ impl AgentRunner {
                 });
             }
 
-            messages.push(ChatMessage::assistant_tool_calls(
+            let mut assistant_turn = ChatMessage::assistant_tool_calls(
                 response.tool_calls.iter().map(message_tool_call).collect(),
-            ));
+            );
+            if let Some(reasoning) = reasoning {
+                assistant_turn = assistant_turn.with_reasoning(reasoning);
+            }
+            messages.push(assistant_turn);
 
             let mut scheduler = ToolScheduler::new(runtime.clone());
             if let Some(max_tool_concurrency) = self.max_tool_concurrency {
@@ -609,24 +684,48 @@ pub struct AgentToolError {
 
 #[derive(Debug)]
 pub enum AgentError {
-    Chat(ChatClientError),
+    /// Provider request failed. Carries the conversation up to the failure —
+    /// history + the user turn (+ a partial assistant message with any text
+    /// and thinking that streamed before the cut) — so the exchange survives
+    /// the error instead of resetting to the last complete turn.
+    Chat {
+        source: ChatClientError,
+        trace: Box<AgentTrace>,
+        messages: Vec<ChatMessage>,
+    },
     Runtime(RuntimeError),
     Json(serde_json::Error),
     MaxToolRoundsExceeded {
         max: usize,
         trace: Box<AgentTrace>,
+        messages: Vec<ChatMessage>,
     },
     /// The user interrupted the run (Esc/Ctrl+C); the partial trace is kept.
     Cancelled {
         trace: Box<AgentTrace>,
+        messages: Vec<ChatMessage>,
     },
 }
 
 impl AgentError {
     pub fn trace(&self) -> Option<&AgentTrace> {
         match self {
-            Self::MaxToolRoundsExceeded { trace, .. } | Self::Cancelled { trace } => Some(trace),
+            Self::Chat { trace, .. }
+            | Self::MaxToolRoundsExceeded { trace, .. }
+            | Self::Cancelled { trace, .. } => Some(trace),
             _ => None,
+        }
+    }
+
+    /// The conversation as of the failure, when the run got far enough to
+    /// have one. `None` for internal errors (Runtime/Json) where the message
+    /// list may hold a dangling tool-call turn.
+    pub fn messages(&self) -> Option<&[ChatMessage]> {
+        match self {
+            Self::Chat { messages, .. }
+            | Self::MaxToolRoundsExceeded { messages, .. }
+            | Self::Cancelled { messages, .. } => Some(messages),
+            Self::Runtime(_) | Self::Json(_) => None,
         }
     }
 }
@@ -634,7 +733,7 @@ impl AgentError {
 impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Chat(err) => write!(f, "{err}"),
+            Self::Chat { source, .. } => write!(f, "{source}"),
             Self::Runtime(err) => write!(f, "{err}"),
             Self::Json(err) => write!(f, "agent message serialization failed: {err}"),
             Self::MaxToolRoundsExceeded { max, .. } => {
@@ -648,17 +747,11 @@ impl fmt::Display for AgentError {
 impl Error for AgentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Chat(err) => Some(err),
+            Self::Chat { source, .. } => Some(source),
             Self::Runtime(err) => Some(err),
             Self::Json(err) => Some(err),
             Self::MaxToolRoundsExceeded { .. } | Self::Cancelled { .. } => None,
         }
-    }
-}
-
-impl From<ChatClientError> for AgentError {
-    fn from(value: ChatClientError) -> Self {
-        Self::Chat(value)
     }
 }
 
@@ -676,4 +769,36 @@ impl From<serde_json::Error> for AgentError {
 
 fn message_tool_call(call: &ChatToolCall) -> MessageToolCall {
     MessageToolCall::new(call.id.clone(), call.name.clone(), call.arguments.clone())
+}
+
+/// Append the interrupted assistant turn (streamed text and/or thinking) to a
+/// conversation snapshot. A no-op when nothing streamed — no empty turns.
+fn with_partial_turn(
+    mut messages: Vec<ChatMessage>,
+    reasoning: &str,
+    content: &str,
+) -> Vec<ChatMessage> {
+    if !reasoning.is_empty() || !content.is_empty() {
+        let mut partial = ChatMessage::assistant(content);
+        if !reasoning.is_empty() {
+            partial = partial.with_reasoning(reasoning);
+        }
+        messages.push(partial);
+    }
+    messages
+}
+
+/// Mirror the interrupted fragments into the trace, so the cut turn is
+/// persisted (session/raw analysis) even though the run failed.
+fn record_partial_turn(trace: &mut AgentTrace, reasoning: &str, content: &str) {
+    if !reasoning.is_empty() {
+        trace.events.push(AgentTraceEvent::Thinking {
+            content: reasoning.to_string(),
+        });
+    }
+    if !content.is_empty() {
+        trace.events.push(AgentTraceEvent::FinalContent {
+            content: Some(content.to_string()),
+        });
+    }
 }

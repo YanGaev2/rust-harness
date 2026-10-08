@@ -1,11 +1,12 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use harness_cli::agent::{AgentError, AgentEvent, AgentRunner};
+use harness_cli::chat_client::{WireEvent, WireTap};
 use harness_cli::providers::ProviderConfig;
 use harness_cli::request::ChatMessage;
 use serde_json::Value;
@@ -459,6 +460,13 @@ fn agent_runner_cancelled_flag_stops_before_any_request() {
     let trace_json = serde_json::to_value(trace).unwrap();
     assert_eq!(trace_json["events"][0]["type"], "error");
     assert_eq!(trace_json["events"][0]["message"], "interrupted by user");
+    // The interrupted turn still carries its conversation (user message
+    // included), so the session history survives the Esc.
+    let messages = err
+        .messages()
+        .expect("cancelled run keeps the conversation");
+    assert_eq!(messages.last().unwrap().role(), "user");
+    assert_eq!(messages.last().unwrap().content(), "never sent");
 }
 
 #[test]
@@ -521,6 +529,72 @@ fn agent_runner_cancel_during_tools_skips_the_next_round() {
         .map(|event| event["type"].as_str().unwrap())
         .collect();
     assert_eq!(types, vec!["model_tool_calls", "tool_result", "error"]);
+}
+
+#[test]
+fn agent_runner_cancel_interrupts_running_shell_tool() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let sleep_command = if cfg!(windows) {
+        "Start-Sleep -Seconds 15"
+    } else {
+        "sleep 15"
+    };
+    let response_body = format!(
+        r#"{{
+            "choices": [{{
+                "message": {{
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {{
+                            "name": "run_shell_command",
+                            "arguments": "{{\"command\":\"{sleep_command}\"}}"
+                        }}
+                    }}]
+                }}
+            }}]
+        }}"#
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        respond(&mut stream, &response_body);
+    });
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let timer = {
+        let cancel = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(1));
+            cancel.store(true, Ordering::SeqCst);
+        })
+    };
+    let provider = ProviderConfig::new("local", format!("http://{addr}/v1"), "sk-agent");
+    // Timeout doubles as the shell timeout: keep it far above the sleep so
+    // the early return can only come from cancellation, not the timeout.
+    let runner = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
+        .with_timeout(Duration::from_secs(30))
+        .with_max_tool_rounds(3)
+        .with_cancel_flag(cancel);
+
+    let started = Instant::now();
+    let err = runner
+        .run_with_events("start a long command", |_| {})
+        .unwrap_err();
+    let elapsed = started.elapsed();
+    server.join().unwrap();
+    timer.join().unwrap();
+
+    assert!(matches!(err, AgentError::Cancelled { .. }));
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "Esc did not interrupt the running shell tool: took {elapsed:?}"
+    );
 }
 
 #[test]
@@ -780,6 +854,247 @@ fn agent_blocks_looping_identical_failing_call() {
     assert_eq!(result.final_content.as_deref(), Some("done"));
 }
 
+/// Two-round mock: round 1 returns reasoning + a tool call, round 2 asserts
+/// on the replayed history and finishes. Returns the base URL and a handle
+/// whose join yields the second request's parsed JSON body.
+fn spawn_reasoning_probe_server() -> (String, thread::JoinHandle<Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        let (mut first_stream, _) = listener.accept().unwrap();
+        read_http_request(&mut first_stream);
+        respond(
+            &mut first_stream,
+            r#"{
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "reasoning_content": "plan: write the file",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {
+                                "name": "write_file",
+                                "arguments": "{\"file\":\"notes.txt\",\"text\":\"hi\"}"
+                            }
+                        }]
+                    }
+                }],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+            }"#,
+        );
+
+        let (mut second_stream, _) = listener.accept().unwrap();
+        let second = read_http_request(&mut second_stream);
+        let body: Value = serde_json::from_str(second.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        respond(
+            &mut second_stream,
+            r#"{
+                "choices": [{"message": {
+                    "role": "assistant",
+                    "content": "done",
+                    "reasoning_content": "final check"
+                }}],
+                "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}
+            }"#,
+        );
+        body
+    });
+    (format!("http://{addr}/v1"), handle)
+}
+
+#[test]
+fn agent_replays_reasoning_in_tool_loop_when_retention_is_enabled() {
+    let (base_url, server) = spawn_reasoning_probe_server();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let provider = ProviderConfig::new("deepseek", base_url, "sk-agent");
+    let result = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_max_tool_rounds(3)
+        .with_retain_thinking(true)
+        .run("write notes.txt")
+        .unwrap();
+    let second_body = server.join().unwrap();
+
+    // The round-1 assistant turn goes back out with its chain-of-thought —
+    // DeepSeek V4 / Kimi / MiMo thinking modes 400 without it.
+    let assistant_turn = second_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| !message["tool_calls"].is_null())
+        .expect("replayed assistant tool-call turn");
+    assert_eq!(assistant_turn["reasoning_content"], "plan: write the file");
+
+    // The transcript keeps reasoning on both assistant turns.
+    let stored: Vec<Option<&str>> = result
+        .messages
+        .iter()
+        .filter(|message| message.role() == "assistant")
+        .map(|message| message.reasoning())
+        .collect();
+    assert_eq!(
+        stored,
+        vec![Some("plan: write the file"), Some("final check")]
+    );
+}
+
+#[test]
+fn agent_keeps_reasoning_out_of_requests_by_default() {
+    let (base_url, server) = spawn_reasoning_probe_server();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let provider = ProviderConfig::new("deepseek", base_url, "sk-agent");
+    let result = AgentRunner::new(provider, "deepseek-v4-pro", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_max_tool_rounds(3)
+        .run("write notes.txt")
+        .unwrap();
+    let second_body = server.join().unwrap();
+
+    for message in second_body["messages"].as_array().unwrap() {
+        assert!(
+            message.get("reasoning_content").is_none(),
+            "default must keep reasoning out of the wire: {message}"
+        );
+    }
+
+    // Off the wire, but never lost: history still stores it, so a later
+    // /retain-thinking toggle applies to the whole session retroactively.
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|message| message.reasoning() == Some("plan: write the file")),
+        "history must retain reasoning even when the wire does not"
+    );
+}
+
+#[test]
+fn agent_retries_transport_errors_in_place_and_recovers() {
+    // The first connection dies after the request is read (no response bytes
+    // → ureq surfaces a transport error). The classifier now asks for a quick
+    // in-place retry, so the second connection finishes the turn. Previously
+    // a transport error without a fallback chain failed the run immediately.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let server = thread::spawn(move || {
+        let (mut first, _) = listener.accept().unwrap();
+        read_http_request(&mut first);
+        drop(first);
+
+        let (mut second, _) = listener.accept().unwrap();
+        read_http_request(&mut second);
+        respond(
+            &mut second,
+            r#"{"choices": [{"message": {"role": "assistant", "content": "recovered"}}]}"#,
+        );
+    });
+
+    let provider = ProviderConfig::new("kimi", format!("http://{addr}/v1"), "sk-test");
+    let runner = AgentRunner::new(provider, "kimi-k3", workspace.path())
+        .with_timeout(Duration::from_secs(2));
+    let result = runner.run("ping").unwrap();
+    server.join().unwrap();
+
+    assert_eq!(result.final_content.as_deref(), Some("recovered"));
+}
+
+#[test]
+fn stream_cut_after_deltas_keeps_partial_turn_and_does_not_retry() {
+    // Once deltas have reached the user, a silent in-place retry would both
+    // duplicate the visible text and re-burn the whole generation (12 minutes
+    // of reasoning in the observed kimi-k3 case). The turn must fail fast and
+    // carry the conversation — user message plus the partial assistant text
+    // and thinking — so a follow-up "continue" resumes with context.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    let served_in_server = served.clone();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut first_served_at: Option<Instant> = None;
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    served_in_server.fetch_add(1, Ordering::SeqCst);
+                    first_served_at = Some(Instant::now());
+                    read_http_request(&mut stream);
+                    // Reasoning and content stream out, then the connection
+                    // closes without [DONE] — a truncated stream.
+                    respond_sse(
+                        &mut stream,
+                        &[
+                            r#"{"choices":[{"delta":{"reasoning_content":"разбираю задачу"},"index":0}]}"#,
+                            r#"{"choices":[{"delta":{"content":"начал ответ"},"index":0}]}"#,
+                        ],
+                    );
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Stay open long enough to catch a forbidden retry (the
+                    // in-place retry delay is 1s), then wind down.
+                    let past_grace = first_served_at
+                        .is_some_and(|at| at.elapsed() > Duration::from_millis(1600));
+                    if past_grace || Instant::now() > deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(30));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let provider = ProviderConfig::new("kimi", format!("http://{addr}/v1"), "sk-test");
+    let runner = AgentRunner::new(provider, "kimi-k3", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_streaming(true);
+    let err = runner.run("сделай видеоредактор").unwrap_err();
+    server.join().unwrap();
+
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "no silent retry once deltas reached the user"
+    );
+
+    let messages = err.messages().expect("chat error keeps the conversation");
+    assert!(messages.len() >= 2, "messages={messages:?}");
+    let user = &messages[messages.len() - 2];
+    assert_eq!(user.role(), "user");
+    assert_eq!(user.content(), "сделай видеоредактор");
+    let partial = messages.last().unwrap();
+    assert_eq!(partial.role(), "assistant");
+    assert_eq!(partial.content(), "начал ответ");
+    assert_eq!(
+        partial.reasoning(),
+        Some("разбираю задачу"),
+        "interrupted thinking must ride on the kept assistant turn"
+    );
+
+    // The trace survives too, so the cut turn is persisted for analysis.
+    let trace = err.trace().expect("chat error keeps its trace");
+    let trace_json = serde_json::to_value(trace).unwrap();
+    let events = trace_json["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|event| event["type"] == "thinking"
+            && event["content"].as_str().unwrap().contains("разбираю")),
+        "events={events:?}"
+    );
+    assert!(
+        events.iter().any(|event| event["type"] == "error"),
+        "events={events:?}"
+    );
+}
+
 fn read_http_request(stream: &mut TcpStream) -> String {
     let mut buffer = Vec::new();
     let mut chunk = [0; 1024];
@@ -855,4 +1170,52 @@ fn respond_sse(stream: &mut TcpStream, events: &[&str]) {
         body
     );
     stream.write_all(response.as_bytes()).unwrap();
+}
+
+#[test]
+fn agent_runner_forwards_wire_traffic_to_the_tap() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+
+    let response_body = r#"{"choices":[{"message":{"role":"assistant","content":"пинг принят"}}]}"#;
+    let canned = response_body.to_string();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_http_request(&mut stream);
+        respond(&mut stream, &canned);
+    });
+
+    let events: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let tap = WireTap::new(move |event| {
+        let (kind, payload) = match event {
+            WireEvent::Request { body, .. } => ("request", body),
+            WireEvent::Response { body, .. } => ("response", body),
+            WireEvent::SseData { data, .. } => ("sse", data),
+        };
+        sink.lock()
+            .unwrap()
+            .push((kind.to_string(), payload.to_string()));
+    });
+
+    let provider = ProviderConfig::new("kimi", format!("http://{addr}/v1"), "sk-agent");
+    let runner = AgentRunner::new(provider, "kimi-k3", workspace.path())
+        .with_timeout(Duration::from_secs(2))
+        .with_wire_tap(tap);
+    let result = runner.run("ping").unwrap();
+    server.join().unwrap();
+
+    assert_eq!(result.final_content.as_deref(), Some("пинг принят"));
+    let events = events.lock().unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "expected request + response, got {events:?}"
+    );
+    assert_eq!(events[0].0, "request");
+    let request: Value = serde_json::from_str(&events[0].1).unwrap();
+    assert_eq!(request["model"], "kimi-k3");
+    assert_eq!(events[1].0, "response");
+    assert_eq!(events[1].1, response_body);
 }

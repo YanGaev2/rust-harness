@@ -16,7 +16,6 @@ pub struct WriteResult {
     pub path: PathBuf,
     pub created: bool,
     pub previous_len: Option<usize>,
-    pub required_prior_read: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,23 +158,16 @@ impl FileTool {
             path: target,
             created: previous.is_none(),
             previous_len: previous.as_ref().map(Vec::len),
-            required_prior_read: false,
         })
     }
 
-    pub fn read_text(&self, requested_path: &str) -> Result<String, ToolError> {
-        let relative = normalize_relative_path(&self.root, requested_path)?;
-        let target = self.root.join(relative);
+    /// Canonical (existing target, display path) pair every path-taking
+    /// operation starts from.
+    fn resolve(&self, requested_path: &str) -> Result<(PathBuf, String), ToolError> {
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = target.canonicalize().map_err(ToolError::Io)?;
-
-        if !target.starts_with(&root) {
-            return Err(ToolError::OutsideWorkspace {
-                path: requested_path.to_string(),
-            });
-        }
-
-        fs::read_to_string(target).map_err(ToolError::Io)
+        let target = resolve_existing_workspace_path(&root, requested_path)?;
+        let path = workspace_relative_display(&root, &target)?;
+        Ok((target, path))
     }
 
     pub fn read_text_bounded(
@@ -183,9 +175,7 @@ impl FileTool {
         requested_path: &str,
         max_bytes: usize,
     ) -> Result<ReadResult, ToolError> {
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let total_bytes = fs::metadata(&target).map_err(ToolError::Io)?.len();
         let max_bytes = max_bytes.max(1);
         let read_limit = u64::try_from(max_bytes)
@@ -234,9 +224,7 @@ impl FileTool {
         max_bytes: usize,
         max_lines: Option<usize>,
     ) -> Result<TailResult, ToolError> {
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let total_bytes = fs::metadata(&target).map_err(ToolError::Io)?.len();
         let max_bytes = max_bytes.max(1);
         let read_window = u64::try_from(max_bytes.saturating_add(4))
@@ -268,9 +256,7 @@ impl FileTool {
     }
 
     pub fn hash_file(&self, requested_path: &str) -> Result<HashResult, ToolError> {
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let mut file = fs::File::open(&target).map_err(ToolError::Io)?;
         let mut hasher = blake3::Hasher::new();
         let bytes =
@@ -285,9 +271,7 @@ impl FileTool {
     }
 
     pub fn stat_path(&self, requested_path: &str) -> Result<StatResult, ToolError> {
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let metadata = fs::metadata(&target).map_err(ToolError::Io)?;
         let modified_unix_seconds = metadata
             .modified()
@@ -316,9 +300,7 @@ impl FileTool {
             return Err(ToolError::EmptySearch);
         }
 
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let previous = fs::read_to_string(&target).map_err(ToolError::Io)?;
         let previous_len = previous.len();
         let limit = max_replacements.unwrap_or(usize::MAX).max(1);
@@ -366,16 +348,10 @@ impl FileTool {
     }
 
     pub fn delete_path(&self, requested_path: &str) -> Result<DeleteResult, ToolError> {
-        let root = self.root.canonicalize().map_err(ToolError::Io)?;
-        let target = resolve_existing_workspace_path(&root, requested_path)?;
-        let path = workspace_relative_display(&root, &target)?;
+        let (target, path) = self.resolve(requested_path)?;
         let was_dir = target.is_dir();
 
-        if was_dir {
-            fs::remove_dir_all(&target).map_err(ToolError::Io)?;
-        } else {
-            fs::remove_file(&target).map_err(ToolError::Io)?;
-        }
+        remove_any(&target)?;
 
         Ok(DeleteResult { path, was_dir })
     }
@@ -399,11 +375,7 @@ impl FileTool {
         }
 
         if target_exists {
-            if target.is_dir() {
-                fs::remove_dir_all(&target).map_err(ToolError::Io)?;
-            } else {
-                fs::remove_file(&target).map_err(ToolError::Io)?;
-            }
+            remove_any(&target)?;
         }
 
         fs::rename(&source, &target).map_err(ToolError::Io)?;
@@ -450,17 +422,7 @@ impl FileTool {
         })
     }
 
-    pub fn search_text(
-        &self,
-        requested_path: &str,
-        query: &str,
-        max_results: usize,
-        max_file_bytes: u64,
-    ) -> Result<FileSearchResult, ToolError> {
-        self.search_text_with_context(requested_path, query, max_results, max_file_bytes, 0)
-    }
-
-    /// Like [`FileTool::search_text`], with `context_lines` neighbouring
+    /// Text search, with `context_lines` neighbouring
     /// lines captured around each match (grep `-C` style) so callers do not
     /// have to read whole files just to see what surrounds a hit.
     pub fn search_text_with_context(
@@ -629,6 +591,14 @@ fn strip_workspace_root(root: &Path, input: &str) -> Option<String> {
         });
     }
     None
+}
+
+fn remove_any(path: &Path) -> Result<(), ToolError> {
+    if path.is_dir() {
+        fs::remove_dir_all(path).map_err(ToolError::Io)
+    } else {
+        fs::remove_file(path).map_err(ToolError::Io)
+    }
 }
 
 fn normalize_relative_path(root: &Path, input: &str) -> Result<PathBuf, ToolError> {

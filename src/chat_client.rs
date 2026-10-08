@@ -8,30 +8,9 @@ use std::time::Duration;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value, json};
 
+use crate::http::{http_agent, streaming_http_agent};
 use crate::providers::{CachePolicy, ChatApiFormat, ProviderConfig};
 use crate::request::{ChatMessage, RequestEnvelope};
-
-/// Build the blocking HTTP agent. Non-2xx statuses come back as regular
-/// responses (`http_status_as_error(false)`) so callers can surface the
-/// provider's own error body instead of a bare status code.
-///
-/// Proxying is strictly opt-in via the harness config: `None`/"none" go
-/// direct (ambient HTTP_PROXY/HTTPS_PROXY are deliberately ignored so the
-/// environment can never silently reroute traffic), `"env"` opts into the
-/// environment variables, anything else is a proxy URL.
-fn http_agent(timeout: Duration, proxy: Option<&str>) -> ureq::Agent {
-    let proxy = match proxy.map(str::trim) {
-        None | Some("") | Some("none") => None,
-        Some("env") => ureq::Proxy::try_from_env(),
-        Some(url) => ureq::Proxy::new(url).ok(),
-    };
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .proxy(proxy)
-        .build()
-        .into()
-}
 
 /// Cache and auth headers a provider wants on every chat request.
 fn provider_headers(
@@ -58,7 +37,35 @@ fn post_json(
     headers: &[(String, String)],
     body: &str,
 ) -> Result<ureq::http::Response<ureq::Body>, ChatClientError> {
-    let agent = http_agent(timeout, proxy);
+    send_json(http_agent(timeout, proxy), url, accept, headers, body)
+}
+
+/// `post_json` for SSE endpoints: `timeout` bounds the connection and the
+/// response-header wait, but never the stream body — see `streaming_http_agent`.
+fn post_json_streaming(
+    timeout: Duration,
+    proxy: Option<&str>,
+    url: &str,
+    accept: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<ureq::http::Response<ureq::Body>, ChatClientError> {
+    send_json(
+        streaming_http_agent(timeout, proxy),
+        url,
+        accept,
+        headers,
+        body,
+    )
+}
+
+fn send_json(
+    agent: ureq::Agent,
+    url: &str,
+    accept: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<ureq::http::Response<ureq::Body>, ChatClientError> {
     let mut request = agent
         .post(url)
         .header("Accept", accept)
@@ -91,10 +98,44 @@ fn response_text(response: ureq::http::Response<ureq::Body>) -> Result<String, C
     Ok(response.into_body().read_to_string()?)
 }
 
+/// One raw wire event: the exact request body as sent, the full unparsed body
+/// of a blocking response, or a single SSE `data:` payload line of a stream
+/// (including the final `[DONE]` marker). Bodies only — headers, and therefore
+/// auth keys, never reach the tap.
+#[derive(Debug, Clone, Copy)]
+pub enum WireEvent<'a> {
+    Request { url: &'a str, body: &'a str },
+    Response { url: &'a str, body: &'a str },
+    SseData { url: &'a str, data: &'a str },
+}
+
+/// Shared sink for [`WireEvent`]s — the raw-traffic insurance log behind
+/// parsed traces. Must tolerate calls from a worker thread (the TUI runs the
+/// agent off-thread).
+#[derive(Clone)]
+pub struct WireTap(Arc<dyn Fn(WireEvent<'_>) + Send + Sync>);
+
+impl WireTap {
+    pub fn new(callback: impl Fn(WireEvent<'_>) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(callback))
+    }
+
+    fn emit(&self, event: WireEvent<'_>) {
+        (self.0)(event);
+    }
+}
+
+impl fmt::Debug for WireTap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WireTap")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderChatClient {
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    wire_tap: Option<WireTap>,
 }
 
 impl ProviderChatClient {
@@ -102,6 +143,7 @@ impl ProviderChatClient {
         Self {
             timeout,
             cancel: None,
+            wire_tap: None,
         }
     }
 
@@ -113,27 +155,54 @@ impl ProviderChatClient {
         self
     }
 
+    /// Mirror every request/response body (and raw SSE line) into `tap`.
+    pub fn with_wire_tap(mut self, tap: WireTap) -> Self {
+        self.wire_tap = Some(tap);
+        self
+    }
+
+    fn compat_client(&self) -> OpenAiCompatibleChatClient {
+        let mut client = OpenAiCompatibleChatClient::new(self.timeout);
+        if let Some(tap) = &self.wire_tap {
+            client = client.with_wire_tap(tap.clone());
+        }
+        client
+    }
+
+    fn responses_client(&self) -> OpenAiResponsesClient {
+        let mut client = OpenAiResponsesClient::new(self.timeout);
+        if let Some(tap) = &self.wire_tap {
+            client = client.with_wire_tap(tap.clone());
+        }
+        client
+    }
+
+    fn anthropic_client(&self) -> AnthropicMessagesChatClient {
+        let mut client = AnthropicMessagesChatClient::new(self.timeout);
+        if let Some(tap) = &self.wire_tap {
+            client = client.with_wire_tap(tap.clone());
+        }
+        client
+    }
+
     pub fn send(
         &self,
         provider: &ProviderConfig,
         envelope: &RequestEnvelope,
     ) -> Result<ChatResponse, ChatClientError> {
         match provider.chat_api() {
-            ChatApiFormat::OpenAiCompatible => {
-                OpenAiCompatibleChatClient::new(self.timeout).send(provider, envelope)
-            }
-            ChatApiFormat::OpenAiResponses => {
-                OpenAiResponsesClient::new(self.timeout).send(provider, envelope)
-            }
+            ChatApiFormat::OpenAiCompatible => self.compat_client().send(provider, envelope),
+            ChatApiFormat::OpenAiResponses => self.responses_client().send(provider, envelope),
             ChatApiFormat::OpenAiCodexResponses => {
-                OpenAiResponsesClient::new(self.timeout).send_codex(provider, envelope)
+                self.responses_client().send_codex(provider, envelope)
             }
-            ChatApiFormat::AnthropicMessages => {
-                AnthropicMessagesChatClient::new(self.timeout).send(provider, envelope)
-            }
+            ChatApiFormat::AnthropicMessages => self.anthropic_client().send(provider, envelope),
         }
     }
 
+    /// Content-only streaming (`chat stream`): the full stream_chat pipeline
+    /// with reasoning and tool-call deltas filtered out, so in-band errors,
+    /// finish_reason, and EOF detection behave identically on both paths.
     pub fn stream_text<F>(
         &self,
         provider: &ProviderConfig,
@@ -143,33 +212,12 @@ impl ProviderChatClient {
     where
         F: FnMut(&str),
     {
-        match provider.chat_api() {
-            ChatApiFormat::OpenAiCompatible => OpenAiCompatibleChatClient::new(self.timeout)
-                .stream_text(provider, envelope, on_delta),
-            ChatApiFormat::OpenAiResponses => {
-                let response = OpenAiResponsesClient::new(self.timeout).send(provider, envelope)?;
-                if let Some(content) = response.content.as_deref() {
-                    on_delta(content);
-                }
-                Ok(response.usage)
+        let response = self.stream_chat(provider, envelope, |delta| {
+            if let StreamDelta::Content(chunk) = delta {
+                on_delta(chunk);
             }
-            ChatApiFormat::OpenAiCodexResponses => {
-                let response =
-                    OpenAiResponsesClient::new(self.timeout).send_codex(provider, envelope)?;
-                if let Some(content) = response.content.as_deref() {
-                    on_delta(content);
-                }
-                Ok(response.usage)
-            }
-            ChatApiFormat::AnthropicMessages => {
-                let response =
-                    AnthropicMessagesChatClient::new(self.timeout).send(provider, envelope)?;
-                if let Some(content) = response.content.as_deref() {
-                    on_delta(content);
-                }
-                Ok(response.usage)
-            }
-        }
+        })?;
+        Ok(response.usage)
     }
 
     /// Stream a full turn (content + reasoning + tool calls). OpenAI-compatible
@@ -187,7 +235,7 @@ impl ProviderChatClient {
     {
         match provider.chat_api() {
             ChatApiFormat::OpenAiCompatible => {
-                let mut client = OpenAiCompatibleChatClient::new(self.timeout);
+                let mut client = self.compat_client();
                 if let Some(cancel) = &self.cancel {
                     client = client.with_cancel_flag(cancel.clone());
                 }
@@ -211,6 +259,7 @@ impl ProviderChatClient {
 pub struct OpenAiCompatibleChatClient {
     timeout: Duration,
     cancel: Option<Arc<AtomicBool>>,
+    wire_tap: Option<WireTap>,
 }
 
 impl OpenAiCompatibleChatClient {
@@ -218,11 +267,17 @@ impl OpenAiCompatibleChatClient {
         Self {
             timeout,
             cancel: None,
+            wire_tap: None,
         }
     }
 
     pub fn with_cancel_flag(mut self, cancel: Arc<AtomicBool>) -> Self {
         self.cancel = Some(cancel);
+        self
+    }
+
+    pub fn with_wire_tap(mut self, tap: WireTap) -> Self {
+        self.wire_tap = Some(tap);
         self
     }
 
@@ -235,43 +290,18 @@ impl OpenAiCompatibleChatClient {
             "{}/chat/completions",
             provider.base_url().trim_end_matches('/')
         );
-        let body = openai_chat_body(provider, envelope);
-        let response = post_json(
+        let body = openai_chat_body(provider, envelope).to_string();
+        let response = exchange(
             self.timeout,
-            provider.proxy(),
+            provider,
+            envelope,
             &url,
-            "application/json",
-            &provider_headers(provider, envelope),
-            &body.to_string(),
+            &[],
+            &body,
+            self.wire_tap.as_ref(),
         )?;
-        let response = response_text(response)?;
         let raw: OpenAiChatCompletionResponse = serde_json::from_str(&response)?;
         raw.into_chat_response()
-    }
-
-    pub fn stream_text<F>(
-        &self,
-        provider: &ProviderConfig,
-        envelope: &RequestEnvelope,
-        on_delta: F,
-    ) -> Result<TokenUsage, ChatClientError>
-    where
-        F: FnMut(&str),
-    {
-        let url = format!(
-            "{}/chat/completions",
-            provider.base_url().trim_end_matches('/')
-        );
-        let body = openai_stream_body(provider, envelope);
-        let response = post_json(
-            self.timeout,
-            provider.proxy(),
-            &url,
-            "text/event-stream",
-            &provider_headers(provider, envelope),
-            &body.to_string(),
-        )?;
-        read_openai_stream(response.into_body().into_reader(), on_delta)
     }
 
     /// Stream a full turn (content, reasoning, and tool calls), emitting each
@@ -289,19 +319,27 @@ impl OpenAiCompatibleChatClient {
             "{}/chat/completions",
             provider.base_url().trim_end_matches('/')
         );
-        let body = openai_stream_body(provider, envelope);
-        let response = post_json(
+        let body = openai_stream_body(provider, envelope).to_string();
+        if let Some(tap) = &self.wire_tap {
+            tap.emit(WireEvent::Request {
+                url: &url,
+                body: &body,
+            });
+        }
+        let response = post_json_streaming(
             self.timeout,
             provider.proxy(),
             &url,
             "text/event-stream",
             &provider_headers(provider, envelope),
-            &body.to_string(),
+            &body,
         )?;
         read_openai_stream_full(
             response.into_body().into_reader(),
             on_delta,
             self.cancel.as_deref(),
+            self.wire_tap.as_ref(),
+            &url,
         )
     }
 }
@@ -309,11 +347,20 @@ impl OpenAiCompatibleChatClient {
 #[derive(Debug, Clone)]
 pub struct OpenAiResponsesClient {
     timeout: Duration,
+    wire_tap: Option<WireTap>,
 }
 
 impl OpenAiResponsesClient {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            wire_tap: None,
+        }
+    }
+
+    pub fn with_wire_tap(mut self, tap: WireTap) -> Self {
+        self.wire_tap = Some(tap);
+        self
     }
 
     pub fn send(
@@ -343,16 +390,16 @@ impl OpenAiResponsesClient {
             provider.base_url().trim_end_matches('/'),
             endpoint.trim_start_matches('/')
         );
-        let body = openai_responses_body(envelope);
-        let response = post_json(
+        let body = openai_responses_body(envelope).to_string();
+        let response = exchange(
             self.timeout,
-            provider.proxy(),
+            provider,
+            envelope,
             &url,
-            "application/json",
-            &provider_headers(provider, envelope),
-            &body.to_string(),
+            &[],
+            &body,
+            self.wire_tap.as_ref(),
         )?;
-        let response = response_text(response)?;
         let raw: OpenAiResponsesResponse = serde_json::from_str(&response)?;
         Ok(raw.into_chat_response())
     }
@@ -361,11 +408,20 @@ impl OpenAiResponsesClient {
 #[derive(Debug, Clone)]
 pub struct AnthropicMessagesChatClient {
     timeout: Duration,
+    wire_tap: Option<WireTap>,
 }
 
 impl AnthropicMessagesChatClient {
     pub fn new(timeout: Duration) -> Self {
-        Self { timeout }
+        Self {
+            timeout,
+            wire_tap: None,
+        }
+    }
+
+    pub fn with_wire_tap(mut self, tap: WireTap) -> Self {
+        self.wire_tap = Some(tap);
+        self
     }
 
     pub fn send(
@@ -374,20 +430,71 @@ impl AnthropicMessagesChatClient {
         envelope: &RequestEnvelope,
     ) -> Result<ChatResponse, ChatClientError> {
         let url = format!("{}/messages", provider.base_url().trim_end_matches('/'));
-        let body = anthropic_messages_body(provider, envelope);
-        let mut headers = vec![("anthropic-version".to_string(), "2023-06-01".to_string())];
-        headers.extend(provider_headers(provider, envelope));
-        let response = post_json(
+        let body = anthropic_messages_body(provider, envelope).to_string();
+        let response = exchange(
             self.timeout,
-            provider.proxy(),
+            provider,
+            envelope,
             &url,
-            "application/json",
-            &headers,
-            &body.to_string(),
+            &[("anthropic-version".to_string(), "2023-06-01".to_string())],
+            &body,
+            self.wire_tap.as_ref(),
         )?;
-        let response = response_text(response)?;
         let raw: AnthropicMessagesResponse = serde_json::from_str(&response)?;
         raw.into_chat_response()
+    }
+}
+
+/// The blocking request pipeline every adapter shares: tap the request,
+/// POST, read the body, tap the response. `extra_headers` go first so the
+/// Anthropic version header keeps its position ahead of auth.
+fn exchange(
+    timeout: Duration,
+    provider: &ProviderConfig,
+    envelope: &RequestEnvelope,
+    url: &str,
+    extra_headers: &[(String, String)],
+    body: &str,
+    tap: Option<&WireTap>,
+) -> Result<String, ChatClientError> {
+    if let Some(tap) = tap {
+        tap.emit(WireEvent::Request { url, body });
+    }
+    let mut headers = extra_headers.to_vec();
+    headers.extend(provider_headers(provider, envelope));
+    let response = post_json(
+        timeout,
+        provider.proxy(),
+        url,
+        "application/json",
+        &headers,
+        body,
+    )?;
+    let response = response_text(response)?;
+    if let Some(tap) = tap {
+        tap.emit(WireEvent::Response {
+            url,
+            body: &response,
+        });
+    }
+    Ok(response)
+}
+
+/// Final assembly shared by every adapter: pairing the usage with its cache
+/// report here means no call site can forget one half.
+fn chat_response(
+    content: Option<String>,
+    reasoning: Option<String>,
+    tool_calls: Vec<ChatToolCall>,
+    usage: TokenUsage,
+) -> ChatResponse {
+    let cache = usage.cache_report();
+    ChatResponse {
+        content,
+        reasoning,
+        tool_calls,
+        usage,
+        cache,
     }
 }
 
@@ -433,20 +540,6 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    pub fn cache_hit_ratio(&self) -> Option<f64> {
-        if let (Some(hit), Some(miss)) =
-            (self.prompt_cache_hit_tokens, self.prompt_cache_miss_tokens)
-        {
-            let total = hit + miss;
-            return (total > 0).then_some(hit as f64 / total as f64);
-        }
-
-        match (self.cached_tokens, self.prompt_tokens) {
-            (Some(cached), Some(prompt)) if prompt > 0 => Some(cached as f64 / prompt as f64),
-            _ => None,
-        }
-    }
-
     pub fn cache_report(&self) -> Option<CacheUsageReport> {
         if let (Some(hit), Some(miss)) =
             (self.prompt_cache_hit_tokens, self.prompt_cache_miss_tokens)
@@ -495,11 +588,6 @@ impl<'de> Deserialize<'de> for TokenUsage {
             prompt_cache_hit_tokens: Option<u64>,
             prompt_cache_miss_tokens: Option<u64>,
             prompt_tokens_details: Option<PromptTokensDetails>,
-        }
-
-        #[derive(Deserialize)]
-        struct PromptTokensDetails {
-            cached_tokens: Option<u64>,
         }
 
         let raw = RawTokenUsage::deserialize(deserializer)?;
@@ -624,14 +712,7 @@ impl OpenAiChatCompletionResponse {
         }
 
         let usage = self.usage.unwrap_or_default();
-        let cache = usage.cache_report();
-        Ok(ChatResponse {
-            content,
-            reasoning,
-            tool_calls,
-            usage,
-            cache,
-        })
+        Ok(chat_response(content, reasoning, tool_calls, usage))
     }
 }
 
@@ -709,14 +790,12 @@ impl OpenAiResponsesResponse {
         }
 
         let usage: TokenUsage = self.usage.map(Into::into).unwrap_or_default();
-        let cache = usage.cache_report();
-        ChatResponse {
-            content: (!text_blocks.is_empty()).then(|| text_blocks.join("")),
-            reasoning: (!reasoning_blocks.is_empty()).then(|| reasoning_blocks.join("\n")),
+        chat_response(
+            (!text_blocks.is_empty()).then(|| text_blocks.join("")),
+            (!reasoning_blocks.is_empty()).then(|| reasoning_blocks.join("\n")),
             tool_calls,
             usage,
-            cache,
-        }
+        )
     }
 }
 
@@ -802,14 +881,12 @@ impl AnthropicMessagesResponse {
         }
 
         let usage: TokenUsage = self.usage.map(Into::into).unwrap_or_default();
-        let cache = usage.cache_report();
-        Ok(ChatResponse {
-            content: (!text_blocks.is_empty()).then(|| text_blocks.join("")),
-            reasoning: (!reasoning_blocks.is_empty()).then(|| reasoning_blocks.join("\n")),
+        Ok(chat_response(
+            (!text_blocks.is_empty()).then(|| text_blocks.join("")),
+            (!reasoning_blocks.is_empty()).then(|| reasoning_blocks.join("\n")),
             tool_calls,
             usage,
-            cache,
-        })
+        ))
     }
 }
 
@@ -849,7 +926,12 @@ fn openai_chat_body(provider: &ProviderConfig, envelope: &RequestEnvelope) -> Va
             "content": content,
         }));
     }
-    messages.extend(envelope.messages().iter().map(openai_message_body));
+    messages.extend(
+        envelope
+            .messages()
+            .iter()
+            .map(|message| openai_message_body(message, envelope.retain_thinking())),
+    );
 
     let tools = envelope
         .tools()
@@ -979,9 +1061,19 @@ fn cacheable_openai_text_content(text: &str, ttl: Option<&str>) -> Value {
     }])
 }
 
-fn openai_message_body(message: &crate::request::ChatMessage) -> Value {
+fn openai_message_body(message: &crate::request::ChatMessage, retain_thinking: bool) -> Value {
     let mut object = Map::new();
     object.insert("role".to_string(), json!(message.role()));
+
+    // `reasoning_content` is the de-facto OpenAI-compatible field for
+    // replayed chain-of-thought (DeepSeek / Kimi / MiMo thinking modes
+    // require it back on every assistant turn; probe 2026-08-04).
+    if retain_thinking
+        && message.role() == "assistant"
+        && let Some(reasoning) = message.reasoning()
+    {
+        object.insert("reasoning_content".to_string(), json!(reasoning));
+    }
 
     if !message.tool_calls().is_empty() {
         object.insert("content".to_string(), Value::Null);
@@ -1039,7 +1131,7 @@ fn anthropic_messages_body(provider: &ProviderConfig, envelope: &RequestEnvelope
             envelope
                 .messages()
                 .iter()
-                .map(anthropic_message_body)
+                .map(|message| anthropic_message_body(message, envelope.retain_thinking()))
                 .collect(),
         ),
     );
@@ -1066,18 +1158,31 @@ fn anthropic_messages_body(provider: &ProviderConfig, envelope: &RequestEnvelope
     Value::Object(object)
 }
 
-fn anthropic_message_body(message: &ChatMessage) -> Value {
+fn anthropic_message_body(message: &ChatMessage, retain_thinking: bool) -> Value {
+    // Unsigned thinking block synthesised from the stored reasoning, first in
+    // the content array (the Kimi/DeepSeek/MiMo anthropic-endpoint contract;
+    // real Anthropic thinking-with-tools needs signed blocks we do not store).
+    let retained_thinking_block = || {
+        retain_thinking
+            .then(|| message.reasoning())
+            .flatten()
+            .map(|reasoning| json!({"type": "thinking", "thinking": reasoning}))
+    };
+
     if !message.tool_calls().is_empty() {
+        let mut blocks = Vec::new();
+        blocks.extend(retained_thinking_block());
+        blocks.extend(message.tool_calls().iter().map(|call| {
+            json!({
+                "type": "tool_use",
+                "id": call.id(),
+                "name": api_tool_name(call.name()),
+                "input": call.arguments(),
+            })
+        }));
         return json!({
             "role": "assistant",
-            "content": message.tool_calls().iter().map(|call| {
-                json!({
-                    "type": "tool_use",
-                    "id": call.id(),
-                    "name": api_tool_name(call.name()),
-                    "input": call.arguments(),
-                })
-            }).collect::<Vec<_>>(),
+            "content": blocks,
         });
     }
 
@@ -1089,6 +1194,18 @@ fn anthropic_message_body(message: &ChatMessage) -> Value {
                 "tool_use_id": tool_call_id,
                 "content": message.content(),
             }],
+        });
+    }
+
+    if message.role() == "assistant"
+        && let Some(thinking_block) = retained_thinking_block()
+    {
+        return json!({
+            "role": "assistant",
+            "content": [
+                thinking_block,
+                {"type": "text", "text": message.content()},
+            ],
         });
     }
 
@@ -1173,25 +1290,22 @@ fn collect_responses_reasoning(item: &Value, reasoning_blocks: &mut Vec<String>)
 fn parse_tool_arguments_lossy(raw: &str) -> Value {
     let trimmed = raw.trim();
     let stripped = strip_json_code_fence(trimmed);
+    // The shared pipeline (json_repair) parses valid JSON on its first
+    // attempt and only then repairs: control chars in strings, trailing
+    // commas (string-literal aware), missing closers. The quote swap stays
+    // local — it only makes sense for fully single-quoted payloads.
     let mut candidates = vec![trimmed.to_string()];
-
     if stripped != trimmed {
         candidates.push(stripped.to_string());
     }
-
     for base in candidates.clone() {
-        let without_trailing_commas = remove_trailing_commas(&base);
-        if without_trailing_commas != base {
-            candidates.push(without_trailing_commas.clone());
-        }
-
-        if without_trailing_commas.contains('\'') && !without_trailing_commas.contains('"') {
-            candidates.push(without_trailing_commas.replace('\'', "\""));
+        if base.contains('\'') && !base.contains('"') {
+            candidates.push(base.replace('\'', "\""));
         }
     }
 
     for candidate in candidates {
-        if let Ok(value) = serde_json::from_str::<Value>(&candidate) {
+        if let Some(value) = crate::json_repair::repair_json_text(&candidate) {
             return if value.is_object() {
                 value
             } else {
@@ -1218,75 +1332,26 @@ fn strip_json_code_fence(input: &str) -> &str {
     }
 }
 
-fn remove_trailing_commas(input: &str) -> String {
-    let characters = input.chars().collect::<Vec<_>>();
-    let mut output = String::with_capacity(input.len());
-
-    for (index, character) in characters.iter().enumerate() {
-        if *character == ',' {
-            let next_non_whitespace = characters
-                .iter()
-                .skip(index + 1)
-                .copied()
-                .find(|candidate| !candidate.is_whitespace());
-            if matches!(next_non_whitespace, Some('}' | ']')) {
-                continue;
-            }
-        }
-
-        output.push(*character);
-    }
-
-    output
-}
-
-fn read_openai_stream<R, F>(reader: R, mut on_delta: F) -> Result<TokenUsage, ChatClientError>
-where
-    R: std::io::Read,
-    F: FnMut(&str),
-{
-    let mut usage = TokenUsage::default();
-    let reader = BufReader::new(reader);
-
-    for line in reader.lines() {
-        let line = line.map_err(ChatClientError::Io)?;
-        let Some(data) = line.trim().strip_prefix("data:") else {
-            continue;
-        };
-        let data = data.trim();
-        if data.is_empty() {
-            continue;
-        }
-        if data == "[DONE]" {
-            break;
-        }
-
-        let event: OpenAiStreamChunk = serde_json::from_str(data)?;
-        if let Some(chunk_usage) = event.usage {
-            usage = chunk_usage;
-        }
-
-        for choice in event.choices {
-            if let Some(content) = choice.delta.content {
-                on_delta(&content);
-            }
-        }
-    }
-
-    Ok(usage)
-}
-
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamChunk {
     #[serde(default)]
     choices: Vec<OpenAiStreamChoice>,
     #[serde(default)]
     usage: Option<TokenUsage>,
+    /// In-band abort: some backends (baseten) end a stream with
+    /// `{"error":{...}}` + [DONE]. Without this field the event used to parse
+    /// as an empty chunk and the cut turn looked like a normal answer.
+    #[serde(default)]
+    error: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiStreamChoice {
     delta: OpenAiStreamDelta,
+    /// Marks normal completion; providers may close right after it without a
+    /// [DONE] marker. Its absence at EOF marks a truncated stream.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1339,6 +1404,8 @@ fn read_openai_stream_full<R, F>(
     reader: R,
     mut on_delta: F,
     cancel: Option<&AtomicBool>,
+    wire_tap: Option<&WireTap>,
+    url: &str,
 ) -> Result<ChatResponse, ChatClientError>
 where
     R: std::io::Read,
@@ -1348,12 +1415,16 @@ where
     let mut content = String::new();
     let mut reasoning = String::new();
     let mut tools: Vec<StreamToolAcc> = Vec::new();
+    // Set by [DONE] or a finish_reason; EOF without either means the stream
+    // was cut mid-answer and must surface as an error, not a shorter answer.
+    let mut completed = false;
     let reader = BufReader::new(reader);
 
     for line in reader.lines() {
         // Cooperative cancel between chunks: stop reading and hand back what
         // has accumulated so far; the caller decides how to report the abort.
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            completed = true;
             break;
         }
         let line = line.map_err(ChatClientError::Io)?;
@@ -1364,16 +1435,28 @@ where
         if data.is_empty() {
             continue;
         }
+        // Tapped before parsing (and before the [DONE] break) so the raw log
+        // is a faithful record of the stream even when parsing fails.
+        if let Some(tap) = wire_tap {
+            tap.emit(WireEvent::SseData { url, data });
+        }
         if data == "[DONE]" {
+            completed = true;
             break;
         }
 
         let event: OpenAiStreamChunk = serde_json::from_str(data)?;
+        if let Some(error) = event.error {
+            return Err(sse_error_event(url, &error));
+        }
         if let Some(chunk_usage) = event.usage {
             usage = chunk_usage;
         }
 
         for choice in event.choices {
+            if choice.finish_reason.is_some() {
+                completed = true;
+            }
             let delta = choice.delta;
             if let Some(chunk) = delta.content.filter(|text| !text.is_empty()) {
                 on_delta(StreamDelta::Content(&chunk));
@@ -1408,6 +1491,13 @@ where
         }
     }
 
+    if !completed {
+        return Err(ChatClientError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "stream ended without completion (no [DONE] or finish_reason)",
+        )));
+    }
+
     let tool_calls = tools
         .into_iter()
         .filter(|tool| !tool.name.is_empty() || !tool.arguments.is_empty())
@@ -1418,12 +1508,28 @@ where
         })
         .collect();
 
-    let cache = usage.cache_report();
-    Ok(ChatResponse {
-        content: (!content.is_empty()).then_some(content),
-        reasoning: (!reasoning.is_empty()).then_some(reasoning),
+    Ok(chat_response(
+        (!content.is_empty()).then_some(content),
+        (!reasoning.is_empty()).then_some(reasoning),
         tool_calls,
         usage,
-        cache,
-    })
+    ))
+}
+
+/// Map an in-band SSE `{"error":{...}}` event onto the same shape as an HTTP
+/// error reply, so the failover classifier sees one taxonomy: the numeric
+/// `code` field when it looks like a status, else 502 (upstream failure).
+fn sse_error_event(url: &str, error: &serde_json::Value) -> ChatClientError {
+    let code = error
+        .get("code")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|code| u16::try_from(code).ok())
+        .filter(|code| (100..=599).contains(code))
+        .unwrap_or(502);
+    ChatClientError::Status {
+        code,
+        url: url.to_string(),
+        body: error.to_string(),
+        retry_after_seconds: None,
+    }
 }

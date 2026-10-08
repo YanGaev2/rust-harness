@@ -1,4 +1,31 @@
-use harness_tui::text::{Color, Line, Span, Style, render_ansi, visible_width, wrap};
+use harness_tui::text::{Color, Line, Span, Style, render_ansi, visible_width, wrap, wrap_hanging};
+
+#[test]
+fn wrap_hanging_indents_continuations_and_consumes_break_spaces() {
+    let rows = wrap_hanging(&Line::raw("• alpha beta gamma"), 10, 2);
+    let texts: Vec<String> = rows.iter().map(Line::text).collect();
+    assert_eq!(texts, vec!["• alpha", "  beta", "  gamma"]);
+}
+
+#[test]
+fn wrap_hanging_counts_display_width_not_chars() {
+    // Four double-width ideographs need eight columns: width 4 fits two per
+    // row. A char-based wrapper would cram all four into one row.
+    let rows = wrap_hanging(&Line::raw("\u{597d}\u{597d}\u{597d}\u{597d}"), 4, 0);
+    let texts: Vec<String> = rows.iter().map(Line::text).collect();
+    assert_eq!(texts, vec!["\u{597d}\u{597d}", "\u{597d}\u{597d}"]);
+}
+
+#[test]
+fn wrap_hanging_keeps_short_lines_and_clamps_indent() {
+    let short = Line::raw("fits");
+    assert_eq!(wrap_hanging(&short, 10, 4), vec![short.clone()]);
+
+    // indent is clamped to half the width so continuations keep room.
+    let rows = wrap_hanging(&Line::raw("aaaa bbbb cccc"), 4, 40);
+    let texts: Vec<String> = rows.iter().map(Line::text).collect();
+    assert_eq!(texts, vec!["aaaa", "  bb", "  bb", "  cc", "  cc"]);
+}
 
 #[test]
 fn width_of_ascii() {

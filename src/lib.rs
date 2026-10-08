@@ -7,6 +7,8 @@ pub mod config;
 pub mod diagnostics;
 pub mod failover;
 pub mod guardrails;
+pub mod http;
+pub mod json_repair;
 pub mod model_client;
 pub mod platform;
 pub mod prompt;

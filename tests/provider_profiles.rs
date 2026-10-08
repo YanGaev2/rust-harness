@@ -1,6 +1,5 @@
 ﻿use harness_cli::providers::{
-    AuthScheme, BuiltinProvider, CachePolicy, ChatApiFormat, ProviderConfig, ProviderRegistry,
-    builtin_pricing,
+    AuthScheme, BuiltinProvider, CachePolicy, ChatApiFormat, ProviderConfig, builtin_pricing,
 };
 
 #[test]
@@ -55,17 +54,8 @@ fn pricing_estimates_a_session_cost_from_cache_aware_token_counts() {
 
 #[test]
 fn builtin_subscription_profiles_include_requested_families_and_deepseek_cache_hints() {
-    let registry = ProviderRegistry::with_builtin_subscriptions();
-
-    for provider in [
-        BuiltinProvider::Codex,
-        BuiltinProvider::Xiaomi,
-        BuiltinProvider::Glm,
-        BuiltinProvider::Kimi,
-        BuiltinProvider::Claude,
-        BuiltinProvider::DeepSeek,
-    ] {
-        let config = registry.get(provider.name()).expect("missing provider");
+    for provider in BuiltinProvider::ALL {
+        let config = ProviderConfig::from_profile(provider.profile());
         assert_eq!(config.auth_scheme(), provider.profile().auth_scheme);
         assert_eq!(config.key_env(), Some(provider.profile().key_env));
         assert_eq!(config.cache_policy(), provider.profile().cache_policy);
@@ -76,7 +66,7 @@ fn builtin_subscription_profiles_include_requested_families_and_deepseek_cache_h
         );
     }
 
-    let claude = registry.get("claude").unwrap();
+    let claude = ProviderConfig::from_profile(BuiltinProvider::Claude.profile());
     assert_eq!(
         claude.auth_scheme(),
         AuthScheme::Header {
@@ -89,11 +79,11 @@ fn builtin_subscription_profiles_include_requested_families_and_deepseek_cache_h
         CachePolicy::AnthropicAutomatic { ttl: None }
     );
 
-    let codex = registry.get("codex").unwrap();
+    let codex = ProviderConfig::from_profile(BuiltinProvider::Codex.profile());
     assert_eq!(codex.chat_api(), ChatApiFormat::OpenAiCodexResponses);
     assert!(codex.models().contains(&"gpt-5-codex".to_string()));
 
-    let deepseek = registry.get("deepseek").unwrap();
+    let deepseek = ProviderConfig::from_profile(BuiltinProvider::DeepSeek.profile());
     assert_eq!(
         deepseek.cache_policy(),
         CachePolicy::Automatic {

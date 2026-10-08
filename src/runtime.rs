@@ -1166,8 +1166,7 @@ const PATH_ALIASES: &[&str] = &[
     "filepath",
     "target_file",
 ];
-const MOVE_SOURCE_ALIASES: &[&str] =
-    &["source", "from", "path", "file", "src", "source_path"];
+const MOVE_SOURCE_ALIASES: &[&str] = &["source", "from", "path", "file", "src", "source_path"];
 const MOVE_TARGET_ALIASES: &[&str] = &[
     "target",
     "to",

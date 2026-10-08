@@ -74,3 +74,44 @@ fn styled_snapshot_of_plain_text_has_no_markers() {
     }]);
     assert_eq!(term.styled(), "plain");
 }
+
+mod vt_screen {
+    use harness_tui::headless::VtScreen;
+
+    #[test]
+    fn line_feed_on_the_last_row_scrolls_into_scrollback() {
+        let mut vt = VtScreen::new(10, 2);
+        vt.feed(b"one\r\ntwo\r\nthree");
+        assert_eq!(vt.scrollback(), &["one".to_string()]);
+        assert_eq!(vt.viewport(), vec!["two", "three"]);
+    }
+
+    #[test]
+    fn cursor_moves_and_erases_follow_the_vt_subset() {
+        let mut vt = VtScreen::new(10, 3);
+        vt.feed(b"aaaa\r\nbbbb\r\ncccc");
+        vt.feed(b"\x1b[2;3H\x1b[0J\x1b[1;1H\x1b[2Kz\x1b[3J");
+        assert_eq!(vt.viewport(), vec!["z", "bb", ""]);
+        assert!(vt.scrollback().is_empty());
+    }
+
+    #[test]
+    fn exact_width_rows_wrap_only_on_the_next_printable() {
+        let mut vt = VtScreen::new(4, 3);
+        // Four cells fill the row; CR LF must not produce an extra blank row.
+        vt.feed(b"abcd\r\nef");
+        assert_eq!(vt.viewport(), vec!["abcd", "ef", ""]);
+        // A fifth printable wraps.
+        let mut vt = VtScreen::new(4, 3);
+        vt.feed(b"abcde");
+        assert_eq!(vt.viewport(), vec!["abcd", "e", ""]);
+    }
+
+    #[test]
+    fn wide_characters_take_two_cells_and_sgr_is_ignored() {
+        let mut vt = VtScreen::new(6, 1);
+        vt.feed("\x1b[1;36m好\x1b[0mab".as_bytes());
+        assert_eq!(vt.viewport(), vec!["好ab"]);
+        assert_eq!(vt.cursor(), (0, 4));
+    }
+}

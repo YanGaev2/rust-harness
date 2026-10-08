@@ -1130,6 +1130,11 @@ fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
                 // listener'а: без сброса read() может вернуть WouldBlock
                 // и уронить мок до прихода полного запроса.
                 stream.set_nonblocking(false).unwrap();
+                // A client that keeps the socket open without sending would
+                // block read() forever and hang server.join(); fail instead.
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .unwrap();
                 return stream;
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {

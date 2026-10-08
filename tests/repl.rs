@@ -426,19 +426,19 @@ fn resize_debouncer_erases_on_width_change_and_repaints_after_settle() {
 }
 
 #[test]
-fn resize_debouncer_height_only_change_resizes_immediately() {
+fn resize_debouncer_height_only_change_also_erases_and_repaints() {
     use harness_cli::repl::{ResizeAction, ResizeDebouncer};
     use std::time::{Duration, Instant};
 
     let t0 = Instant::now();
     let mut deb = ResizeDebouncer::new(120, 30, Duration::from_millis(150));
-    // No reflow on a height-only change: keep the cheap repin path and
-    // never schedule a repaint.
-    assert_eq!(deb.observe(120, 40, t0), ResizeAction::Resize);
-    assert!(!deb.is_pending());
+    // The docked status row keeps the cursor on the last row, so a height
+    // change may scroll the buffer: same erase + repaint path as width.
+    assert_eq!(deb.observe(120, 40, t0), ResizeAction::Erase);
+    assert!(deb.is_pending());
     assert_eq!(
         deb.observe(120, 40, t0 + Duration::from_millis(200)),
-        ResizeAction::None
+        ResizeAction::Repaint
     );
 }
 

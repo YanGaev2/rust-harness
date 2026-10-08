@@ -1,9 +1,17 @@
-//! Screen: a pinned bottom panel plus native-scrollback content.
+//! Screen: native-scrollback content plus a live panel below it.
 //!
-//! The Claude-Code-style screen model: finished content is printed into
-//! the terminal's own scrollback (wheel-scrollable, selectable, survives
-//! exit) and only the bottom panel (editor, spinner, status) is diffed
-//! and repainted. Every write happens inside a synchronized-output frame.
+//! Finished content is printed into the terminal's own scrollback
+//! (wheel-scrollable, selectable, survives exit) and only the live panel
+//! (streaming tail, editor, spinner, status) is diffed and repainted.
+//! Every write happens inside a synchronized-output frame.
+//!
+//! Layout contract: content always flows top-down and every commit
+//! starts exactly where the previous content ended, so the scrollback
+//! never receives blank gaps. The live panel follows the content. Its
+//! last `docked` rows (editor, status) are pinned to the bottom edge:
+//! blank filler rows between the panel body and the dock absorb every
+//! change of panel height. The filler belongs to the panel, so it is
+//! repainted, never committed.
 
 use std::io;
 
@@ -11,20 +19,21 @@ use crate::diff::diff_frames;
 use crate::terminal::{Terminal, TerminalError, esc};
 use crate::text::{Line, render_ansi};
 
-/// A live screen: pinned panel at the bottom, scrollback above.
+/// A live screen: scrollback content above, the live panel below it.
 pub struct Screen {
     terminal: Terminal,
     width: u16,
     height: u16,
-    /// Currently painted panel rows.
+    /// Currently painted panel rows, dock filler included.
     panel: Vec<Line>,
+    /// The live frame as last passed in (no filler) — resize recomposes
+    /// it against the new geometry.
+    live: Vec<Line>,
+    /// How many trailing `live` rows are docked to the bottom edge.
+    docked: usize,
     /// Terminal row (0-based) where the panel starts — also where the
-    /// next scrollback emission begins.
+    /// next committed content begins.
     origin: u16,
-    /// Opt-in bottom-pinned layout: the panel hugs the last rows of the
-    /// viewport and every repaint/resize re-derives its top from the
-    /// bottom edge instead of following the content flow.
-    anchored: bool,
 }
 
 impl Screen {
@@ -36,21 +45,9 @@ impl Screen {
             width,
             height,
             panel: Vec::new(),
+            live: Vec::new(),
+            docked: 0,
             origin: start_row.min(height.saturating_sub(1)),
-            anchored: false,
-        }
-    }
-
-    /// Switch to the bottom-pinned layout (Claude-Code-style chat): the
-    /// flow origin moves to the last viewport row so committed content
-    /// accumulates just above the panel, and repaints/resizes keep the
-    /// panel glued to the bottom edge. Call before the first paint (or
-    /// right before `clear_screen`) — an already-painted panel is not
-    /// relocated retroactively.
-    pub fn set_bottom_anchor(&mut self, anchored: bool) {
-        self.anchored = anchored;
-        if anchored && self.panel.is_empty() {
-            self.origin = self.height.saturating_sub(1);
         }
     }
 
@@ -71,122 +68,63 @@ impl Screen {
         self.height
     }
 
-    /// Rows available for the pinned panel.
+    /// Rows available for the live panel.
     pub fn max_panel_rows(&self) -> u16 {
         self.height
     }
 
     /// Print finished content into native scrollback, then repaint the
-    /// panel right below it. Lines must already be wrapped to `width`.
+    /// current live frame right below it. Lines must already be wrapped
+    /// to `width`.
     pub fn emit(&mut self, lines: &[Line]) -> io::Result<()> {
         if lines.is_empty() {
             return Ok(());
         }
-        let panel_len = self.panel.len() as u16;
-        let row0 = self.origin;
-        let k = lines.len() as u16;
-        let height = self.height.max(1);
-
-        let mut frame = String::new();
-        frame.push_str(esc::SYNC_BEGIN);
-        frame.push_str(&esc::move_to(row0, 0));
-        frame.push_str(esc::CLEAR_DOWN);
-        for line in lines {
-            frame.push_str(&render_ansi(line));
-            frame.push_str("\r\n");
-        }
-        // Printing scrolled the buffer when it ran past the last row;
-        // scroll further if the panel reserve still doesn't fit.
-        let scrolled = (row0 + k).saturating_sub(height - 1);
-        let needed = (row0 + k + panel_len).saturating_sub(height);
-        let extra = needed.saturating_sub(scrolled);
-        if extra > 0 {
-            frame.push_str(&esc::move_to(height - 1, 0));
-            for _ in 0..extra {
-                frame.push_str("\r\n");
-            }
-        }
-        // Reserve at least the cursor row even with no panel painted,
-        // so origin can never land outside the viewport. Anchored mode
-        // ignores the flow and pins the panel to the bottom edge.
-        self.origin = if self.anchored {
-            height.saturating_sub(panel_len.max(1))
-        } else {
-            (row0 + k).min(height.saturating_sub(panel_len.max(1)))
-        };
-        push_panel_rows(&mut frame, &self.panel, self.origin);
-        frame.push_str(esc::SYNC_END);
-        self.terminal.write_all(frame.as_bytes())
+        let live = self.live.clone();
+        self.present(lines, live, self.docked)
     }
 
-    /// Repaint the pinned panel. Same height → only changed rows are
-    /// rewritten; height changes force a clear + full redraw.
-    pub fn render_panel(&mut self, mut lines: Vec<Line>) -> io::Result<()> {
-        // A panel taller than the screen is tail-clipped: the bottom
-        // rows (editor, status) matter most, and unclipped input would
+    /// Repaint the live panel in flow layout (no docked rows). Same
+    /// height → only changed rows are rewritten.
+    pub fn render_panel(&mut self, lines: Vec<Line>) -> io::Result<()> {
+        self.present(&[], lines, 0)
+    }
+
+    /// Commit finalized rows at the current origin and paint the next
+    /// live frame directly below them — in ONE synchronized write, so the
+    /// terminal never shows a stale live frame between the two. The last
+    /// `docked` rows of `live` are pinned to the bottom edge. The scroll
+    /// reserve comes from the NEW live frame without filler: filler only
+    /// fills rows that are free anyway, it never pushes content up.
+    pub fn present(
+        &mut self,
+        committed: &[Line],
+        mut live: Vec<Line>,
+        docked: usize,
+    ) -> io::Result<()> {
+        let height = self.height.max(1);
+        // A frame taller than the screen is tail-clipped: the bottom rows
+        // (editor, status) matter most, and an unclipped frame would
         // underflow the origin arithmetic below.
-        let max_rows = self.height.max(1) as usize;
-        if lines.len() > max_rows {
-            lines = lines.split_off(lines.len() - max_rows);
+        if live.len() > height as usize {
+            live = live.split_off(live.len() - height as usize);
         }
-        if lines.len() == self.panel.len() {
-            let updates = diff_frames(&self.panel, &lines);
-            self.panel = lines;
-            return self.terminal.present(&updates, self.origin);
-        }
-        let height = self.height.max(1);
-        let new_len = lines.len() as u16;
-        let mut frame = String::new();
-        frame.push_str(esc::SYNC_BEGIN);
-        // Scroll content up when the taller panel no longer fits below.
-        let overflow = (self.origin + new_len).saturating_sub(height);
-        if overflow > 0 {
-            frame.push_str(&esc::move_to(height - 1, 0));
-            for _ in 0..overflow {
-                frame.push_str("\r\n");
-            }
-            self.origin = self.origin.saturating_sub(overflow);
-        }
-        if self.anchored {
-            let target = height.saturating_sub(new_len.max(1));
-            if target > self.origin {
-                // Panel shrank: wipe the old panel area first, then
-                // repin to the bottom (the flow origin would leave the
-                // shorter panel floating with a gap below it).
-                frame.push_str(&esc::move_to(self.origin, 0));
-                frame.push_str(esc::CLEAR_DOWN);
-                self.origin = target;
-            }
-        }
-        frame.push_str(&esc::move_to(self.origin, 0));
-        frame.push_str(esc::CLEAR_DOWN);
-        push_panel_rows(&mut frame, &lines, self.origin);
-        frame.push_str(esc::SYNC_END);
-        self.panel = lines;
-        self.terminal.write_all(frame.as_bytes())
-    }
-
-    /// Commit finalized rows at the current flow origin and paint the
-    /// next live frame directly below them — in ONE synchronized write,
-    /// so the terminal never shows the stale live frame between the two.
-    /// The scroll reserve is computed from the NEW live frame, not the
-    /// previously painted one.
-    pub fn present(&mut self, committed: &[Line], mut live: Vec<Line>) -> io::Result<()> {
-        let height = self.height.max(1);
-        let max_rows = height as usize;
-        if live.len() > max_rows {
-            live = live.split_off(live.len() - max_rows);
-        }
-        // Fast path: nothing to commit and the live frame kept its
-        // height — diff rows in place.
-        if committed.is_empty() && live.len() == self.panel.len() {
-            let updates = diff_frames(&self.panel, &live);
-            self.panel = live;
-            return self.terminal.present(&updates, self.origin);
-        }
+        let docked = docked.min(live.len());
         let row0 = self.origin;
         let k = committed.len() as u16;
         let live_len = live.len() as u16;
+        let origin = (row0 + k).min(height.saturating_sub(live_len.max(1)));
+        let panel = compose(&live, docked, (height - origin) as usize);
+
+        // Fast path: nothing to commit, the panel stays put and keeps its
+        // height — diff rows in place.
+        if committed.is_empty() && origin == row0 && panel.len() == self.panel.len() {
+            let updates = diff_frames(&self.panel, &panel);
+            self.panel = panel;
+            self.live = live;
+            self.docked = docked;
+            return self.terminal.present(&updates, origin);
+        }
 
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
@@ -197,7 +135,7 @@ impl Screen {
             frame.push_str("\r\n");
         }
         // Printing scrolled the buffer when it ran past the last row;
-        // scroll further only if the NEW live frame still doesn't fit.
+        // scroll further only if the new live frame still doesn't fit.
         let scrolled = (row0 + k).saturating_sub(height - 1);
         let needed = (row0 + k + live_len).saturating_sub(height);
         let extra = needed.saturating_sub(scrolled);
@@ -207,57 +145,47 @@ impl Screen {
                 frame.push_str("\r\n");
             }
         }
-        let origin = if self.anchored {
-            height.saturating_sub(live_len.max(1))
-        } else {
-            (row0 + k).min(height.saturating_sub(live_len.max(1)))
-        };
-        push_panel_rows(&mut frame, &live, origin);
+        push_panel_rows(&mut frame, &panel, origin);
         frame.push_str(esc::SYNC_END);
         self.terminal.write_all(frame.as_bytes())?;
         self.origin = origin;
-        self.panel = live;
+        self.panel = panel;
+        self.live = live;
+        self.docked = docked;
         Ok(())
     }
 
-    /// Adopt a new terminal size: keep the content-following flow origin
-    /// (clamped so the panel still fits) and fully redraw the live frame
-    /// there. The origin is never derived from the bottom edge — resize
-    /// must not reinstate a bottom-pinned layout.
+    /// Adopt a new terminal size: keep the content-following origin
+    /// (clamped so the live frame still fits), recompose the dock filler
+    /// for the new height and redraw the panel there.
     pub fn resize(&mut self, width: u16, height: u16) -> io::Result<()> {
         self.width = width;
         self.height = height.max(1);
         let max_rows = self.height as usize;
-        if self.panel.len() > max_rows {
-            let clipped = self.panel.split_off(self.panel.len() - max_rows);
-            self.panel = clipped;
+        if self.live.len() > max_rows {
+            self.live = self.live.split_off(self.live.len() - max_rows);
         }
-        let panel_len = self.panel.len() as u16;
-        let clamp = self.height.saturating_sub(panel_len.max(1));
-        // Anchored mode repins to the new bottom edge; flow mode keeps
-        // the content-following origin (clamped so the panel fits).
-        let clear_from = if self.anchored {
-            let target = clamp;
-            let clear_from = self.origin.min(target);
-            self.origin = target;
-            clear_from
-        } else {
-            self.origin = self.origin.min(clamp);
-            self.origin
-        };
+        self.docked = self.docked.min(self.live.len());
+        let live_len = self.live.len() as u16;
+        self.origin = self.origin.min(self.height.saturating_sub(live_len.max(1)));
+        self.panel = compose(
+            &self.live,
+            self.docked,
+            (self.height - self.origin) as usize,
+        );
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
-        frame.push_str(&esc::move_to(clear_from, 0));
+        frame.push_str(&esc::move_to(self.origin, 0));
         frame.push_str(esc::CLEAR_DOWN);
         push_panel_rows(&mut frame, &self.panel, self.origin);
         frame.push_str(esc::SYNC_END);
         self.terminal.write_all(frame.as_bytes())
     }
 
-    /// Adopt a new size after a width change and wipe the viewport.
-    /// Width changes make the terminal reflow its buffer, so every row
-    /// coordinate recorded before the resize — including the painted
-    /// panel's — is stale; erasing the whole viewport is the only
+    /// Adopt a new size and wipe the viewport. A width change makes the
+    /// terminal reflow its buffer, and a height change may scroll it, so
+    /// every row coordinate recorded before the resize — including the
+    /// painted panel's — is stale; erasing the whole viewport is the only
     /// cleanup that needs no coordinates. The painted panel is
     /// forgotten; follow up with [`Screen::repaint`] once the size
     /// settles. Native scrollback is never touched.
@@ -265,7 +193,7 @@ impl Screen {
         self.width = width;
         self.height = height.max(1);
         self.panel.clear();
-        self.origin = self.reset_origin();
+        self.origin = 0;
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -274,27 +202,27 @@ impl Screen {
         self.terminal.write_all(frame.as_bytes())
     }
 
-    /// Repaint the whole viewport from the model: the content tail sits
-    /// directly above the panel (anchored mode) or flows from the top
-    /// with the panel below it (flow mode). Absolute row writes only —
-    /// nothing scrolls, so nothing is duplicated into scrollback.
-    pub fn repaint(&mut self, content: &[Line], mut live: Vec<Line>) -> io::Result<()> {
+    /// Repaint the whole viewport from the model: the content tail flows
+    /// from the top, the live panel follows it, docked rows sit on the
+    /// bottom edge. Absolute row writes only — nothing scrolls, so
+    /// nothing is duplicated into scrollback.
+    pub fn repaint(
+        &mut self,
+        content: &[Line],
+        mut live: Vec<Line>,
+        docked: usize,
+    ) -> io::Result<()> {
         let height = self.height.max(1);
-        let max_rows = height as usize;
-        if live.len() > max_rows {
-            live = live.split_off(live.len() - max_rows);
+        if live.len() > height as usize {
+            live = live.split_off(live.len() - height as usize);
         }
+        let docked = docked.min(live.len());
         let live_len = live.len() as u16;
-        let origin = if self.anchored {
-            height.saturating_sub(live_len.max(1))
-        } else {
-            (content.len() as u16).min(height.saturating_sub(live_len.max(1)))
-        };
+        let origin = (content.len() as u16).min(height.saturating_sub(live_len.max(1)));
         // Content fills the rows above the panel, tail-clipped to fit.
-        let space = origin as usize;
-        let tail_start = content.len().saturating_sub(space);
-        let tail = &content[tail_start..];
+        let tail = &content[content.len().saturating_sub(origin as usize)..];
         let first_row = origin - tail.len() as u16;
+        let panel = compose(&live, docked, (height - origin) as usize);
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -302,10 +230,12 @@ impl Screen {
             frame.push_str(&esc::move_to(first_row + i as u16, 0));
             frame.push_str(&render_ansi(line));
         }
-        push_panel_rows(&mut frame, &live, origin);
+        push_panel_rows(&mut frame, &panel, origin);
         frame.push_str(esc::SYNC_END);
         self.origin = origin;
-        self.panel = live;
+        self.panel = panel;
+        self.live = live;
+        self.docked = docked;
         self.terminal.write_all(frame.as_bytes())
     }
 
@@ -315,8 +245,7 @@ impl Screen {
     /// TUI owns the window from row 0). The user's existing terminal
     /// scrollback is left untouched.
     pub fn clear_screen(&mut self) -> io::Result<()> {
-        self.panel.clear();
-        self.origin = self.reset_origin();
+        self.forget();
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -326,11 +255,10 @@ impl Screen {
     }
 
     /// Wipe the visible screen and the terminal's scrollback and forget
-    /// the painted panel — the `/new`-style full reset. The next
-    /// `render_panel`/`emit` starts from the top row.
+    /// the painted panel — the `/new`-style full reset. The next frame
+    /// starts from the top row.
     pub fn clear(&mut self) -> io::Result<()> {
-        self.panel.clear();
-        self.origin = self.reset_origin();
+        self.forget();
         let mut frame = String::new();
         frame.push_str(esc::SYNC_BEGIN);
         frame.push_str(esc::CLEAR_ALL);
@@ -348,19 +276,29 @@ impl Screen {
         frame.push_str(esc::CLEAR_DOWN);
         self.terminal.write_all(frame.as_bytes())
     }
+
+    fn forget(&mut self) {
+        self.panel.clear();
+        self.live.clear();
+        self.docked = 0;
+        self.origin = 0;
+    }
 }
 
-impl Screen {
-    /// Where a wiped screen starts painting: the top row in flow mode,
-    /// the last row in anchored mode (so the first frame lands at the
-    /// bottom instead of the top of the blank viewport).
-    fn reset_origin(&self) -> u16 {
-        if self.anchored {
-            self.height.saturating_sub(1)
-        } else {
-            0
-        }
+/// The painted panel for `rows` free rows below the origin: the live
+/// body, then blank filler, then the docked rows on the bottom edge.
+/// Without docked rows (or without spare room) the frame is the live
+/// rows as-is.
+fn compose(live: &[Line], docked: usize, rows: usize) -> Vec<Line> {
+    if docked == 0 || live.len() >= rows {
+        return live.to_vec();
     }
+    let split = live.len() - docked;
+    let mut panel = Vec::with_capacity(rows);
+    panel.extend_from_slice(&live[..split]);
+    panel.resize(rows - docked, Line::default());
+    panel.extend_from_slice(&live[split..]);
+    panel
 }
 
 fn push_panel_rows(frame: &mut String, panel: &[Line], origin: u16) {

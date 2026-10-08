@@ -2,6 +2,7 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use harness_tui::core::Screen;
+use harness_tui::headless::VtScreen;
 use harness_tui::terminal::{Terminal, esc};
 use harness_tui::text::Line;
 
@@ -159,6 +160,7 @@ fn present_commits_and_paints_live_in_one_synchronized_frame() {
         .present(
             &lines(&["> user message"]),
             lines(&["spinner", "editor", "status"]),
+            0,
         )
         .unwrap();
     let out = buf.contents()[before..].to_string();
@@ -191,7 +193,7 @@ fn present_reserves_rows_for_the_new_live_frame_not_the_old() {
     // Committing one row with a 1-row next frame must scroll by the NEW
     // frame's need only (codex finding: reserve came from the old panel).
     screen
-        .present(&lines(&["done"]), lines(&["editor"]))
+        .present(&lines(&["done"]), lines(&["editor"]), 0)
         .unwrap();
     let out = buf.contents()[before..].to_string();
     // Flow sat at row 2; the commit ends at row 3 and the 1-row live
@@ -266,87 +268,186 @@ fn clear_wipes_screen_and_scrollback_and_resets_origin() {
     assert!(repaint.contains("status"));
 }
 
-// --- bottom-anchored mode (opt-in, used by the chat TUI) ---
+// --- docked layout (chat TUI): content flows top-down, the editor and
+// status rows sit on the bottom edge, blank filler between them belongs
+// to the panel. Asserted end-to-end through the VT emulator: what the
+// user can scroll back to must never contain filler gaps or duplicates.
 
-#[test]
-fn bottom_anchor_pins_panel_to_the_bottom_from_startup() {
-    let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
-    screen.clear_screen().unwrap();
-    screen.render_panel(lines(&["input", "status"])).unwrap();
-    let out = buf.contents();
-    // Panel occupies the last two rows (8, 9 → escape rows 9, 10),
-    // not the top of the blank viewport.
-    assert!(
-        out.contains("\x1b[9;1H"),
-        "panel top not at bottom: {out:?}"
-    );
-    assert!(
-        out.contains("\x1b[10;1H"),
-        "panel bottom row missing: {out:?}"
-    );
+/// Screen + VT emulator pair of the same geometry.
+fn vt_screen(width: u16, height: u16) -> (Screen, SharedBuf, VtScreen) {
+    let (screen, buf) = screen(width, height, 0);
+    (screen, buf, VtScreen::new(width, height))
+}
+
+fn replay(vt: &mut VtScreen, buf: &SharedBuf, cursor: &mut usize) {
+    let bytes = buf.0.lock().unwrap().clone();
+    vt.feed(&bytes[*cursor..]);
+    *cursor = bytes.len();
+}
+
+/// History with trailing blank rows dropped.
+fn history(vt: &VtScreen) -> Vec<String> {
+    let mut rows = vt.history();
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    rows
 }
 
 #[test]
-fn bottom_anchor_commits_content_just_above_the_panel() {
-    let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
+fn docked_rows_sit_on_the_bottom_edge_below_top_flowing_content() {
+    let (mut screen, buf, mut vt) = vt_screen(40, 10);
     screen.clear_screen().unwrap();
-    let before = buf.contents().len();
     screen
-        .present(&lines(&["banner"]), lines(&["editor", "status"]))
+        .present(&lines(&["banner"]), lines(&["editor", "status"]), 2)
         .unwrap();
-    let out = buf.contents()[before..].to_string();
-    // The committed line prints at the bottom flow origin (row 9 →
-    // escape row 10) and the panel lands on the last two rows.
-    assert!(out.contains("\x1b[10;1H"), "commit not at bottom: {out:?}");
-    assert!(out.contains("banner"));
-    assert!(out.contains("\x1b[9;1H"), "panel not repinned: {out:?}");
-    assert!(out.contains("editor"));
-}
-
-#[test]
-fn bottom_anchor_resize_repins_to_the_bottom() {
-    let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
-    screen.clear_screen().unwrap();
-    screen.render_panel(lines(&["input", "status"])).unwrap();
-    let before = buf.contents().len();
-    screen.resize(40, 20).unwrap();
-    let out = buf.contents()[before..].to_string();
-    // Anchored mode is the opposite contract of the flow-mode resize
-    // test above: growing the window MUST teleport the panel down.
+    let mut cursor = 0;
+    replay(&mut vt, &buf, &mut cursor);
+    let rows = vt.viewport();
+    assert_eq!(rows[0], "banner");
+    assert!(rows[1..8].iter().all(String::is_empty), "filler: {rows:?}");
+    assert_eq!(rows[8], "editor");
+    assert_eq!(rows[9], "status");
     assert!(
-        out.contains("\x1b[19;1H"),
-        "panel must repin to the bottom: {out:?}"
+        vt.scrollback().is_empty(),
+        "startup scrolled: {:?}",
+        vt.scrollback()
     );
 }
 
 #[test]
-fn bottom_anchor_shrinking_panel_returns_to_the_bottom() {
-    let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
+fn closing_a_menu_leaves_no_gap_in_history() {
+    // The screenshot bug: an 8-row menu opened and closed under the
+    // editor, then the next turn committed — the old bottom-pinned
+    // layout left 8 blank rows between the answer and the next message.
+    let (mut screen, buf, mut vt) = vt_screen(40, 20);
     screen.clear_screen().unwrap();
-    screen.render_panel(lines(&["a", "b", "c", "d"])).unwrap();
-    let before = buf.contents().len();
-    screen.render_panel(lines(&["input", "status"])).unwrap();
-    let out = buf.contents()[before..].to_string();
-    // 4-row panel sat at rows 6..9; the 2-row panel must hug rows 8..9
-    // again instead of staying at row 6 with a gap below.
-    assert!(out.contains("\x1b[9;1H"), "panel not at bottom: {out:?}");
-    assert!(out.contains("input"));
+    let panel = |extra: usize| {
+        let mut rows = lines(&["editor-top", "editor", "editor-bottom", "status"]);
+        rows.extend((0..extra).map(|i| Line::raw(format!("menu-{i}"))));
+        rows
+    };
+    screen
+        .present(&lines(&["answer-0", "answer-1", "answer-2"]), panel(0), 4)
+        .unwrap();
+    screen.present(&[], panel(8), 12).unwrap();
+    screen.present(&[], panel(0), 4).unwrap();
+    screen
+        .present(&lines(&["user-0", "user-1"]), panel(0), 4)
+        .unwrap();
+    let mut cursor = 0;
+    replay(&mut vt, &buf, &mut cursor);
+    let rows = vt.viewport();
+    assert_eq!(
+        &rows[..5],
+        &["answer-0", "answer-1", "answer-2", "user-0", "user-1"],
+        "content must stay contiguous: {rows:?}"
+    );
+    assert_eq!(rows[19], "status");
+    assert!(vt.scrollback().is_empty(), "{:?}", vt.scrollback());
 }
 
-// --- width-change resize: erase + full repaint from the model ---
-// Windows Terminal reflows the buffer on width change, so absolute rows
-// recorded before the resize are meaningless afterwards. The chat loop
-// erases the viewport eagerly (resize_erase) and repaints everything it
-// owns from the model once the size settles (repaint).
+#[test]
+fn live_body_follows_content_and_commits_in_place() {
+    let (mut screen, buf, mut vt) = vt_screen(40, 10);
+    screen.clear_screen().unwrap();
+    screen
+        .present(&lines(&["banner"]), lines(&["editor", "status"]), 2)
+        .unwrap();
+    // A streaming block lives in the panel body, directly under content.
+    screen
+        .present(&[], lines(&["streaming", "editor", "status"]), 2)
+        .unwrap();
+    let mut cursor = 0;
+    replay(&mut vt, &buf, &mut cursor);
+    assert_eq!(vt.viewport()[1], "streaming");
+    // Committing it prints it on the very row it was shown — no jump.
+    screen
+        .present(&lines(&["streaming"]), lines(&["editor", "status"]), 2)
+        .unwrap();
+    replay(&mut vt, &buf, &mut cursor);
+    let rows = vt.viewport();
+    assert_eq!(&rows[..2], &["banner", "streaming"]);
+    assert!(rows[2..8].iter().all(String::is_empty), "{rows:?}");
+    assert_eq!(&rows[8..], &["editor", "status"]);
+}
+
+#[test]
+fn growing_panel_eats_filler_before_scrolling_content() {
+    let (mut screen, buf, mut vt) = vt_screen(40, 10);
+    screen.clear_screen().unwrap();
+    screen
+        .present(&lines(&["a", "b"]), lines(&["editor", "status"]), 2)
+        .unwrap();
+    // 6 body rows + 2 docked = 8 rows still fit under 2 content rows.
+    let mut live: Vec<Line> = (0..6).map(|i| Line::raw(format!("body-{i}"))).collect();
+    live.extend(lines(&["editor", "status"]));
+    screen.present(&[], live, 2).unwrap();
+    let mut cursor = 0;
+    replay(&mut vt, &buf, &mut cursor);
+    assert!(vt.scrollback().is_empty(), "{:?}", vt.scrollback());
+    let rows = vt.viewport();
+    assert_eq!(&rows[..3], &["a", "b", "body-0"]);
+    assert_eq!(rows[9], "status");
+}
+
+#[test]
+fn long_session_history_is_exactly_the_committed_rows_in_order() {
+    let (mut screen, buf, mut vt) = vt_screen(30, 8);
+    screen.clear_screen().unwrap();
+    let mut expected = Vec::new();
+    for turn in 0..12 {
+        // Alternate panel heights (spinner on/off, menu) between commits.
+        let mut live: Vec<Line> = (0..turn % 3)
+            .map(|i| Line::raw(format!("live-{i}")))
+            .collect();
+        live.extend(lines(&["editor", "status"]));
+        screen.present(&[], live, 2).unwrap();
+        let committed = vec![
+            Line::raw(format!("turn-{turn}-a")),
+            Line::raw(format!("turn-{turn}-b")),
+        ];
+        expected.extend(committed.iter().map(Line::text));
+        screen
+            .present(&committed, lines(&["editor", "status"]), 2)
+            .unwrap();
+    }
+    let mut cursor = 0;
+    replay(&mut vt, &buf, &mut cursor);
+    let mut rows = history(&vt);
+    assert_eq!(rows.pop().as_deref(), Some("status"));
+    assert_eq!(rows.pop().as_deref(), Some("editor"));
+    while rows.last().is_some_and(String::is_empty) {
+        rows.pop();
+    }
+    assert_eq!(rows, expected, "gaps or duplicates in history");
+}
+
+#[test]
+fn resize_extends_the_dock_filler_to_the_new_bottom() {
+    let (mut screen, buf) = screen(40, 10, 0);
+    screen.clear_screen().unwrap();
+    screen
+        .present(&lines(&["banner"]), lines(&["editor", "status"]), 2)
+        .unwrap();
+    screen.resize(40, 14).unwrap();
+    let mut vt = VtScreen::new(40, 14);
+    vt.feed(&buf.0.lock().unwrap());
+    let rows = vt.viewport();
+    assert_eq!(rows[0], "banner", "content untouched: {rows:?}");
+    assert_eq!(&rows[12..], &["editor", "status"]);
+}
+
+// --- resize: erase + full repaint from the model ---
+// Windows Terminal reflows the buffer on width change (and may scroll it
+// on height change), so absolute rows recorded before the resize are
+// meaningless afterwards. The chat loop erases the viewport eagerly
+// (resize_erase) and repaints everything it owns from the model once the
+// size settles (repaint).
 
 #[test]
 fn resize_erase_wipes_viewport_adopts_size_and_keeps_scrollback() {
     let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
     screen.clear_screen().unwrap();
     screen.render_panel(lines(&["input", "status"])).unwrap();
     let before = buf.contents().len();
@@ -362,9 +463,8 @@ fn resize_erase_wipes_viewport_adopts_size_and_keeps_scrollback() {
 }
 
 #[test]
-fn repaint_paints_content_tail_above_the_bottom_panel_in_one_frame() {
+fn repaint_flows_content_from_the_top_and_docks_the_panel() {
     let (mut screen, buf) = screen(40, 10, 0);
-    screen.set_bottom_anchor(true);
     screen.clear_screen().unwrap();
     screen
         .render_panel(lines(&["old input", "old status"]))
@@ -372,39 +472,34 @@ fn repaint_paints_content_tail_above_the_bottom_panel_in_one_frame() {
     screen.resize_erase(60, 12).unwrap();
     let before = buf.contents().len();
     screen
-        .repaint(&lines(&["one", "two"]), lines(&["input", "status"]))
+        .repaint(&lines(&["one", "two"]), lines(&["input", "status"]), 2)
         .unwrap();
     let out = buf.contents()[before..].to_string();
-    // One synchronized frame.
+    // One synchronized frame, absolute writes only — repaint must never
+    // scroll content into scrollback (that would duplicate history).
     assert_eq!(out.matches("\x1b[?2026h").count(), 1, "{out:?}");
     assert_eq!(out.matches("\x1b[?2026l").count(), 1);
-    // Panel pinned to the new bottom: rows 10, 11 → escapes 11, 12.
-    assert!(out.contains("\x1b[11;1H"), "panel top: {out:?}");
-    assert!(out.contains("\x1b[12;1H"), "panel bottom: {out:?}");
-    assert!(out.contains("input"));
-    // Content sits directly above the panel: rows 8, 9 → escapes 9, 10.
-    assert!(out.contains("\x1b[9;1H"), "content top: {out:?}");
-    assert!(out.contains("\x1b[10;1H"), "content bottom: {out:?}");
-    assert!(out.contains("one"));
-    assert!(out.contains("two"));
-    // Absolute row writes only — repaint must never scroll content into
-    // scrollback (that would duplicate history).
     assert!(
         !out.contains("\r\n"),
         "repaint must not print flow newlines: {out:?}"
     );
+    let mut vt = VtScreen::new(60, 12);
+    vt.feed(&buf.0.lock().unwrap());
+    let rows = vt.viewport();
+    assert_eq!(&rows[..2], &["one", "two"]);
+    assert!(rows[2..10].iter().all(String::is_empty), "{rows:?}");
+    assert_eq!(&rows[10..], &["input", "status"]);
 }
 
 #[test]
 fn repaint_clips_oversized_content_and_restores_the_diff_origin() {
     let (mut screen, buf) = screen(40, 6, 0);
-    screen.set_bottom_anchor(true);
     screen.clear_screen().unwrap();
     // 8 content lines into 4 free rows (height 6 - panel 2): tail only.
     let texts: Vec<String> = (0..8).map(|i| format!("line{i}")).collect();
     let content: Vec<Line> = texts.iter().map(Line::raw).collect();
     screen
-        .repaint(&content, lines(&["input", "status"]))
+        .repaint(&content, lines(&["input", "status"]), 2)
         .unwrap();
     let out = buf.contents();
     assert!(out.contains("line7"), "tail kept: {out:?}");
@@ -413,7 +508,7 @@ fn repaint_clips_oversized_content_and_restores_the_diff_origin() {
     // panel at the restored origin (row 4 → escape 5).
     let before = buf.contents().len();
     screen
-        .render_panel(lines(&["input", "new status"]))
+        .present(&[], lines(&["input", "new status"]), 2)
         .unwrap();
     let update = buf.contents()[before..].to_string();
     assert!(update.contains("\x1b[6;1H"), "diff at origin: {update:?}");

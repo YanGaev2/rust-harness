@@ -1083,13 +1083,32 @@ impl ChatApp {
     /// transcript tail, the busy spinner, the command palette, the editor,
     /// the completion menu, and the status row.
     pub fn panel_lines(&self, width: usize, max_live_rows: usize) -> Vec<Line> {
-        self.panel_lines_after(width, max_live_rows, self.emitted)
+        self.panel_frame(width, max_live_rows).0
     }
 
     /// `panel_lines` with an explicit commit boundary — the draw loop
     /// passes the boundary from `peek_scrollback` so the rows being
     /// committed in the same frame are not also rendered as live.
     pub fn panel_lines_after(&self, width: usize, max_live_rows: usize, from: usize) -> Vec<Line> {
+        self.panel_frame_after(width, max_live_rows, from).0
+    }
+
+    /// The panel plus how many of its trailing rows are docked to the
+    /// bottom edge of the terminal: everything from the spinner down
+    /// (spinner, palette, editor, menus, status). The live transcript
+    /// tail above them follows the content instead.
+    pub fn panel_frame(&self, width: usize, max_live_rows: usize) -> (Vec<Line>, usize) {
+        self.panel_frame_after(width, max_live_rows, self.emitted)
+    }
+
+    /// `panel_frame` with an explicit commit boundary (see
+    /// `panel_lines_after`).
+    pub fn panel_frame_after(
+        &self,
+        width: usize,
+        max_live_rows: usize,
+        from: usize,
+    ) -> (Vec<Line>, usize) {
         let mut lines = Vec::new();
 
         let mut live: Vec<Line> = Vec::new();
@@ -1105,6 +1124,10 @@ impl ChatApp {
         }
         let has_live = !live.is_empty();
         lines.extend(live);
+        if has_live && !self.busy {
+            lines.push(Line::default());
+        }
+        let body_rows = lines.len();
 
         if self.busy {
             // Two rows: a blank spacer, then ` ⠋ Working… (5s)`.
@@ -1112,8 +1135,6 @@ impl ChatApp {
             if let Some(note) = stream_idle_note(self.stream_idle_secs()) {
                 lines.push(Line::styled(format!("   {note}"), Style::default().dim()));
             }
-        } else if has_live {
-            lines.push(Line::default());
         }
 
         if self.help_visible {
@@ -1145,7 +1166,8 @@ impl ChatApp {
         }
 
         lines.push(self.status_row(width));
-        lines
+        let docked = lines.len() - body_rows;
+        (lines, docked)
     }
 
     /// Flush finalized transcript entries to native scrollback: returns their

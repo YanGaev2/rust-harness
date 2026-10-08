@@ -448,10 +448,8 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
 
     tui_terminal::install_panic_restore();
     let mut screen = Screen::stdout().map_err(|err| ReplError::Io(err.into()))?;
-    // Start from a clean viewport with the panel pinned to the bottom
-    // edge (the reference-tool chat layout): committed content
-    // accumulates just above the editor instead of hanging at the top.
-    screen.set_bottom_anchor(true);
+    // Start from a clean viewport: content flows from the top, the editor
+    // and status rows are docked to the bottom edge (see `draw_chat`).
     screen.clear_screen().map_err(ReplError::Io)?;
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
@@ -643,8 +641,10 @@ fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
     // head-clipping it out of view.
     app.freeze_streaming_overflow(width, max_live_rows);
     let (scrollback, commit_through) = app.peek_scrollback(width);
-    let live = app.panel_lines_after(width, max_live_rows, commit_through);
-    screen.present(&scrollback, live).map_err(ReplError::Io)?;
+    let (live, docked) = app.panel_frame_after(width, max_live_rows, commit_through);
+    screen
+        .present(&scrollback, live, docked)
+        .map_err(ReplError::Io)?;
     app.acknowledge_emitted(commit_through);
     Ok(())
 }
@@ -659,21 +659,20 @@ const RESIZE_SETTLE: Duration = Duration::from_millis(150);
 pub enum ResizeAction {
     /// Size unchanged and nothing pending.
     None,
-    /// Height-only change: repin the panel immediately (`Screen::resize`).
-    /// Height changes do not reflow the buffer, so the cheap path is safe.
-    Resize,
-    /// Width changed: erase the viewport now (`Screen::resize_erase`).
-    /// The reflowed old panel must not survive to the next reflow.
+    /// Size changed: erase the viewport now (`Screen::resize_erase`).
+    /// A width change reflows the buffer; a height change may scroll it
+    /// (the docked status row keeps the cursor on the last row), so no
+    /// painted row coordinate survives either.
     Erase,
     /// The size has been stable for the settle window: repaint the whole
     /// frame from the model (`Screen::repaint`).
     Repaint,
 }
 
-/// Debounced resize policy: erase eagerly on every width change (a panel
+/// Debounced resize policy: erase eagerly on every size change (a panel
 /// painted mid-drag is reflowed into ghost fragments by the very next
-/// width step), repaint lazily once the size settles. Pure state machine
-/// with injected clocks so tests need no terminal.
+/// step), repaint lazily once the size settles. Pure state machine with
+/// injected clocks so tests need no terminal.
 #[derive(Debug)]
 pub struct ResizeDebouncer {
     width: u16,
@@ -693,18 +692,12 @@ impl ResizeDebouncer {
     }
 
     pub fn observe(&mut self, width: u16, height: u16, now: Instant) -> ResizeAction {
-        let width_changed = width != self.width;
-        let height_changed = height != self.height;
-        self.width = width;
-        self.height = height;
-        // A height change during an active drag is part of the same
-        // gesture — keep erasing and restart the settle window.
-        if width_changed || (height_changed && self.pending.is_some()) {
+        if width != self.width || height != self.height {
+            self.width = width;
+            self.height = height;
+            // Every step of a drag restarts the settle window.
             self.pending = Some(now);
             return ResizeAction::Erase;
-        }
-        if height_changed {
-            return ResizeAction::Resize;
         }
         match self.pending {
             Some(since) if now.duration_since(since) >= self.settle => {
@@ -722,8 +715,8 @@ impl ResizeDebouncer {
 
 /// The terminal delivers no resize signal we listen for — the loops poll
 /// the size once per tick and feed it through the debouncer: eager erase
-/// on width changes, cheap repin on height-only changes, one full
-/// repaint from the model once the size settles.
+/// on every change, one full repaint from the model once the size
+/// settles.
 fn handle_resize(
     screen: &mut Screen,
     app: &ChatApp,
@@ -734,7 +727,6 @@ fn handle_resize(
     };
     match resize.observe(width, height, Instant::now()) {
         ResizeAction::None => {}
-        ResizeAction::Resize => screen.resize(width, height).map_err(ReplError::Io)?,
         ResizeAction::Erase => screen.resize_erase(width, height).map_err(ReplError::Io)?,
         ResizeAction::Repaint => {
             // Mirror draw_chat's layout budget, then fill every row the
@@ -742,10 +734,10 @@ fn handle_resize(
             let width = screen.width() as usize;
             let height = screen.height() as usize;
             let max_live_rows = height.saturating_sub(14).max(3);
-            let live = app.panel_lines(width, max_live_rows);
+            let (live, docked) = app.panel_frame(width, max_live_rows);
             let content_rows = height.saturating_sub(live.len());
             let tail = app.viewport_tail(width, content_rows);
-            screen.repaint(&tail, live).map_err(ReplError::Io)?;
+            screen.repaint(&tail, live, docked).map_err(ReplError::Io)?;
         }
     }
     Ok(())

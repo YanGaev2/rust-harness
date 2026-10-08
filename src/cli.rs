@@ -105,6 +105,7 @@ where
             proxy_show(rest, output)
         }
         [command, rest @ ..] if command == "diagnostics" => diagnostics_command(rest, output),
+        [command, rest @ ..] if command == "terminal-setup" => terminal_setup(rest, output),
         [command, rest @ ..] if command == "repl" => repl(rest, output),
         [] => default_launch(&command_name, false, input, output),
         _ => Err(CliError::Usage(help(&command_name))),
@@ -769,6 +770,46 @@ fn proxy_command_args(
         }
     }
     Ok((value, config.unwrap_or_else(default_config_path)))
+}
+
+/// Install (or `--remove`) the Windows Terminal "Harness" profile fragment.
+fn terminal_setup<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
+    let remove = match args {
+        [] => false,
+        [flag] if flag == "--remove" => true,
+        _ => {
+            return Err(CliError::Usage(
+                "usage: harness terminal-setup [--remove]".to_string(),
+            ));
+        }
+    };
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else {
+        writeln!(
+            output,
+            "terminal-setup configures Windows Terminal; LOCALAPPDATA is not set on this system"
+        )?;
+        return Ok(());
+    };
+    if remove {
+        if crate::terminal_setup::remove(&local_app_data)? {
+            writeln!(output, "removed the Windows Terminal profile \"Harness\"")?;
+        } else {
+            writeln!(output, "no Harness profile is installed")?;
+        }
+        return Ok(());
+    }
+    let path = crate::terminal_setup::install(&local_app_data)?;
+    writeln!(
+        output,
+        "installed the Windows Terminal profile \"Harness\": {}",
+        path.display()
+    )?;
+    writeln!(
+        output,
+        "open a new tab with it (the ˅ menu next to +): PowerShell with Cascadia Mono, line height 1.2, real bold, Harness color schemes"
+    )?;
+    writeln!(output, "undo with: harness terminal-setup --remove")?;
+    Ok(())
 }
 
 fn diagnostics_command<W: Write>(args: &[String], output: &mut W) -> Result<(), CliError> {
@@ -1601,6 +1642,7 @@ fn help(command_name: &str) -> String {
             "  {command_name} repl --config PATH --workspace PATH --provider NAME --model MODEL [--timeout-ms N] [--max-rounds N] [--max-tool-concurrency N] [--tool-timeout-ms N]"
         ),
         format!("  {command_name} diagnostics [--binary PATH] [--max-binary-bytes N] [--max-rss-bytes N]"),
+        format!("  {command_name} terminal-setup [--remove]"),
         format!("  {command_name} clipboard paste --workspace PATH"),
         format!("  {command_name} tool call --workspace PATH TOOL_NAME JSON_ARGS"),
         format!(

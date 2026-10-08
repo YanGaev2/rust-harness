@@ -17,5 +17,6 @@ pub mod repl;
 pub mod request;
 pub mod runtime;
 pub mod session;
+pub mod terminal_setup;
 pub mod tools;
 pub mod tui;

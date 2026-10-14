@@ -1,8 +1,8 @@
 # harness-cli
 
-> **1007 tool calls across 5 model families. 0 failed. 0 repairs needed.**
+> **1199 tool calls across 6 models. 0 failed. 0 repairs needed.**
 
-A **4 MB** Rust agent harness (Windows + Linux) that speaks your model's
+A **5 MB** Rust agent harness (Windows + Linux) that speaks your model's
 native tool dialect: tool names, argument shapes, and schemas are
 **measured from each model's training priors** — not guessed, not imposed.
 
@@ -10,7 +10,7 @@ native tool dialect: tool names, argument shapes, and schemas are
 
 ## Why
 
-- ⚡ **Invisible footprint** — 4.2 MB static binary, **5.6 MB RAM**, ~34 ms
+- ⚡ **Invisible footprint** — 4.8 MB static binary, **5.6 MB RAM**, ~34 ms
   cold start. No tokio, no Node, no Electron: blocking I/O, `std::thread`,
   and an in-repo terminal UI library.
 - 🎯 **Tools fitted to the model, not the other way around** — before a
@@ -144,6 +144,17 @@ Messages API. When the request fails, Enter goes back to the URL and Tab lets yo
 type the model id. After the save, the same launch starts the REPL with that provider; later
 `harness` opens the REPL directly. Non-interactive runs fall back to the
 line-mode setup screen so tests and pipes do not enter raw mode.
+
+The wizard saves providers to the default config file:
+
+| Platform | Default config file |
+|---|---|
+| Windows | `%APPDATA%\harness-cli\providers.json` |
+| Linux | `$XDG_CONFIG_HOME/harness-cli/providers.json`, else `~/.config/harness-cli/providers.json` |
+
+Set `HARNESS_CONFIG` to use a different file. Every command also accepts
+`--config PATH`. The examples below use `--config .harness/providers.json`, a
+config file inside the workspace. Omit the flag to use the default file.
 
 ## Current commands
 
@@ -517,9 +528,9 @@ Done (each item is verified by tests and/or the agent benchmark):
 - ✅ Four chat API formats (OpenAI-compatible, OpenAI Responses, Codex Responses, Anthropic Messages) + SSE streaming
 - ✅ Provider onboarding — presets, `/models` discovery, Bearer/header/env auth, per-provider proxy, cache metadata
 - ✅ Agent loop with forgiving tool runtime — name aliases, argument coercion, repair memos, loop guardrails
-- ✅ Model-fitted tools — probe suite + 26-task benchmark across 6 model families (1199 tool calls, 0 failures)
+- ✅ Model-fitted tools — probe suite + 26-task benchmark across 6 models (1199 tool calls, 0 failures)
 - ✅ Fallback chains with error classification (switch on 5xx/429/quota, never on auth/context/policy)
-- ✅ Own TUI library (`harness-tui`) — no ratatui/crossterm, native-scrollback screen, own input parser
+- ✅ Own TUI library (`harness-tui`) — no ratatui/crossterm, inline and full-screen screens, own input parser
 - ✅ Chat TUI — markdown rendering, slash-command autocomplete, interactive model picker, streaming tool cards
 - ✅ Session & trace persistence under `~/.harness` with resume on launch
 - ✅ Clipboard & attachments — Ctrl+V / `/paste`, PNG capture into `.harness/attachments`
@@ -542,7 +553,7 @@ Planned:
 - OpenAI-compatible streaming chat adapter for data-only SSE text deltas.
 - OpenAI-compatible tool argument parsing repairs common malformed JSON and preserves
   unrepaired raw arguments as `_raw_arguments` instead of failing the whole response.
-- Built-in provider family slots for `codex`, `xiaomi`, `glm`, `kimi`, and `claude`.
+- Built-in provider family slots for `codex`, `xiaomi`, `glm`, `kimi`, `claude`, and `deepseek`.
 - Built-in subscription metadata for `codex`, `xiaomi`, `glm`, `kimi`, `claude`, and `deepseek`.
 - Provider auth policy supports Bearer, custom header, env-backed subscription
   keys, and explicit API-key override.
@@ -576,6 +587,8 @@ Planned:
 - Provider onboarding accepts cache metadata flags such as `--cache automatic`,
   `--cache-hit-field`, `--cache-miss-field`, `--cache header`,
   `--cache body-cache-control`, and `--cache anthropic-automatic`.
+  `--cache-ttl VALUE` (for example `1h`) adds a `ttl` to the `cache_control`
+  marker of the last two policies.
 - JSON config store for custom providers, URLs, keys, and selected models.
 - Native shell profile selection for Windows and Linux.
 - Diagnostics command reports current process RSS, binary size, and optional limit checks.
@@ -687,28 +700,29 @@ Planned:
 - Clipboard capture backend for text and PNG image attachments with prompt fragments.
 - Native system clipboard reader for Windows and Linux command-line environments.
 - Interactive terminal REPL with Ctrl+V text/image paste handling, Enter submit,
-  Ctrl+C exit, in-session history search, model switching, and streaming agent
+  Esc/Ctrl+C interrupt, in-session history search, model switching, and streaming agent
   progress/output events.
 - Bracketed paste support in the REPL and setup TUI so multi-line text and
   clipboard pastes arrive as one atomic event instead of submitting on the first
   newline; pastes inside the provider wizard route into the active field (e.g. an
   API key) with trailing clipboard newlines stripped.
-- Ratatui chat TUI for the live session on a real terminal: a scrolling
-  transcript that folds in streamed tool rounds, tool results, and assistant
-  output, plus a prompt editor and bracketed paste. Non-TTY runs (pipes, tests)
-  keep the line-mode REPL.
+- Full-screen chat TUI on `harness-tui` for the live session on a real
+  terminal: a scrolling transcript that folds in streamed tool rounds, tool
+  results, and assistant output, plus a prompt editor and bracketed paste.
+  Non-TTY runs (pipes, tests) keep the line-mode REPL.
 - Chat TUI in-session commands and navigation: `/model PROVIDER MODEL` (live
   provider/model switch), `/history QUERY`, `/clear`, `/help` (command palette
-  overlay), `/exit`; Up/Down recall previous prompts and PageUp/PageDown scroll
-  the transcript (new output snaps back to the bottom).
+  overlay), `/exit`; Up/Down recall previous prompts, PageUp/PageDown and the
+  mouse wheel scroll the transcript (a scrolled view stays put; sending a
+  message jumps back to the newest rows).
 - No-provider setup TUI (on `harness-tui`) for the real `harness` terminal
   launch path, with line-mode fallback for non-TTY output.
 
 ## Workspace
 
 The repo is a cargo workspace. `crates/harness-tui/` is our own terminal UI
-library (line-based rendering, native-scrollback screen model) powering all
-interactive front ends — the previous third-party TUI stack is fully removed.
+library (line-based rendering, an inline screen for the setup TUI and a
+full-screen screen for the chat) powering all interactive front ends — the previous third-party TUI stack is fully removed.
 Run its tests with `cargo test -p harness-tui`; run everything with
 `cargo test --workspace`.
 

@@ -6,6 +6,8 @@ A **4 MB** Rust agent harness (Windows + Linux) that speaks your model's
 native tool dialect: tool names, argument shapes, and schemas are
 **measured from each model's training priors** — not guessed, not imposed.
 
+![harness chat in Windows Terminal](assets/screenshot.png)
+
 ## Why
 
 - ⚡ **Invisible footprint** — 4.2 MB static binary, **5.6 MB RAM**, ~34 ms

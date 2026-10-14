@@ -134,6 +134,19 @@ fn stat_path_reports_file_and_directory_metadata_without_reading_content() {
 }
 
 #[test]
+fn stat_path_dot_means_the_workspace_root() {
+    // Models stat "." like `ls .` (Kimi K3, seen live): it is the root,
+    // the same as file.list accepts, not an empty path.
+    let root = tempfile::tempdir().unwrap();
+    let tool = FileTool::new(root.path());
+    for requested in [".", "./", ""] {
+        let stat = tool.stat_path(requested).unwrap();
+        assert!(stat.is_dir, "{requested:?}");
+        assert_eq!(stat.path, ".", "{requested:?}");
+    }
+}
+
+#[test]
 fn replace_text_updates_first_literal_match_and_reports_lengths() {
     let root = tempfile::tempdir().unwrap();
     let tool = FileTool::new(root.path());
@@ -311,4 +324,114 @@ fn move_path_renames_workspace_file_without_overwriting_by_default() {
         .move_path("src/draft.txt", "notes/final.txt", false)
         .unwrap_err();
     assert!(err.to_string().contains("destination already exists"));
+}
+
+/// A workspace with a root `.gitignore` and needles in ignored, hidden
+/// and normal places.
+fn ignored_workspace() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    let write = |path: &str, text: &str| {
+        let path = root.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    };
+    write(".gitignore", "# build output\n/target\nexternal/\n*.log\n");
+    write("src/main.rs", "fn main() { needle(); }\n");
+    write("target/debug/out.rs", "needle\n");
+    write("external/lib/x.rs", "needle\n");
+    write("notes.log", "needle\n");
+    write(".hidden/secret.rs", "needle\n");
+    // `/target` is anchored to the root: a nested target stays searchable.
+    write("docs/target/keep.rs", "needle\n");
+    root
+}
+
+#[test]
+fn search_skips_gitignored_and_hidden_paths_but_searches_them_on_request() {
+    let root = ignored_workspace();
+    let tool = FileTool::new(root.path());
+
+    let result = tool
+        .search_text_with_context(".", "needle", 50, 1 << 20, 0)
+        .unwrap();
+    let paths: Vec<&str> = result.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, vec!["docs/target/keep.rs", "src/main.rs"]);
+    assert_eq!(
+        result.skipped,
+        vec![".hidden", "external", "notes.log", "target"]
+    );
+
+    // An explicit path wins over the ignore rules.
+    let inside = tool
+        .search_text_with_context("target", "needle", 50, 1 << 20, 0)
+        .unwrap();
+    let paths: Vec<&str> = inside.matches.iter().map(|m| m.path.as_str()).collect();
+    assert_eq!(paths, vec!["target/debug/out.rs"]);
+}
+
+#[test]
+fn list_shows_ignored_directories_without_descending_into_them() {
+    let root = ignored_workspace();
+    let tool = FileTool::new(root.path());
+    let result = tool.list_files(".", 100, None, false).unwrap();
+    let paths: Vec<&str> = result.entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(
+        paths.contains(&"target") && paths.contains(&"external"),
+        "{paths:?}"
+    );
+    assert!(
+        paths.contains(&"src/main.rs") && paths.contains(&"notes.log"),
+        "{paths:?}"
+    );
+    assert!(
+        !paths
+            .iter()
+            .any(|p| p.starts_with("target/") || p.starts_with("external/")),
+        "{paths:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn search_passes_over_a_directory_it_cannot_read() {
+    // A subdirectory that cannot be read used to fail the whole search —
+    // the same path as a directory that vanishes mid-walk while a build
+    // runs next to the search (seen live: `cargo build` and `file.search`
+    // in one batch ended in `os error 2`).
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join("a.txt"),
+        "needle
+",
+    )
+    .unwrap();
+    let locked = root.path().join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(
+        locked.join("b.txt"),
+        "needle
+",
+    )
+    .unwrap();
+    let user = std::env::var("USERNAME").unwrap();
+    let icacls = |args: &[&str]| {
+        std::process::Command::new("icacls")
+            .arg(&locked)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    assert!(icacls(&["/deny", &format!("{user}:(RD)")]).status.success());
+    let tool = FileTool::new(root.path());
+
+    let result = tool.search_text_with_context(".", "needle", 50, 1 << 20, 0);
+    icacls(&["/remove:d", &user]);
+
+    let paths: Vec<String> = result
+        .unwrap()
+        .matches
+        .into_iter()
+        .map(|m| m.path)
+        .collect();
+    assert_eq!(paths, vec!["a.txt".to_string()]);
 }

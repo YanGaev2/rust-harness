@@ -97,6 +97,8 @@ pub struct FileSearchMatch {
     pub path: String,
     pub line_number: usize,
     pub line: String,
+    /// `line` is a cut of a longer line (see [`SEARCH_LINE_MAX_BYTES`]).
+    pub clipped: bool,
     /// Neighbouring lines (1-based number, text) when the caller asked for
     /// grep `-C` style context; empty otherwise.
     pub before: Vec<(usize, String)>,
@@ -109,6 +111,9 @@ pub struct FileSearchResult {
     pub scanned_files: usize,
     pub skipped_large_files: usize,
     pub truncated: bool,
+    /// Workspace-relative paths the walk left out: hidden entries and
+    /// entries the root `.gitignore` covers. Sorted.
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,7 +276,13 @@ impl FileTool {
     }
 
     pub fn stat_path(&self, requested_path: &str) -> Result<StatResult, ToolError> {
-        let (target, path) = self.resolve(requested_path)?;
+        // "." is the workspace root here, as in file.list.
+        let root = self.root.canonicalize().map_err(ToolError::Io)?;
+        let target = resolve_existing_workspace_path_or_root(&root, requested_path)?;
+        let path = match workspace_relative_display(&root, &target)? {
+            path if path.is_empty() => ".".to_string(),
+            path => path,
+        };
         let metadata = fs::metadata(&target).map_err(ToolError::Io)?;
         let modified_unix_seconds = metadata
             .modified()
@@ -401,14 +412,12 @@ impl FileTool {
         let limit = max_results.max(1);
         let scan_limit = limit.saturating_add(1);
         let mut entries = Vec::new();
-        collect_files_bounded(
-            &root,
-            &target,
-            &mut entries,
-            scan_limit,
-            max_depth,
+        let walk = Walk {
+            root: &root,
+            rules: IgnoreRules::for_target(&root, &target),
             show_hidden,
-        )?;
+        };
+        collect_files_bounded(&walk, &target, &mut entries, scan_limit, max_depth, true)?;
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         let scanned = entries.len();
@@ -435,9 +444,16 @@ impl FileTool {
     ) -> Result<FileSearchResult, ToolError> {
         let root = self.root.canonicalize().map_err(ToolError::Io)?;
         let target = resolve_existing_workspace_path_or_root(&root, requested_path)?;
+        let walk = Walk {
+            root: &root,
+            rules: IgnoreRules::for_target(&root, &target),
+            show_hidden: false,
+        };
         let mut files = Vec::new();
-        collect_file_paths(&target, &mut files)?;
+        let mut skipped = Vec::new();
+        collect_file_paths(&walk, &target, &mut files, &mut skipped, true)?;
         files.sort();
+        skipped.sort();
 
         let limit = max_results.max(1);
         let mut matches = Vec::new();
@@ -451,7 +467,11 @@ impl FileTool {
                 break;
             }
 
-            let metadata = fs::metadata(&file).map_err(ToolError::Io)?;
+            // A file can vanish between the walk and the read (a build
+            // deleting its temp files): pass it over.
+            let Ok(metadata) = fs::metadata(&file) else {
+                continue;
+            };
             if metadata.len() > max_file_bytes {
                 skipped_large_files += 1;
                 continue;
@@ -462,18 +482,22 @@ impl FileTool {
             };
             scanned_files += 1;
             let relative = workspace_relative_display(&root, &file)?;
+            if !content.contains(query) {
+                continue;
+            }
             let lines: Vec<&str> = content.lines().collect();
             for (index, line) in lines.iter().enumerate() {
-                if line.contains(query) {
+                if let Some(at) = line.find(query) {
                     let window = |range: std::ops::Range<usize>| {
                         range
-                            .filter_map(|i| lines.get(i).map(|text| (i + 1, text.to_string())))
+                            .filter_map(|i| lines.get(i).map(|text| (i + 1, clip_line(text, 0))))
                             .collect::<Vec<_>>()
                     };
                     matches.push(FileSearchMatch {
                         path: relative.clone(),
                         line_number: index + 1,
-                        line: line.to_string(),
+                        line: clip_line(line, at),
+                        clipped: line.len() > SEARCH_LINE_MAX_BYTES,
                         before: window(index.saturating_sub(context_lines)..index),
                         after: window(index + 1..index + 1 + context_lines),
                     });
@@ -490,8 +514,35 @@ impl FileTool {
             scanned_files,
             skipped_large_files,
             truncated,
+            skipped,
         })
     }
+}
+
+/// Longest line `search_text_with_context` returns. Minified bundles and
+/// JSONL logs carry lines of 100+ KB; whole, 200 of them filled a prompt
+/// with 1.6 MB of tool output in a real session (2026-10-09).
+pub const SEARCH_LINE_MAX_BYTES: usize = 500;
+
+/// `line` cut to about [`SEARCH_LINE_MAX_BYTES`] around byte `at`: a third
+/// of the budget before it, the rest after. `…` marks each cut.
+fn clip_line(line: &str, at: usize) -> String {
+    if line.len() <= SEARCH_LINE_MAX_BYTES {
+        return line.to_string();
+    }
+    let mut start = at
+        .saturating_sub(SEARCH_LINE_MAX_BYTES / 3)
+        .min(line.len() - SEARCH_LINE_MAX_BYTES);
+    while !line.is_char_boundary(start) {
+        start -= 1;
+    }
+    let mut end = start + SEARCH_LINE_MAX_BYTES;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    let head = if start > 0 { "…" } else { "" };
+    let tail = if end < line.len() { "…" } else { "" };
+    format!("{head}{}{tail}", &line[start..end])
 }
 
 #[derive(Debug)]
@@ -656,15 +707,12 @@ fn resolve_existing_workspace_path_or_root(
     root: &Path,
     requested_path: &str,
 ) -> Result<PathBuf, ToolError> {
-    let trimmed = requested_path.trim();
-    if trimmed.is_empty()
-        || trimmed == "."
-        || strip_workspace_root(root, trimmed).as_deref() == Some(".")
-    {
-        return Ok(root.to_path_buf());
+    // "", ".", "./" and the workspace's own absolute path all normalize
+    // to an empty relative path: that is the root.
+    match resolve_existing_workspace_path(root, requested_path.trim()) {
+        Err(ToolError::EmptyPath) => Ok(root.to_path_buf()),
+        other => other,
     }
-
-    resolve_existing_workspace_path(root, requested_path)
 }
 
 fn resolve_new_workspace_path(root: &Path, requested_path: &str) -> Result<PathBuf, ToolError> {
@@ -681,13 +729,53 @@ fn resolve_new_workspace_path(root: &Path, requested_path: &str) -> Result<PathB
     Ok(target)
 }
 
+/// What a directory walk needs besides the directory: the root for
+/// relative paths, the ignore rules, and whether dot entries count.
+struct Walk<'a> {
+    root: &'a Path,
+    rules: IgnoreRules,
+    show_hidden: bool,
+}
+
+impl Walk<'_> {
+    /// Path segments of `path` below the workspace root.
+    fn segments(&self, path: &Path) -> Vec<String> {
+        path.strip_prefix(self.root)
+            .map(|relative| {
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Dot entries (.git, .claude, …) are noise for the model unless it
+    /// asks for them explicitly.
+    fn is_hidden(&self, entry: &fs::DirEntry) -> bool {
+        !self.show_hidden && entry.file_name().to_string_lossy().starts_with('.')
+    }
+}
+
+/// The entries of `dir`. Only the walk's starting directory reports an
+/// error; a subdirectory that vanished or cannot be read is passed over.
+fn read_dir_entries(dir: &Path, top: bool) -> Result<Vec<fs::DirEntry>, ToolError> {
+    match fs::read_dir(dir) {
+        Ok(entries) => Ok(entries.flatten().collect()),
+        Err(error) if top => Err(ToolError::Io(error)),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Bounded listing. Ignored directories are listed but never entered:
+/// the model sees that `target/` exists without paying for its contents.
 fn collect_files_bounded(
-    root: &Path,
+    walk: &Walk<'_>,
     target: &Path,
     entries: &mut Vec<FileListEntry>,
     scan_limit: usize,
     max_depth: Option<usize>,
-    show_hidden: bool,
+    top: bool,
 ) -> Result<(), ToolError> {
     if entries.len() >= scan_limit {
         return Ok(());
@@ -696,7 +784,7 @@ fn collect_files_bounded(
     if target.is_file() {
         let metadata = fs::metadata(target).map_err(ToolError::Io)?;
         entries.push(FileListEntry {
-            path: workspace_relative_display(root, target)?,
+            path: workspace_relative_display(walk.root, target)?,
             is_dir: false,
             len: Some(metadata.len()),
         });
@@ -707,31 +795,31 @@ fn collect_files_bounded(
         return Ok(());
     }
 
-    for entry in fs::read_dir(target).map_err(ToolError::Io)? {
+    for entry in read_dir_entries(target, top)? {
         if entries.len() >= scan_limit {
             break;
         }
-        let entry = entry.map_err(ToolError::Io)?;
-        let path = entry.path();
-        // Dot entries (.git, .claude, …) are noise for the model unless it
-        // asks for them explicitly.
-        if !show_hidden && entry.file_name().to_string_lossy().starts_with('.') {
+        if walk.is_hidden(&entry) {
             continue;
         }
-        let metadata = entry.metadata().map_err(ToolError::Io)?;
+        // An entry that vanished mid-walk is simply not listed.
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let path = entry.path();
         entries.push(FileListEntry {
-            path: workspace_relative_display(root, &path)?,
+            path: workspace_relative_display(walk.root, &path)?,
             is_dir: metadata.is_dir(),
             len: metadata.is_file().then_some(metadata.len()),
         });
-        if metadata.is_dir() {
+        if metadata.is_dir() && !walk.rules.is_ignored(&walk.segments(&path), true) {
             collect_files_bounded(
-                root,
+                walk,
                 &path,
                 entries,
                 scan_limit,
                 max_depth.map(|depth| depth.saturating_sub(1)),
-                show_hidden,
+                false,
             )?;
         }
     }
@@ -739,24 +827,163 @@ fn collect_files_bounded(
     Ok(())
 }
 
-fn collect_file_paths(target: &Path, files: &mut Vec<PathBuf>) -> Result<(), ToolError> {
+/// Files to search, like ripgrep: hidden entries and entries the root
+/// `.gitignore` covers are recorded in `skipped` instead of walked, and
+/// entries that vanish or cannot be read mid-walk are passed over.
+fn collect_file_paths(
+    walk: &Walk<'_>,
+    target: &Path,
+    files: &mut Vec<PathBuf>,
+    skipped: &mut Vec<String>,
+    top: bool,
+) -> Result<(), ToolError> {
     if target.is_file() {
         files.push(target.to_path_buf());
         return Ok(());
     }
 
-    for entry in fs::read_dir(target).map_err(ToolError::Io)? {
-        let entry = entry.map_err(ToolError::Io)?;
+    for entry in read_dir_entries(target, top)? {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
         let path = entry.path();
-        let metadata = entry.metadata().map_err(ToolError::Io)?;
-        if metadata.is_file() {
+        let segments = walk.segments(&path);
+        let hidden = walk.is_hidden(&entry);
+        if hidden || walk.rules.is_ignored(&segments, metadata.is_dir()) {
+            // Hidden files (.gitignore, .env) are not worth naming.
+            if !hidden || metadata.is_dir() {
+                skipped.push(segments.join("/"));
+            }
+        } else if metadata.is_file() {
             files.push(path);
         } else if metadata.is_dir() {
-            collect_file_paths(&path, files)?;
+            collect_file_paths(walk, &path, files, skipped, false)?;
         }
     }
 
     Ok(())
+}
+
+/// The workspace root `.gitignore`, read for the patterns that matter to a
+/// walk: comments, blank lines, `/anchored` and `dir/` patterns, `*` and
+/// `?` inside one path segment. Negations (`!`), `**` and nested
+/// `.gitignore` files are not read — a missed rule only means a wider
+/// walk.
+#[derive(Debug, Default)]
+struct IgnoreRules {
+    rules: Vec<IgnoreRule>,
+}
+
+#[derive(Debug)]
+struct IgnoreRule {
+    segments: Vec<String>,
+    /// Matches from the root (a leading `/` or a `/` inside), not by name
+    /// at any depth.
+    anchored: bool,
+    /// A trailing `/`: directories only.
+    dir_only: bool,
+}
+
+impl IgnoreRules {
+    /// Rules for a walk that starts at `target`. A target the rules cover
+    /// (or one inside such a directory) was asked for explicitly: no
+    /// rules then.
+    fn for_target(root: &Path, target: &Path) -> IgnoreRules {
+        let rules = IgnoreRules::load(root);
+        let segments: Vec<String> = target
+            .strip_prefix(root)
+            .map(|relative| {
+                relative
+                    .components()
+                    .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let covered = (1..=segments.len()).any(|depth| rules.is_ignored(&segments[..depth], true));
+        if covered {
+            IgnoreRules::default()
+        } else {
+            rules
+        }
+    }
+
+    fn load(root: &Path) -> IgnoreRules {
+        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
+            return IgnoreRules::default();
+        };
+        let rules = text
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if line.is_empty()
+                    || line.starts_with('#')
+                    || line.starts_with('!')
+                    || line.contains("**")
+                {
+                    return None;
+                }
+                let dir_only = line.ends_with('/');
+                let pattern = line.trim_end_matches('/');
+                let anchored = pattern.contains('/');
+                let segments: Vec<String> = pattern
+                    .trim_start_matches('/')
+                    .split('/')
+                    .map(str::to_string)
+                    .collect();
+                (!segments.iter().any(String::is_empty)).then_some(IgnoreRule {
+                    segments,
+                    anchored,
+                    dir_only,
+                })
+            })
+            .collect();
+        IgnoreRules { rules }
+    }
+
+    /// Whether the entry at `segments` (its path below the root) is ignored.
+    fn is_ignored(&self, segments: &[String], is_dir: bool) -> bool {
+        self.rules.iter().any(|rule| {
+            if rule.dir_only && !is_dir {
+                return false;
+            }
+            if rule.anchored {
+                rule.segments.len() == segments.len()
+                    && rule
+                        .segments
+                        .iter()
+                        .zip(segments)
+                        .all(|(pattern, segment)| glob_match(pattern, segment))
+            } else {
+                segments
+                    .last()
+                    .is_some_and(|name| glob_match(&rule.segments[0], name))
+            }
+        })
+    }
+}
+
+/// `*` (any run) and `?` (one char) matching within one path segment.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let (mut p, mut t) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some((p, t));
+            p += 1;
+        } else if let Some((star_p, star_t)) = star {
+            p = star_p + 1;
+            t = star_t + 1;
+            star = Some((star_p, star_t + 1));
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|&ch| ch == '*')
 }
 
 fn replace_limited(

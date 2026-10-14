@@ -79,6 +79,22 @@ mod vt_screen {
     use harness_tui::headless::VtScreen;
 
     #[test]
+    fn alternate_screen_saves_and_restores_the_main_viewport() {
+        let mut vt = VtScreen::new(10, 3);
+        vt.feed(b"shell\r\n");
+        vt.feed(b"\x1b[?1049h");
+        assert!(vt.in_alt_screen());
+        assert!(vt.viewport().iter().all(String::is_empty));
+        // Scrolling on the alternate screen never reaches scrollback.
+        vt.feed(b"a\r\nb\r\nc\r\nd");
+        assert!(vt.scrollback().is_empty());
+        vt.feed(b"\x1b[?1049l");
+        assert!(!vt.in_alt_screen());
+        assert_eq!(vt.viewport(), vec!["shell", "", ""]);
+        assert_eq!(vt.cursor(), (1, 0));
+    }
+
+    #[test]
     fn line_feed_on_the_last_row_scrolls_into_scrollback() {
         let mut vt = VtScreen::new(10, 2);
         vt.feed(b"one\r\ntwo\r\nthree");

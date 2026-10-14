@@ -83,9 +83,11 @@ fn styled_row(line: &Line) -> String {
 /// the bytes `core::Screen` writes, then read back the viewport and the
 /// native scrollback. Understands the subset the library emits — CUP,
 /// ED 0/2/3, EL 0/2, CR, LF (LF on the last row scrolls the top row
-/// into scrollback) and pending-wrap autowrap at the right margin. SGR,
-/// private modes and OSC strings are skipped. Wide characters take two
-/// cells; zero-width marks join the previous cell.
+/// into scrollback) and pending-wrap autowrap at the right margin — plus
+/// the alternate screen (private mode 1049: the main viewport and cursor
+/// are saved and restored, and the alternate screen has no scrollback).
+/// SGR, other private modes and OSC strings are skipped. Wide characters
+/// take two cells; zero-width marks join the previous cell.
 pub struct VtScreen {
     width: usize,
     height: usize,
@@ -96,6 +98,8 @@ pub struct VtScreen {
     col: usize,
     pending_wrap: bool,
     scrollback: Vec<String>,
+    /// The main viewport and cursor while the alternate screen is shown.
+    saved_main: Option<(Vec<Vec<String>>, usize, usize)>,
 }
 
 impl VtScreen {
@@ -110,6 +114,7 @@ impl VtScreen {
             col: 0,
             pending_wrap: false,
             scrollback: Vec::new(),
+            saved_main: None,
         }
     }
 
@@ -185,8 +190,31 @@ impl VtScreen {
         (self.row, self.col)
     }
 
+    /// True while the alternate screen is shown.
+    pub fn in_alt_screen(&self) -> bool {
+        self.saved_main.is_some()
+    }
+
     fn csi(&mut self, params: &str, final_byte: char) {
-        if params.starts_with('?') {
+        if let Some(modes) = params.strip_prefix('?') {
+            if modes.split(';').any(|mode| mode == "1049") {
+                match final_byte {
+                    'h' if self.saved_main.is_none() => {
+                        let blank = vec![vec![" ".to_string(); self.width]; self.height];
+                        let main = std::mem::replace(&mut self.rows, blank);
+                        self.saved_main = Some((main, self.row, self.col));
+                    }
+                    'l' => {
+                        if let Some((main, row, col)) = self.saved_main.take() {
+                            self.rows = main;
+                            self.row = row;
+                            self.col = col;
+                        }
+                    }
+                    _ => {}
+                }
+                self.pending_wrap = false;
+            }
             return;
         }
         let nums: Vec<usize> = params
@@ -234,7 +262,9 @@ impl VtScreen {
     fn line_feed(&mut self) {
         if self.row + 1 == self.height {
             let top = self.rows.remove(0);
-            self.scrollback.push(row_text(&top));
+            if self.saved_main.is_none() {
+                self.scrollback.push(row_text(&top));
+            }
             self.rows.push(vec![" ".to_string(); self.width]);
         } else {
             self.row += 1;

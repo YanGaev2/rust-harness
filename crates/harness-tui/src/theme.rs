@@ -32,6 +32,10 @@ pub struct Theme {
     pub diff_del_bg: Color,
     pub diff_add: Color,
     pub diff_del: Color,
+    /// Background of mouse-selected text.
+    pub selection: Color,
+    /// The bright band that sweeps over `Working…`.
+    pub shimmer: Color,
 }
 
 impl Theme {
@@ -50,6 +54,8 @@ impl Theme {
             diff_del_bg: Color::Rgb(0x3a, 0x22, 0x28),
             diff_add: Color::Rgb(0xb8, 0xdb, 0x87),
             diff_del: Color::Rgb(0xe2, 0x6a, 0x75),
+            selection: Color::Rgb(0x3b, 0x4f, 0x66),
+            shimmer: Color::Rgb(0xe6, 0xe6, 0xe6),
         }
     }
 
@@ -68,6 +74,8 @@ impl Theme {
             diff_del_bg: Color::Rgb(0xf7, 0xd8, 0xdb),
             diff_add: Color::Rgb(0x2e, 0x7d, 0x32),
             diff_del: Color::Rgb(0xc0, 0x39, 0x2b),
+            selection: Color::Rgb(0xc8, 0xdc, 0xf5),
+            shimmer: Color::Rgb(0x1f, 0x1f, 0x1f),
         }
     }
 
@@ -98,6 +106,8 @@ impl Theme {
             diff_del_bg: q(self.diff_del_bg),
             diff_add: q(self.diff_add),
             diff_del: q(self.diff_del),
+            selection: q(self.selection),
+            shimmer: q(self.shimmer),
         }
     }
 }
@@ -106,6 +116,17 @@ impl Default for Theme {
     fn default() -> Theme {
         Theme::dark()
     }
+}
+
+/// Linear blend of two RGB colors: `t = 0` is `from`, `t = 1` is `to`.
+pub fn mix(from: (u8, u8, u8), to: (u8, u8, u8), t: f32) -> (u8, u8, u8) {
+    let t = t.clamp(0.0, 1.0);
+    let channel = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t).round() as u8;
+    (
+        channel(from.0, to.0),
+        channel(from.1, to.1),
+        channel(from.2, to.2),
+    )
 }
 
 /// Perceived brightness in 0..=1 (Rec. 709 weights on sRGB values; the

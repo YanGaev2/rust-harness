@@ -14,8 +14,32 @@ pub enum Event {
     Paste(String),
     WheelUp,
     WheelDown,
+    /// A mouse button event while mouse capture is on (SGR encoding).
+    Mouse(MouseEvent),
     /// Terminal size changed (emitted by the event pump, not the parser).
     Resize(u16, u16),
+}
+
+/// A mouse event at a 0-based screen cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseEvent {
+    pub kind: MouseKind,
+    pub column: u16,
+    pub row: u16,
+}
+
+/// The mouse events an app can act on: the left button drives
+/// selection, the right button is the terminal's usual paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseKind {
+    /// Left button pressed.
+    Down,
+    /// The pointer moved with the left button held.
+    Drag,
+    /// Left button released.
+    Up,
+    /// Right button pressed.
+    RightDown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,17 +398,39 @@ fn parse_kitty_key(consumed: usize, params: &[u8]) -> Step {
     Step::Emit(consumed, Event::Key(KeyEvent { code, mods }))
 }
 
-/// CSI < cb ; cx ; cy M/m — SGR mouse. Only the wheel matters to us.
+/// CSI < cb ; cx ; cy M/m — SGR mouse: `M` is a press or a motion, `m` a
+/// release. In `cb`, bits 0-1 are the button (0 left, 2 right), 4/8/16
+/// are Shift/Alt/Ctrl, 32 marks motion and 64 the wheel. Coordinates
+/// are 1-based.
 fn parse_sgr_mouse(consumed: usize, params: &[u8], final_byte: u8) -> Step {
     if final_byte != b'M' && final_byte != b'm' {
         return Step::Consume(consumed);
     }
     let numbers = parse_params(params);
-    match numbers.first().copied() {
-        Some(64) if final_byte == b'M' => Step::Emit(consumed, Event::WheelUp),
-        Some(65) if final_byte == b'M' => Step::Emit(consumed, Event::WheelDown),
-        _ => Step::Consume(consumed),
-    }
+    let (Some(&code), Some(&column), Some(&row)) =
+        (numbers.first(), numbers.get(1), numbers.get(2))
+    else {
+        return Step::Consume(consumed);
+    };
+    let code = code & !(4 | 8 | 16);
+    let press = final_byte == b'M';
+    let kind = match code {
+        64 if press => return Step::Emit(consumed, Event::WheelUp),
+        65 if press => return Step::Emit(consumed, Event::WheelDown),
+        0 if press => MouseKind::Down,
+        32 if press => MouseKind::Drag,
+        0 => MouseKind::Up,
+        2 if press => MouseKind::RightDown,
+        _ => return Step::Consume(consumed),
+    };
+    Step::Emit(
+        consumed,
+        Event::Mouse(MouseEvent {
+            kind,
+            column: column.saturating_sub(1),
+            row: row.saturating_sub(1),
+        }),
+    )
 }
 
 fn tilde_key(n: u16) -> Option<KeyCode> {

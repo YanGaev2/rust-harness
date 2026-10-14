@@ -8,7 +8,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use harness_tui::core::Screen;
+use harness_tui::fullscreen::FullScreen;
 use harness_tui::input::{Event as TuiEvent, KeyCode as TuiKeyCode, Parser, coalesce_burst};
 use harness_tui::terminal as tui_terminal;
 use harness_tui::theme::Theme;
@@ -21,6 +21,7 @@ use crate::clipboard::{
     SystemClipboard,
 };
 use crate::config::ConfigStore;
+use crate::model_client::OpenAiCompatibleModelClient;
 use crate::providers::ProviderConfig;
 use crate::request::ChatMessage;
 use crate::session::{ChatSession, SessionStore};
@@ -426,11 +427,12 @@ pub fn run_terminal_repl<W: Write>(options: ReplOptions, output: &mut W) -> Resu
     Ok(())
 }
 
-/// Run the interactive chat session on harness-tui: finished chat blocks
-/// flow into the terminal's native scrollback (wheel-scrollable,
-/// selectable, they survive exit) and only the bottom panel — live
-/// blocks, spinner, prompt editor, completions, status — is repainted.
-/// Used on a real terminal; non-TTY callers stay on `run_terminal_repl`.
+/// Run the interactive chat session full screen on harness-tui: the
+/// transcript scrolls inside the window, the editor and status rows stay
+/// on the bottom edge, a mouse drag copies transcript text. On exit the
+/// terminal's own screen comes back and the conversation is printed into
+/// its native scrollback. Used on a real terminal; non-TTY callers stay
+/// on `run_terminal_repl`.
 pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     let ReplOptions {
         provider,
@@ -448,22 +450,24 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
     let mut catalog = provider_catalog;
 
     tui_terminal::install_panic_restore();
-    let mut screen = Screen::stdout().map_err(|err| ReplError::Io(err.into()))?;
-    // Start from a clean viewport: content flows from the top, the editor
-    // and status rows are docked to the bottom edge (see `draw_chat`).
-    screen.clear_screen().map_err(ReplError::Io)?;
+    let mut screen = FullScreen::stdout().map_err(|err| ReplError::Io(err.into()))?;
     let clipboard = SystemClipboard;
     let mut capture = ClipboardCapture::new(AttachmentStore::new(&workspace));
     let provider_label = format!("{}/{}", active_provider.name(), active_model);
     let theme = Theme::for_background(screen.background());
-    let theme = if tui_terminal::supports_truecolor() {
-        theme
+    let truecolor = tui_terminal::supports_truecolor();
+    let theme = if truecolor { theme } else { theme.quantized() };
+    // The fade-in blends RGB colors: only with truecolor.
+    let (foreground, background) = if truecolor {
+        (screen.foreground(), screen.background())
     } else {
-        theme.quantized()
+        (None, None)
     };
     let mut app = ChatApp::new(provider_label, &workspace)
         .with_catalog(catalog_pairs(&catalog))
-        .with_theme(theme);
+        .with_theme(theme)
+        .with_animations(true)
+        .with_terminal_colors(foreground, background);
     app.push_banner(env!("CARGO_PKG_VERSION"));
     let mut chat = ChatSession::start(
         SessionStore::for_workspace(&workspace),
@@ -472,33 +476,33 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
         &active_model,
     );
     render_resumed_history(&mut app, &chat.history());
+    app.finish_reveals();
     for notice in chat.take_notices() {
         app.push_system_line(notice);
     }
 
     let mut pump = InputPump::start();
-    let mut resize = ResizeDebouncer::new(screen.width(), screen.height(), RESIZE_SETTLE);
+    let mut window_probe = model_metadata(&active_provider, &active_model, &mut app);
+    // The `/provider add` model list request, while it runs.
+    let mut model_fetch: Option<mpsc::Receiver<crate::tui::FetchResult>> = None;
 
     'session: loop {
-        // While a width change settles the viewport stays erased — a
-        // panel painted mid-drag would be reflowed into ghost fragments.
-        if !resize.is_pending() {
-            draw_chat(&mut screen, &mut app)?;
+        take_context_window(&mut window_probe, &mut app);
+        if let Some(result) = model_fetch.as_ref().and_then(|fetch| fetch.try_recv().ok()) {
+            app.models_loaded(result);
+            model_fetch = None;
         }
-        // 100ms idle polling keeps the first-erase window small: the
-        // longer a stale-width panel survives a resize, the more of it
-        // the terminal's reflow can push into unreachable scrollback.
-        // Unchanged frames diff to zero updates, so the extra ticks
-        // cost nothing.
-        let poll_window = if resize.is_pending() {
-            Duration::from_millis(50)
+        draw_chat(&mut screen, &mut app)?;
+        // Animations need frames without input; an idle screen does not.
+        let poll_window = if app.is_animating() || model_fetch.is_some() {
+            FRAME_INTERVAL
         } else {
             Duration::from_millis(100)
         };
         // A prompt queued during the last run goes first, without waiting
-        // for input; otherwise poll the keyboard.
+        // for input; otherwise poll the keyboard and mouse.
         let inputs: Vec<LoopInput> = match app.take_queued() {
-            Some(action) => vec![LoopInput::Queued(action)],
+            Some(action) => vec![LoopInput::Queued(Box::new(action))],
             None => pump
                 .poll(poll_window)
                 .map_err(ReplError::Io)?
@@ -506,13 +510,10 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                 .map(LoopInput::Event)
                 .collect(),
         };
-        handle_resize(&mut screen, &app, &mut resize)?;
         for input in inputs {
             let action = match input {
-                LoopInput::Queued(action) => action,
-                LoopInput::Event(TuiEvent::Paste(text)) => app.handle_paste(&text),
-                LoopInput::Event(TuiEvent::Key(key)) => app.handle_key(key),
-                LoopInput::Event(_) => ChatAction::Continue,
+                LoopInput::Queued(action) => *action,
+                LoopInput::Event(event) => app.handle_event(event),
             };
             match action {
                 ChatAction::Continue => {}
@@ -520,40 +521,60 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                 ChatAction::CaptureClipboard => {
                     capture_into_chat(&mut app, &mut capture, &clipboard);
                 }
-                ChatAction::SwitchModel { provider, model } => {
-                    let selection = ReplModelSelection {
-                        provider_name: provider,
-                        model: model.clone(),
-                    };
-                    match perform_model_switch(&mut catalog, config_path.as_deref(), &selection) {
-                        Ok((resolved, notes)) => {
-                            active_provider = resolved;
-                            active_model = model;
-                            app.set_provider_label(format!(
-                                "{}/{}",
-                                active_provider.name(),
-                                active_model
-                            ));
-                            app.add_catalog_model(active_provider.name(), &active_model);
-                            for note in notes {
-                                app.push_system_line(note);
+                ChatAction::Copy(text) => screen.copy(&text).map_err(ReplError::Io)?,
+                ChatAction::FetchModels(provider) => {
+                    model_fetch = Some(crate::tui::spawn_model_fetch(provider));
+                }
+                ChatAction::SaveProvider { provider, model } => {
+                    let name = provider.name().to_string();
+                    match &config_path {
+                        Some(path) => {
+                            match ConfigStore::new(path).save_provider(provider.clone()) {
+                                Ok(()) => app.push_system_line(format!(
+                                    "saved provider {name} with {} model(s)",
+                                    provider.models().len()
+                                )),
+                                Err(err) => app.push_system_line(format!(
+                                    "note: provider {name} not saved to config: {err}"
+                                )),
                             }
                         }
-                        Err(err) => app.push_system_line(err),
+                        None => app.push_system_line(format!(
+                            "note: no config file — provider {name} lasts for this session only"
+                        )),
                     }
+                    for saved in provider.models() {
+                        app.add_catalog_model(&name, saved);
+                    }
+                    match catalog.iter_mut().find(|entry| entry.name() == name) {
+                        Some(entry) => *entry = provider,
+                        None => catalog.push(provider),
+                    }
+                    switch_model(
+                        &mut catalog,
+                        config_path.as_deref(),
+                        name,
+                        model,
+                        (&mut active_provider, &mut active_model),
+                        &mut app,
+                        &mut window_probe,
+                    );
                 }
+                ChatAction::SwitchModel { provider, model } => switch_model(
+                    &mut catalog,
+                    config_path.as_deref(),
+                    provider,
+                    model,
+                    (&mut active_provider, &mut active_model),
+                    &mut app,
+                    &mut window_probe,
+                ),
                 ChatAction::NewSession => {
                     chat.start_new(active_provider.name(), &active_model);
-                    // The app already dropped its transcript; wipe the terminal
-                    // too so the old conversation does not linger on screen.
-                    screen.clear().map_err(ReplError::Io)?;
                     app.push_system_line("started new session");
                     for notice in chat.take_notices() {
                         app.push_system_line(notice);
                     }
-                }
-                ChatAction::ClearScreen => {
-                    screen.clear().map_err(ReplError::Io)?;
                 }
                 ChatAction::Submit(message) => {
                     app.set_busy(true);
@@ -587,34 +608,26 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                         while let Ok(event) = event_rx.try_recv() {
                             app.push_agent_event(&event);
                         }
-                        app.tick();
-                        handle_resize(&mut screen, &app, &mut resize)?;
-                        if !resize.is_pending() {
-                            draw_chat(&mut screen, &mut app)?;
-                        }
+                        take_context_window(&mut window_probe, &mut app);
+                        draw_chat(&mut screen, &mut app)?;
                         // Poll input BEFORE the finished check so a
                         // queued Esc is consumed as a busy cancel and
                         // can never leak into the idle loop as an exit.
-                        for event in pump
-                            .poll(Duration::from_millis(50))
-                            .map_err(ReplError::Io)?
-                        {
+                        for event in pump.poll(FRAME_INTERVAL).map_err(ReplError::Io)? {
                             match app.busy_action(&event) {
                                 BusyAction::Cancel => cancel.store(true, Ordering::SeqCst),
-                                // The user keeps typing; Enter queues the
-                                // prompt for after this run (the app holds
-                                // the queue), so only a clipboard capture
-                                // needs the loop now.
-                                BusyAction::Forward => {
-                                    let action = match event {
-                                        TuiEvent::Paste(text) => app.handle_paste(&text),
-                                        TuiEvent::Key(key) => app.handle_key(key),
-                                        _ => ChatAction::Continue,
-                                    };
-                                    if action == ChatAction::CaptureClipboard {
+                                // The user keeps typing, scrolling and
+                                // selecting; Enter queues the prompt for
+                                // after this run (the app holds the queue).
+                                BusyAction::Forward => match app.handle_event(event) {
+                                    ChatAction::CaptureClipboard => {
                                         capture_into_chat(&mut app, &mut capture, &clipboard);
                                     }
-                                }
+                                    ChatAction::Copy(text) => {
+                                        screen.copy(&text).map_err(ReplError::Io)?;
+                                    }
+                                    _ => {}
+                                },
                             }
                         }
                         if worker.is_finished() {
@@ -648,139 +661,131 @@ pub fn run_chat_tui(options: ReplOptions) -> Result<(), ReplError> {
                     for notice in chat.take_notices() {
                         app.push_system_line(notice);
                     }
-                    if !resize.is_pending() {
-                        draw_chat(&mut screen, &mut app)?;
-                    }
+                    draw_chat(&mut screen, &mut app)?;
                 }
             }
         }
     }
 
-    let _ = screen.release();
+    // Back on the terminal's own screen: leave the conversation in its
+    // scrollback, fully revealed, like a line-mode session would.
+    screen.leave().map_err(ReplError::Io)?;
+    let width = screen.width() as usize;
+    screen
+        .print(&app.exit_transcript(width))
+        .map_err(ReplError::Io)?;
     Ok(())
 }
+
+/// Switch the session to `provider`/`model` and refresh the model's
+/// window and prices.
+fn switch_model(
+    catalog: &mut [ProviderConfig],
+    config_path: Option<&Path>,
+    provider: String,
+    model: String,
+    (active_provider, active_model): (&mut ProviderConfig, &mut String),
+    app: &mut ChatApp,
+    window_probe: &mut Option<mpsc::Receiver<Option<u64>>>,
+) {
+    let selection = ReplModelSelection {
+        provider_name: provider,
+        model: model.clone(),
+    };
+    match perform_model_switch(catalog, config_path, &selection) {
+        Ok((resolved, notes)) => {
+            *active_provider = resolved;
+            *active_model = model;
+            app.set_provider_label(format!("{}/{}", active_provider.name(), active_model));
+            app.add_catalog_model(active_provider.name(), active_model);
+            // A different model, a different window and price.
+            *window_probe = model_metadata(active_provider, active_model, app);
+            for note in notes {
+                app.push_system_line(note);
+            }
+        }
+        Err(err) => app.push_system_line(err),
+    }
+}
+
+/// Give the app the model's prices and context window. A window saved
+/// when the provider was added is used as is; otherwise it is probed.
+fn model_metadata(
+    provider: &ProviderConfig,
+    model: &str,
+    app: &mut ChatApp,
+) -> Option<mpsc::Receiver<Option<u64>>> {
+    app.set_pricing(provider.pricing(model));
+    let saved = provider
+        .model_info(model)
+        .and_then(|info| info.context_window);
+    app.set_context_window(saved);
+    match saved {
+        Some(_) => None,
+        None => Some(probe_context_window(provider, model)),
+    }
+}
+
+/// Ask the provider's model list for `model`'s context window on a worker
+/// thread, so a slow or missing `/models` endpoint never delays the chat.
+/// The answer is `None` when the list does not report a window.
+fn probe_context_window(provider: &ProviderConfig, model: &str) -> mpsc::Receiver<Option<u64>> {
+    let (sender, receiver) = mpsc::channel();
+    let provider = provider.clone();
+    let model = model.to_string();
+    thread::spawn(move || {
+        let window = OpenAiCompatibleModelClient::new(CONTEXT_PROBE_TIMEOUT)
+            .list_models(&provider)
+            .ok()
+            .and_then(|discovery| discovery.context_window(&model));
+        let _ = sender.send(window);
+    });
+    receiver
+}
+
+/// Hand a finished context-window probe to the app. A probe replaced by
+/// a newer one (model switch) is dropped with its receiver.
+fn take_context_window(probe: &mut Option<mpsc::Receiver<Option<u64>>>, app: &mut ChatApp) {
+    let Some(receiver) = probe else {
+        return;
+    };
+    match receiver.try_recv() {
+        Ok(window) => {
+            app.set_context_window(window);
+            *probe = None;
+        }
+        Err(mpsc::TryRecvError::Disconnected) => *probe = None,
+        Err(mpsc::TryRecvError::Empty) => {}
+    }
+}
+
+/// How long the context-window probe waits for `/models`.
+const CONTEXT_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Frame interval while something animates (~30 frames per second):
+/// smooth for revealed text and the spinner, cheap because unchanged
+/// rows diff to nothing.
+const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// One step of the chat loop: a terminal event, or a prompt the user
 /// queued while the previous run was busy.
 enum LoopInput {
     Event(TuiEvent),
-    Queued(ChatAction),
+    Queued(Box<ChatAction>),
 }
 
-/// One frame: commit finalized transcript rows into native scrollback
-/// and paint the next live frame directly below them, atomically. The
-/// commit boundary is acknowledged only after the write succeeds.
-fn draw_chat(screen: &mut Screen, app: &mut ChatApp) -> Result<(), ReplError> {
-    let width = screen.width() as usize;
-    let height = screen.height() as usize;
-    // Reserve rows for the framed editor (≤6 + 2 border rows) + menu/
-    // palette + spinner + status; the live block area gets the rest and
-    // shows its tail when over budget.
-    let max_live_rows = height.saturating_sub(14).max(3);
-    // Long streams freeze their stable prefix into scrollback instead of
-    // head-clipping it out of view.
-    app.freeze_streaming_overflow(width, max_live_rows);
-    let (scrollback, commit_through) = app.peek_scrollback(width);
-    let (live, docked) = app.panel_frame_after(width, max_live_rows, commit_through);
-    screen
-        .present(&scrollback, live, docked)
-        .map_err(ReplError::Io)?;
-    app.acknowledge_emitted(commit_through);
-    Ok(())
-}
-
-/// How long the terminal size must stay unchanged before the full
-/// repaint runs. Short enough to feel instant after a drag, long enough
-/// to skip the intermediate widths the drag produces.
-const RESIZE_SETTLE: Duration = Duration::from_millis(150);
-
-/// What the chat loop should do about the terminal size right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResizeAction {
-    /// Size unchanged and nothing pending.
-    None,
-    /// Size changed: erase the viewport now (`Screen::resize_erase`).
-    /// A width change reflows the buffer; a height change may scroll it
-    /// (the docked status row keeps the cursor on the last row), so no
-    /// painted row coordinate survives either.
-    Erase,
-    /// The size has been stable for the settle window: repaint the whole
-    /// frame from the model (`Screen::repaint`).
-    Repaint,
-}
-
-/// Debounced resize policy: erase eagerly on every size change (a panel
-/// painted mid-drag is reflowed into ghost fragments by the very next
-/// step), repaint lazily once the size settles. Pure state machine with
-/// injected clocks so tests need no terminal.
-#[derive(Debug)]
-pub struct ResizeDebouncer {
-    width: u16,
-    height: u16,
-    settle: Duration,
-    pending: Option<Instant>,
-}
-
-impl ResizeDebouncer {
-    pub fn new(width: u16, height: u16, settle: Duration) -> Self {
-        ResizeDebouncer {
-            width,
-            height,
-            settle,
-            pending: None,
-        }
+/// One frame: adopt a changed terminal size (the alternate screen has no
+/// scrollback to reflow, so a full repaint is the whole story), advance
+/// the animations, and paint the app's frame.
+fn draw_chat(screen: &mut FullScreen, app: &mut ChatApp) -> Result<(), ReplError> {
+    if let Ok((width, height)) = tui_terminal::size()
+        && (width != screen.width() || height != screen.height())
+    {
+        screen.resize(width, height).map_err(ReplError::Io)?;
     }
-
-    pub fn observe(&mut self, width: u16, height: u16, now: Instant) -> ResizeAction {
-        if width != self.width || height != self.height {
-            self.width = width;
-            self.height = height;
-            // Every step of a drag restarts the settle window.
-            self.pending = Some(now);
-            return ResizeAction::Erase;
-        }
-        match self.pending {
-            Some(since) if now.duration_since(since) >= self.settle => {
-                self.pending = None;
-                ResizeAction::Repaint
-            }
-            _ => ResizeAction::None,
-        }
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.pending.is_some()
-    }
-}
-
-/// The terminal delivers no resize signal we listen for — the loops poll
-/// the size once per tick and feed it through the debouncer: eager erase
-/// on every change, one full repaint from the model once the size
-/// settles.
-fn handle_resize(
-    screen: &mut Screen,
-    app: &ChatApp,
-    resize: &mut ResizeDebouncer,
-) -> Result<(), ReplError> {
-    let Ok((width, height)) = tui_terminal::size() else {
-        return Ok(());
-    };
-    match resize.observe(width, height, Instant::now()) {
-        ResizeAction::None => {}
-        ResizeAction::Erase => screen.resize_erase(width, height).map_err(ReplError::Io)?,
-        ResizeAction::Repaint => {
-            // Mirror draw_chat's layout budget, then fill every row the
-            // panel leaves free with the re-wrapped transcript tail.
-            let width = screen.width() as usize;
-            let height = screen.height() as usize;
-            let max_live_rows = height.saturating_sub(14).max(3);
-            let (live, docked) = app.panel_frame(width, max_live_rows);
-            let content_rows = height.saturating_sub(live.len());
-            let tail = app.viewport_tail(width, content_rows);
-            screen.repaint(&tail, live, docked).map_err(ReplError::Io)?;
-        }
-    }
-    Ok(())
+    app.animate(Instant::now());
+    let frame = app.frame(screen.width() as usize, screen.height() as usize);
+    screen.draw(frame).map_err(ReplError::Io)
 }
 
 /// Reads raw stdin bytes on a background thread; the UI thread polls

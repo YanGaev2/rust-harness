@@ -326,7 +326,7 @@ impl AgentRunner {
                 ));
             }
 
-            trace.record_usage(&response.usage);
+            trace.record_usage(&response.usage, current_provider.pricing(&current_model));
             on_event(AgentEvent::UsageUpdated(trace.usage));
 
             // Kept beyond the trace: the reasoning also rides on the assistant
@@ -527,12 +527,16 @@ pub enum AgentEvent {
 
 /// Token totals across all requests of a run, cache-aware: `cached_tokens`
 /// is the part of `prompt_tokens` billed at the provider's cached rate.
+/// `context_tokens` is not a sum: it is the latest request's prompt plus
+/// completion — the conversation the next request carries, i.e. how full
+/// the context window is.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct UsageTotals {
     pub requests: u64,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
     pub completion_tokens: u64,
+    pub context_tokens: u64,
 }
 
 impl UsageTotals {
@@ -543,6 +547,11 @@ impl UsageTotals {
             prompt_tokens: self.prompt_tokens + other.prompt_tokens,
             cached_tokens: self.cached_tokens + other.cached_tokens,
             completion_tokens: self.completion_tokens + other.completion_tokens,
+            context_tokens: if other.requests > 0 {
+                other.context_tokens
+            } else {
+                self.context_tokens
+            },
         }
     }
 
@@ -550,6 +559,8 @@ impl UsageTotals {
         self.requests += 1;
         self.prompt_tokens += usage.prompt_tokens.unwrap_or(0);
         self.completion_tokens += usage.completion_tokens.unwrap_or(0);
+        self.context_tokens =
+            usage.prompt_tokens.unwrap_or(0) + usage.completion_tokens.unwrap_or(0);
         // cache_report unifies both wire schemes (DeepSeek hit/miss fields
         // and OpenAI-style cached_tokens).
         if let Some(report) = usage.cache_report() {
@@ -597,15 +608,19 @@ impl AgentTrace {
         }
     }
 
-    fn record_usage(&mut self, usage: &crate::chat_client::TokenUsage) {
+    fn record_usage(
+        &mut self,
+        usage: &crate::chat_client::TokenUsage,
+        pricing: Option<crate::providers::ModelPricing>,
+    ) {
         self.usage.add(usage);
-        if let Some(pricing) = crate::providers::builtin_pricing(&self.provider, &self.model) {
+        if let Some(pricing) = pricing {
             self.estimated_cost_usd = Some(pricing.estimate_usd(
                 self.usage.prompt_tokens,
                 self.usage.cached_tokens,
                 self.usage.completion_tokens,
             ));
-            self.pricing_as_of = Some(pricing.as_of.to_string());
+            self.pricing_as_of = Some(pricing.as_of);
         }
     }
 

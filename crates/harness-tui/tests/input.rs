@@ -230,8 +230,25 @@ fn sgr_mouse_wheel() {
 }
 
 #[test]
-fn sgr_mouse_clicks_are_ignored() {
-    assert_eq!(feed_all(b"\x1b[<0;10;5M\x1b[<0;10;5m"), vec![]);
+fn sgr_mouse_left_button_press_drag_release_and_right_press() {
+    use harness_tui::input::{MouseEvent, MouseKind};
+    let mouse = |kind, column, row| Event::Mouse(MouseEvent { kind, column, row });
+    assert_eq!(
+        feed_all(b"\x1b[<0;10;5M\x1b[<32;12;6M\x1b[<0;12;6m\x1b[<2;1;1M"),
+        vec![
+            mouse(MouseKind::Down, 9, 4),
+            mouse(MouseKind::Drag, 11, 5),
+            mouse(MouseKind::Up, 11, 5),
+            mouse(MouseKind::RightDown, 0, 0),
+        ]
+    );
+    // Shift/Alt/Ctrl bits do not change the event.
+    assert_eq!(
+        feed_all(b"\x1b[<16;3;3M"),
+        vec![mouse(MouseKind::Down, 2, 2)]
+    );
+    // Middle button, right release and motion without a button: nothing.
+    assert_eq!(feed_all(b"\x1b[<1;3;3M\x1b[<2;3;3m\x1b[<35;3;3M"), vec![]);
 }
 
 #[test]

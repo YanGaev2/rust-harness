@@ -8,6 +8,7 @@
 pub mod components;
 pub mod core;
 pub mod diff;
+pub mod fullscreen;
 pub mod headless;
 pub mod input;
 pub mod terminal;

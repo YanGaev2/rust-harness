@@ -67,11 +67,16 @@ pub mod esc {
     /// `CSI … u` keys. Terminals without the protocol ignore both.
     pub const KITTY_KEYS_ON: &str = "\x1b[>1u";
     pub const KITTY_KEYS_OFF: &str = "\x1b[<u";
-    /// SGR mouse capture (1000 = button tracking, 1006 = SGR encoding).
-    /// Not enabled by `Terminal` setup: capturing the mouse breaks
-    /// native-scrollback wheel scrolling. The input layer toggles it.
-    pub const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1006h";
-    pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1000l";
+    /// SGR mouse capture: 1000 = press/release, 1002 = motion while a
+    /// button is held (drag selection), 1006 = SGR encoding. Not enabled
+    /// by `Terminal` setup: capturing the mouse breaks native-scrollback
+    /// wheel scrolling. `fullscreen::FullScreen` turns it on.
+    pub const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+    pub const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+    /// Enter / leave the alternate screen buffer (xterm 1049: the main
+    /// buffer and its cursor are saved, then restored on leave).
+    pub const ALT_SCREEN_ON: &str = "\x1b[?1049h";
+    pub const ALT_SCREEN_OFF: &str = "\x1b[?1049l";
     pub const CLEAR_LINE: &str = "\x1b[2K";
     /// Erase from the cursor to the end of the screen.
     pub const CLEAR_DOWN: &str = "\x1b[0J";
@@ -83,14 +88,56 @@ pub mod esc {
     pub fn move_to(row: u16, col: u16) -> String {
         format!("\x1b[{};{}H", row + 1, col + 1)
     }
+
+    /// OSC 52: put `text` on the system clipboard through the terminal
+    /// (Windows Terminal, kitty, WezTerm, iTerm2, tmux with
+    /// `set-clipboard on`). Works over SSH too.
+    pub fn copy_to_clipboard(text: &str) -> String {
+        format!("\x1b]52;c;{}\x07", super::base64(text.as_bytes()))
+    }
+}
+
+/// Standard base64 with padding — enough for OSC 52.
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = match *chunk {
+            [a, b, c] => (a as u32) << 16 | (b as u32) << 8 | c as u32,
+            [a, b] => (a as u32) << 16 | (b as u32) << 8,
+            [a] => (a as u32) << 16,
+            _ => unreachable!("chunks(3) yields 1 to 3 bytes"),
+        };
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(ALPHABET[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 /// Everything a session must write to leave the terminal usable, in
 /// safe order: close any open synchronized frame, release the mouse,
 /// pop the kitty keyboard flags, turn bracketed paste off, show the
 /// cursor. Raw-mode restore is separate (console modes, not escapes).
+/// Leaving the alternate screen is separate too ([`Terminal`] and the
+/// panic hook add it only when it was entered: on the main screen,
+/// xterm's 1049 reset would also restore a stale saved cursor).
 pub fn restore_sequence() -> &'static str {
-    "\x1b[?2026l\x1b[?1006l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h"
+    "\x1b[?2026l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[<u\x1b[?2004l\x1b[?25h"
+}
+
+/// Set while a real terminal shows the alternate screen, so a panic
+/// can leave it before the panic message prints.
+static ALT_SCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the panic hook whether the real terminal is on the alternate
+/// screen (`fullscreen::FullScreen::stdout` and `leave` call this).
+pub fn mark_alt_screen(active: bool) {
+    ALT_SCREEN_ACTIVE.store(active, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// True only when both stdin and stdout are terminals — the TUI needs
@@ -153,17 +200,19 @@ pub struct StartupProbe {
     pub cursor: (u16, u16),
     /// Default background color, when the terminal answers OSC 11.
     pub background: Option<(u8, u8, u8)>,
+    /// Default text color, when the terminal answers OSC 10.
+    pub foreground: Option<(u8, u8, u8)>,
 }
 
-/// Ask the terminal where the cursor is (DSR) and for its background
-/// color (OSC 11) in one round trip. Terminals answer in order and every
-/// VT terminal answers DSR, so an OSC 11 reply that has not arrived by
-/// the cursor report is not coming — no timeout is needed. Call only at
-/// startup, before the input pump owns stdin: the replies arrive
-/// interleaved with any pending keystrokes.
+/// Ask the terminal where the cursor is (DSR) and for its text and
+/// background colors (OSC 10, OSC 11) in one round trip. Terminals answer
+/// in order and every VT terminal answers DSR, so an OSC reply that has
+/// not arrived by the cursor report is not coming — no timeout is needed.
+/// Call only at startup, before the input pump owns stdin: the replies
+/// arrive interleaved with any pending keystrokes.
 pub fn startup_probe() -> Result<StartupProbe, TerminalError> {
     let mut out = io::stdout();
-    out.write_all(b"\x1b]11;?\x1b\\\x1b[6n")?;
+    out.write_all(b"\x1b]10;?\x1b\\\x1b]11;?\x1b\\\x1b[6n")?;
     out.flush()?;
     let mut collected: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 64];
@@ -179,6 +228,7 @@ pub fn startup_probe() -> Result<StartupProbe, TerminalError> {
             return Ok(StartupProbe {
                 cursor,
                 background: parse_background_report(&collected),
+                foreground: parse_foreground_report(&collected),
             });
         }
     }
@@ -208,8 +258,19 @@ pub fn parse_cursor_report(bytes: &[u8]) -> Option<(u16, u16)> {
 /// Parse an OSC 11 reply — `ESC ] 11 ; rgb:RRRR/GGGG/BBBB` ended by BEL or
 /// ST — into 8-bit channels (1 to 4 hex digits per channel are allowed).
 pub fn parse_background_report(bytes: &[u8]) -> Option<(u8, u8, u8)> {
-    let start = bytes.windows(5).position(|w| w == b"\x1b]11;")?;
-    let rest = &bytes[start + 5..];
+    parse_color_report(bytes, b"\x1b]11;")
+}
+
+/// Parse an OSC 10 (default text color) reply; same format as OSC 11.
+pub fn parse_foreground_report(bytes: &[u8]) -> Option<(u8, u8, u8)> {
+    parse_color_report(bytes, b"\x1b]10;")
+}
+
+fn parse_color_report(bytes: &[u8], introducer: &[u8]) -> Option<(u8, u8, u8)> {
+    let start = bytes
+        .windows(introducer.len())
+        .position(|w| w == introducer)?;
+    let rest = &bytes[start + introducer.len()..];
     let end = rest.iter().position(|&b| b == 0x07 || b == 0x1b)?;
     let body = std::str::from_utf8(&rest[..end]).ok()?;
     let mut channels = body.strip_prefix("rgb:")?.split('/').map(|hex| {
@@ -238,6 +299,8 @@ pub fn colorfgbg_background() -> Option<(u8, u8, u8)> {
 pub struct Terminal {
     out: Box<dyn Write + Send>,
     _raw: Option<sys::RawModeGuard>,
+    /// The alternate screen is on: drop must leave it.
+    alt_screen: bool,
 }
 
 impl Terminal {
@@ -252,6 +315,7 @@ impl Terminal {
         let mut terminal = Terminal {
             out: Box::new(io::stdout()),
             _raw: Some(raw),
+            alt_screen: false,
         };
         terminal.write_setup()?;
         Ok(terminal)
@@ -260,9 +324,19 @@ impl Terminal {
     /// Same escape behavior against an injected writer; no tty or raw
     /// mode. This is how tests observe exact bytes.
     pub fn with_backend(out: Box<dyn Write + Send>) -> Terminal {
-        let mut terminal = Terminal { out, _raw: None };
+        let mut terminal = Terminal {
+            out,
+            _raw: None,
+            alt_screen: false,
+        };
         let _ = terminal.write_setup();
         terminal
+    }
+
+    /// Record that the alternate screen is on (or off again), so drop
+    /// leaves it before the shell gets the terminal back.
+    pub fn set_alt_screen(&mut self, active: bool) {
+        self.alt_screen = active;
     }
 
     /// Write raw bytes and flush — the primitive `core::Screen` builds
@@ -312,6 +386,10 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
+        if self.alt_screen {
+            let _ = self.out.write_all(esc::SYNC_END.as_bytes());
+            let _ = self.out.write_all(esc::ALT_SCREEN_OFF.as_bytes());
+        }
         let _ = self.out.write_all(restore_sequence().as_bytes());
         let _ = self.out.flush();
         // `_raw` drops after this, restoring console modes.
@@ -336,6 +414,10 @@ pub fn install_panic_restore() {
 /// panicking writer) plus console-mode restore. Safe to call anytime.
 pub fn restore_now() {
     let mut err = io::stderr();
+    if ALT_SCREEN_ACTIVE.swap(false, std::sync::atomic::Ordering::SeqCst) {
+        let _ = err.write_all(esc::SYNC_END.as_bytes());
+        let _ = err.write_all(esc::ALT_SCREEN_OFF.as_bytes());
+    }
     let _ = err.write_all(restore_sequence().as_bytes());
     let _ = err.flush();
     sys::restore_console();

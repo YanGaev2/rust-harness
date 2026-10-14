@@ -18,12 +18,12 @@ use crate::model_client::{ModelClientError, OpenAiCompatibleModelClient};
 use crate::prompt::DEFAULT_SYSTEM_PROMPT;
 use crate::providers::{
     AuthScheme, BuiltinProvider, CachePolicy, ChatApiFormat, ModelChoice, ModelDiscovery,
-    ProviderConfig,
+    ProviderConfig, provider_from_profile,
 };
 use crate::repl::{ReplError, ReplOptions, run_chat_tui, run_terminal_repl};
 use crate::request::{CacheMode, ChatMessage, RequestEnvelope};
 use crate::runtime::{RuntimeError, ToolCall, ToolRuntime, ToolScheduler};
-use crate::tui::{TuiAction, TuiError, TuiProviderDraft, run_tui};
+use crate::tui::{TuiAction, TuiError, run_tui};
 
 pub fn run<I, W>(args: I, output: &mut W) -> Result<(), CliError>
 where
@@ -345,12 +345,24 @@ pub fn finish_tui_setup_action<W: Write>(
     let workspace = workspace.into();
 
     match action {
-        TuiAction::SaveProvider(draft) => {
-            let provider = provider_config_from_tui_draft(draft);
+        TuiAction::SaveProvider { provider, model } => {
+            let provider_name = provider.name().to_string();
             save_provider(provider, config_path.clone(), output)?;
-            default_repl_launch_from_config(config_path, workspace, command_name, output)
+            writeln!(
+                output,
+                "Starting {command_name} with {provider_name}/{model}"
+            )?;
+            Ok(DefaultReplLaunch {
+                config_path,
+                workspace,
+                provider_name,
+                model,
+            })
         }
-        TuiAction::Exit | TuiAction::Continue | TuiAction::Command(_) => Err(CliError::Usage(
+        TuiAction::Exit
+        | TuiAction::Continue
+        | TuiAction::Command(_)
+        | TuiAction::FetchModels(_) => Err(CliError::Usage(
             "provider setup cancelled from interface".to_string(),
         )),
     }
@@ -836,10 +848,8 @@ where
     if flags.add_all {
         let client =
             OpenAiCompatibleModelClient::new(flags.timeout.unwrap_or(Duration::from_secs(15)));
-        let discovery = client.list_models(&provider)?;
-        for model in discovery.add_all_model_ids() {
-            provider = provider.with_model(model);
-        }
+        let (discovered, discovery) = client.discover(provider)?;
+        provider = discovered.with_discovered_models(&discovery, &discovery.add_all_model_ids());
     } else {
         for model in flags.models {
             provider = provider.with_model(model);
@@ -884,10 +894,10 @@ where
         flags.key = Some(prompt_value(input, output, "API key: ")?);
     }
 
-    let mut provider = flags.provider()?;
+    let provider = flags.provider()?;
     let config_path = flags.config_path();
     let client = OpenAiCompatibleModelClient::new(flags.timeout.unwrap_or(Duration::from_secs(15)));
-    let discovery = client.list_models(&provider)?;
+    let (provider, discovery) = client.discover(provider)?;
 
     writeln!(output, "Available models:")?;
     for (index, choice) in discovery.choices().iter().enumerate() {
@@ -898,9 +908,8 @@ where
     }
 
     let selection = prompt_value(input, output, "Choose model number or id: ")?;
-    for model in selected_models(&discovery, &selection)? {
-        provider = provider.with_model(model);
-    }
+    let provider =
+        provider.with_discovered_models(&discovery, &selected_models(&discovery, &selection)?);
 
     save_provider(provider, config_path, output)
 }
@@ -919,25 +928,6 @@ fn save_provider<W: Write>(
     )?;
 
     Ok(())
-}
-
-/// Provider seeded from the builtin profile when the name matches a family,
-/// plain otherwise.
-fn provider_from_profile(name: String, url: String, key: String) -> ProviderConfig {
-    if let Some(builtin) = BuiltinProvider::from_name(&name) {
-        let profile = builtin.profile();
-        ProviderConfig::new(profile.name, url, key)
-            .with_auth_scheme(profile.auth_scheme)
-            .with_cache_policy(profile.cache_policy)
-            .with_chat_api(profile.chat_api)
-            .with_key_env(profile.key_env)
-    } else {
-        ProviderConfig::new(name, url, key)
-    }
-}
-
-pub fn provider_config_from_tui_draft(draft: TuiProviderDraft) -> ProviderConfig {
-    provider_from_profile(draft.name, draft.base_url, draft.api_key).with_model(draft.model)
 }
 
 fn selected_models(discovery: &ModelDiscovery, selection: &str) -> Result<Vec<String>, CliError> {

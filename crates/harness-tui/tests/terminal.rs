@@ -41,8 +41,10 @@ fn cursor_and_sync_escapes_are_standard() {
     assert_eq!(esc::SYNC_END, "\x1b[?2026l");
     assert_eq!(esc::BRACKETED_PASTE_ON, "\x1b[?2004h");
     assert_eq!(esc::BRACKETED_PASTE_OFF, "\x1b[?2004l");
-    assert_eq!(esc::MOUSE_ON, "\x1b[?1000h\x1b[?1006h");
-    assert_eq!(esc::MOUSE_OFF, "\x1b[?1006l\x1b[?1000l");
+    assert_eq!(esc::MOUSE_ON, "\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+    assert_eq!(esc::MOUSE_OFF, "\x1b[?1006l\x1b[?1002l\x1b[?1000l");
+    assert_eq!(esc::ALT_SCREEN_ON, "\x1b[?1049h");
+    assert_eq!(esc::ALT_SCREEN_OFF, "\x1b[?1049l");
     assert_eq!(esc::CLEAR_LINE, "\x1b[2K");
 }
 
@@ -53,6 +55,28 @@ fn restore_sequence_undoes_every_mode_we_set() {
     assert!(seq.contains(esc::MOUSE_OFF));
     assert!(seq.contains(esc::BRACKETED_PASTE_OFF));
     assert!(seq.contains(esc::SHOW_CURSOR));
+    // Only a session that entered the alternate screen leaves it.
+    assert!(!seq.contains(esc::ALT_SCREEN_OFF));
+}
+
+#[test]
+fn osc_52_carries_base64_of_the_utf8_text() {
+    assert_eq!(esc::copy_to_clipboard(""), "\x1b]52;c;\x07");
+    assert_eq!(esc::copy_to_clipboard("M"), "\x1b]52;c;TQ==\x07");
+    assert_eq!(esc::copy_to_clipboard("Ma"), "\x1b]52;c;TWE=\x07");
+    assert_eq!(esc::copy_to_clipboard("Man"), "\x1b]52;c;TWFu\x07");
+    assert_eq!(esc::copy_to_clipboard("ё"), "\x1b]52;c;0ZE=\x07");
+}
+
+#[test]
+fn a_terminal_on_the_alternate_screen_leaves_it_on_drop() {
+    let buf = SharedBuf::default();
+    let mut terminal = Terminal::with_backend(Box::new(buf.clone()));
+    terminal.set_alt_screen(true);
+    drop(terminal);
+    let out = buf.contents();
+    assert!(out.contains(esc::ALT_SCREEN_OFF), "{out:?}");
+    assert!(out.ends_with(restore_sequence()), "{out:?}");
 }
 
 // Platform queries must be safe to call in any environment. Under the
@@ -189,6 +213,13 @@ fn background_report_parses_any_hex_width_and_terminator() {
         Some((255, 250, 240))
     );
     assert_eq!(parse_background_report(b"\x1b[1;1R"), None, "no OSC reply");
+    // The OSC 10 (text color) reply sits next to it in the same stream.
+    let both = b"\x1b]10;rgb:cccc/cccc/cccc\x1b\\\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\\x1b[1;1R";
+    assert_eq!(
+        harness_tui::terminal::parse_foreground_report(both),
+        Some((0xcc, 0xcc, 0xcc))
+    );
+    assert_eq!(parse_background_report(both), Some((0x0c, 0x0c, 0x0c)));
 }
 
 #[test]

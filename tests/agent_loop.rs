@@ -79,6 +79,8 @@ fn agent_run_accumulates_cache_aware_usage_and_estimates_cost() {
     assert_eq!(usage.prompt_tokens, 3000);
     assert_eq!(usage.cached_tokens, 2400);
     assert_eq!(usage.completion_tokens, 30);
+    // The context is the latest request's conversation, not a running sum.
+    assert_eq!(usage.context_tokens, 2020);
     assert_eq!(usage_events, 2, "one usage event per round");
 
     // 600 fresh * $0.435 + 2400 cached * $0.003625 + 30 out * $0.87, per 1M.

@@ -134,6 +134,49 @@ fn empty_search_result_says_no_matches_instead_of_silence() {
 }
 
 #[test]
+fn a_search_without_matches_names_what_it_skipped() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(
+        root.path().join(".gitignore"),
+        "/target
+",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("target/debug")).unwrap();
+    std::fs::write(
+        root.path().join("target/debug/build.rs"),
+        "profile
+",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("main.rs"),
+        "fn main() {}
+",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    // "no matches" must not read as "not in the project" when the walk
+    // left gitignored directories out (models expect ripgrep's rules).
+    let result = runtime
+        .execute(ToolCall::new(
+            "s-ign",
+            "grep_search",
+            json!({"pattern": "profile", "path": ""}),
+        ))
+        .unwrap();
+    assert!(result.ok, "{result:?}");
+    assert!(
+        result
+            .content
+            .contains("skipped hidden or gitignored: target — pass one as path to search it"),
+        "{}",
+        result.content
+    );
+}
+
+#[test]
 fn search_returns_context_lines_around_matches() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -1629,4 +1672,90 @@ fn envelope_key_alongside_real_args_is_not_unwrapped() {
         .unwrap();
     assert_eq!(result.tool_name, "file.read");
     assert!(result.ok, "path must arrive untouched: {result:?}");
+}
+
+#[test]
+fn search_clips_long_lines_around_the_match_and_caps_the_output() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("dist")).unwrap();
+    std::fs::create_dir(root.path().join("logs")).unwrap();
+    // A minified bundle: the hit sits deep inside one 200 KB line.
+    let bundle = format!(
+        "{}retryBudget:7,backoffMs:250{}",
+        "x".repeat(100_000),
+        "y".repeat(100_000)
+    );
+    std::fs::write(root.path().join("dist/app.min.js"), bundle).unwrap();
+    // A log with more hits than 64 KB of output can hold.
+    let log: String = (0..2000)
+        .map(|i| {
+            format!(
+                "{{\"id\":{i},\"status\":429,\"body\":\"{}\"}}\n",
+                "p".repeat(300)
+            )
+        })
+        .collect();
+    std::fs::write(root.path().join("logs/requests.jsonl"), log).unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let hit = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "grep_search",
+            json!({"query": "retryBudget", "path": "dist"}),
+        ))
+        .unwrap();
+    assert!(
+        hit.content.contains("retryBudget:7,backoffMs:250"),
+        "the hit and its neighbourhood survive: {}",
+        hit.content
+    );
+    assert!(hit.content.len() < 1_000, "{} bytes", hit.content.len());
+
+    let flood = runtime
+        .execute(ToolCall::new(
+            "c2",
+            "grep_search",
+            json!({"query": "\"status\":429", "path": "logs"}),
+        ))
+        .unwrap();
+    assert!(
+        flood.content.len() <= 64 * 1024,
+        "{} bytes",
+        flood.content.len()
+    );
+    // The model learns that it saw a part and how to get the rest.
+    let note = flood.content.lines().last().unwrap();
+    assert!(
+        note.contains("of 200+ matches") && note.contains("narrow"),
+        "{note}"
+    );
+    assert_eq!(flood.metadata["truncated"], true);
+}
+
+#[test]
+fn search_says_how_to_read_a_clipped_line() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("data")).unwrap();
+    // The field the caller wants sits far after the hit.
+    let line = format!(
+        "{{\"id\":\"evt-1\",\"blob\":\"{}\",\"checksum\":\"abc\"}}\n",
+        "b".repeat(3000)
+    );
+    std::fs::write(root.path().join("data/events.jsonl"), line).unwrap();
+    let runtime = ToolRuntime::new(root.path());
+
+    let hit = runtime
+        .execute(ToolCall::new(
+            "c1",
+            "grep_search",
+            json!({"query": "evt-1", "path": "data"}),
+        ))
+        .unwrap();
+    assert!(!hit.content.contains("checksum"), "{}", hit.content);
+    let note = hit.content.lines().last().unwrap();
+    assert!(
+        note.contains("cut to 500 bytes") && note.contains("run_shell_command"),
+        "{note}"
+    );
 }

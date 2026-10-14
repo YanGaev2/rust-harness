@@ -1408,7 +1408,7 @@ fn read_openai_stream_full<R, F>(
     url: &str,
 ) -> Result<ChatResponse, ChatClientError>
 where
-    R: std::io::Read,
+    R: std::io::Read + Send + 'static,
     F: FnMut(StreamDelta),
 {
     let mut usage = TokenUsage::default();
@@ -1418,9 +1418,10 @@ where
     // Set by [DONE] or a finish_reason; EOF without either means the stream
     // was cut mid-answer and must surface as an error, not a shorter answer.
     let mut completed = false;
-    let reader = BufReader::new(reader);
+    let mut saw_done = false;
+    let mut reader = BufReader::new(reader);
 
-    for line in reader.lines() {
+    for line in (&mut reader).lines() {
         // Cooperative cancel between chunks: stop reading and hand back what
         // has accumulated so far; the caller decides how to report the abort.
         if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
@@ -1442,6 +1443,7 @@ where
         }
         if data == "[DONE]" {
             completed = true;
+            saw_done = true;
             break;
         }
 
@@ -1496,6 +1498,12 @@ where
             std::io::ErrorKind::UnexpectedEof,
             "stream ended without completion (no [DONE] or finish_reason)",
         )));
+    }
+    // ureq returns a connection to the pool only once its body is read to
+    // the end. Drain what follows [DONE] off-thread: the answer is complete,
+    // and a server that keeps the body open must not stall the agent.
+    if saw_done {
+        std::thread::spawn(move || std::io::copy(&mut reader, &mut std::io::sink()));
     }
 
     let tool_calls = tools

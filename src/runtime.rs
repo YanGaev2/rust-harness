@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 use crate::platform::ShellProfile;
 use crate::request::ToolSpec;
 use crate::tools::attachments::{AttachmentError, AttachmentTool};
-use crate::tools::files::{FileTool, ToolError, WriteMode};
+use crate::tools::files::{FileTool, SEARCH_LINE_MAX_BYTES, ToolError, WriteMode};
 use crate::tools::shell::{DEFAULT_MAX_OUTPUT_BYTES, ShellError, ShellTool};
 use crate::tools::web::{DEFAULT_FETCH_MAX_CHARS, DEFAULT_SEARCH_COUNT, WebError, WebTool};
 
@@ -897,33 +897,82 @@ impl ToolRuntime {
         // An empty string reads as "did the search even run?" — say what
         // happened instead (bench run5: the model met bare emptiness 8
         // times while probing patterns).
+        let mut shown = 0;
         let content = if result.matches.is_empty() {
-            format!(
+            let mut note = format!(
                 "no matches for '{query}' (searched {} files)",
                 result.scanned_files
-            )
+            );
+            // Say what was not searched, so "no matches" is not read as
+            // "not in the project".
+            if !result.skipped.is_empty() {
+                let shown: Vec<&str> = result
+                    .skipped
+                    .iter()
+                    .take(SKIPPED_SHOWN)
+                    .map(String::as_str)
+                    .collect();
+                let more = result.skipped.len().saturating_sub(SKIPPED_SHOWN);
+                note.push_str(&format!(
+                    "; skipped hidden or gitignored: {}{} — pass one as path to search it",
+                    shown.join(", "),
+                    if more > 0 {
+                        format!(" and {more} more")
+                    } else {
+                        String::new()
+                    }
+                ));
+            }
+            note
         } else {
-            result
-                .matches
+            let mut content = String::new();
+            for entry in &result.matches {
+                // grep -n -C rendering: context lines use dashes, the
+                // matching line uses colons.
+                let mut block = String::new();
+                for (number, text) in &entry.before {
+                    block.push_str(&format!("{}-{}-{}\n", entry.path, number, text));
+                }
+                block.push_str(&format!(
+                    "{}:{}:{}",
+                    entry.path, entry.line_number, entry.line
+                ));
+                for (number, text) in &entry.after {
+                    block.push_str(&format!("\n{}-{}-{}", entry.path, number, text));
+                }
+                // The same output budget as shell.exec, with room for the note.
+                if content.len() + block.len() + 200 > DEFAULT_MAX_OUTPUT_BYTES {
+                    break;
+                }
+                if shown > 0 {
+                    content.push('\n');
+                }
+                content.push_str(&block);
+                shown += 1;
+            }
+            let mut notes = Vec::new();
+            if shown < result.matches.len() || result.truncated {
+                let more = if result.truncated { "+" } else { "" };
+                notes.push(format!(
+                    "showing {shown} of {}{more} matches; narrow `query` or `path` to see the rest",
+                    result.matches.len()
+                ));
+            }
+            let clipped = result.matches[..shown]
                 .iter()
-                .map(|entry| {
-                    // grep -n -C rendering: context lines use dashes, the
-                    // matching line uses colons.
-                    let mut block = String::new();
-                    for (number, text) in &entry.before {
-                        block.push_str(&format!("{}-{}-{}\n", entry.path, number, text));
-                    }
-                    block.push_str(&format!(
-                        "{}:{}:{}",
-                        entry.path, entry.line_number, entry.line
-                    ));
-                    for (number, text) in &entry.after {
-                        block.push_str(&format!("\n{}-{}-{}", entry.path, number, text));
-                    }
-                    block
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .filter(|entry| entry.clipped)
+                .count();
+            if clipped > 0 {
+                // file.read has no line offset; the shell reads one line.
+                notes.push(format!(
+                    "{clipped} matching lines are cut to {SEARCH_LINE_MAX_BYTES} bytes around the match; read a whole line with {}",
+                    wire_tool_name("shell.exec")
+                ));
+            }
+            if !notes.is_empty() {
+                content.push_str(&format!("\n[{}]", notes.join("; ")));
+            }
+            content
         };
 
         Ok(ToolCallResult {
@@ -937,9 +986,11 @@ impl ToolRuntime {
             content,
             metadata: json!({
                 "matches": result.matches.len(),
+                "shown": shown,
                 "scanned_files": result.scanned_files,
                 "skipped_large_files": result.skipped_large_files,
-                "truncated": result.truncated,
+                "skipped": result.skipped.len(),
+                "truncated": result.truncated || shown < result.matches.len(),
             }),
         })
     }
@@ -1136,6 +1187,9 @@ fn batch_mutates_shared_paths(calls: &[ToolCall]) -> bool {
 
 /// Argument aliases shared by the executors, the batch conflict detector and
 /// the chat's tool cards — single lists so they can never drift apart.
+/// Skipped paths named in a "no matches" search result.
+const SKIPPED_SHOWN: usize = 8;
+
 pub(crate) const PATH_ALIASES: &[&str] = &[
     "path",
     "file",

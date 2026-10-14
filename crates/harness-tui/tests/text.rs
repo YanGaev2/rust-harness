@@ -1,4 +1,50 @@
-use harness_tui::text::{Color, Line, Span, Style, render_ansi, visible_width, wrap, wrap_hanging};
+use harness_tui::text::{
+    Color, Line, Span, Style, columns_text, highlight, render_ansi, visible_width, wrap,
+    wrap_hanging,
+};
+
+#[test]
+fn highlight_restyles_only_the_selected_columns() {
+    let line = Line {
+        spans: vec![
+            Span::raw("ab"),
+            Span::styled("cd", Style::fg(Color::Ansi(1))),
+        ],
+    };
+    let lit = highlight(&line, 1, 3, |style| style.bg(Color::Ansi(4)));
+    assert_eq!(lit.text(), "abcd");
+    let styles: Vec<(String, Style)> = lit
+        .spans
+        .iter()
+        .map(|span| (span.text.clone(), span.style))
+        .collect();
+    assert_eq!(
+        styles,
+        vec![
+            ("a".to_string(), Style::default()),
+            ("b".to_string(), Style::default().bg(Color::Ansi(4))),
+            (
+                "c".to_string(),
+                Style::fg(Color::Ansi(1)).bg(Color::Ansi(4))
+            ),
+            ("d".to_string(), Style::fg(Color::Ansi(1))),
+        ]
+    );
+}
+
+#[test]
+fn columns_text_cuts_by_display_columns() {
+    // A double-width ideograph covers columns 2 and 3.
+    let line = Line::raw("ab\u{597d}cd");
+    assert_eq!(columns_text(&line, 0, 2), "ab");
+    assert_eq!(columns_text(&line, 2, 4), "\u{597d}");
+    assert_eq!(columns_text(&line, 4, 99), "cd");
+    assert_eq!(
+        columns_text(&line, 3, 4),
+        "",
+        "a cell belongs to its first column"
+    );
+}
 
 #[test]
 fn wrap_hanging_indents_continuations_and_consumes_break_spaces() {

@@ -5,8 +5,8 @@
 use harness_cli::agent::AgentEvent;
 use harness_cli::chat::{BusyAction, ChatAction, ChatApp};
 use harness_cli::runtime::ToolBatchResult;
-use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Color, Line};
+use harness_tui::input::{Event, KeyCode, KeyEvent, MouseEvent, MouseKind};
+use harness_tui::text::{Color, Line, visible_width};
 use serde_json::json;
 
 fn app() -> ChatApp {
@@ -58,13 +58,14 @@ fn cost_command_reports_session_tokens_and_dated_estimate() {
         prompt_tokens: 1_000_000,
         cached_tokens: 800_000,
         completion_tokens: 50_000,
+        ..Default::default()
     }));
     app.set_busy(false);
 
     let action = submit_message(&mut app, "/cost");
     assert_eq!(action, ChatAction::Continue);
 
-    let (lines, _) = app.peek_scrollback(120);
+    let lines = app.transcript_lines(120);
     let text = lines_text(&lines);
     assert!(text.contains("1000000"), "prompt tokens: {text}");
     assert!(text.contains("800000"), "cached tokens: {text}");
@@ -84,15 +85,16 @@ fn cost_command_without_pricing_still_reports_tokens() {
         prompt_tokens: 500,
         cached_tokens: 0,
         completion_tokens: 20,
+        ..Default::default()
     }));
     app.set_busy(false);
 
     submit_message(&mut app, "/cost");
-    let (lines, _) = app.peek_scrollback(120);
+    let lines = app.transcript_lines(120);
     let text = lines_text(&lines);
     assert!(text.contains("500"), "{text}");
     assert!(
-        text.contains("no built-in pricing"),
+        text.contains("no pricing known"),
         "must be honest about the missing price list: {text}"
     );
 }
@@ -133,7 +135,7 @@ fn esc_arms_a_confirmation_and_only_the_second_esc_exits() {
     let mut app = app();
     // First Esc: no exit, the status row asks for a confirming press.
     assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
-    let status = lines_text(&app.panel_lines(120, 10));
+    let status = lines_text(&app.frame(120, 10));
     assert!(
         status.contains("Press Esc again to exit"),
         "missing confirmation hint: {status}"
@@ -148,7 +150,7 @@ fn any_other_key_disarms_the_exit_confirmation() {
     app.handle_key(key(KeyCode::Char('h')));
     // The armed state was dropped: the next Esc starts over.
     assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
-    let status = lines_text(&app.panel_lines(120, 10));
+    let status = lines_text(&app.frame(120, 10));
     assert!(status.contains("Press Esc again to exit"), "{status}");
 }
 
@@ -273,7 +275,7 @@ fn small_paste_is_inserted_verbatim() {
 fn welcome_banner_names_the_build_model_and_workspace() {
     let mut app = ChatApp::new("deepseek/deepseek-v4-pro", "C:/work/project");
     app.push_banner("0.1.0");
-    let text = lines_text(&app.take_scrollback(80));
+    let text = lines_text(&app.transcript_lines(80));
     assert!(text.contains("harness"), "{text}");
     assert!(text.contains("0.1.0"), "{text}");
     assert!(text.contains("deepseek/deepseek-v4-pro"), "{text}");
@@ -327,49 +329,6 @@ fn ctrl_v_requests_clipboard_capture_and_callback_inserts() {
     assert_eq!(app.input(), "pasted from clipboard");
 }
 
-// --- resize repaint: re-wrap the emitted tail at the new width ---
-
-#[test]
-fn viewport_tail_rewraps_emitted_entries_and_excludes_live_ones() {
-    let mut app = app();
-    submit_message(&mut app, "first message with quite a few words in it");
-    let (_, through) = app.peek_scrollback(80);
-    app.acknowledge_emitted(through);
-    // A second entry that was never flushed must not appear: the panel
-    // renders it as the live tail, so the repaint would duplicate it.
-    submit_message(&mut app, "second unflushed");
-
-    let tail = app.viewport_tail(20, 30);
-    let text = lines_text(&tail);
-    assert!(text.contains("first message"), "{text}");
-    assert!(!text.contains("second unflushed"), "{text}");
-    // Re-wrapped to the new width: no rendered line exceeds 20 columns.
-    for line in &tail {
-        assert!(
-            line.text().chars().count() <= 20,
-            "line wider than 20: {:?}",
-            line.text()
-        );
-    }
-}
-
-#[test]
-fn viewport_tail_returns_only_the_last_rows() {
-    let mut app = app();
-    submit_message(&mut app, "oldest entry");
-    submit_message(&mut app, "newest entry");
-    let (_, through) = app.peek_scrollback(80);
-    app.acknowledge_emitted(through);
-
-    let tail = app.viewport_tail(80, 2);
-    assert!(tail.len() <= 2, "got {} lines", tail.len());
-    let text = lines_text(&tail);
-    assert!(text.contains("newest"), "{text}");
-    assert!(!text.contains("oldest"), "{text}");
-}
-
-// --- slash commands ---
-
 #[test]
 fn slash_paste_requests_clipboard_capture() {
     // Windows Terminal binds Ctrl+V to its own paste action, so the 0x16 byte
@@ -401,14 +360,14 @@ fn slash_retain_thinking_toggles_and_reports_state() {
     let action = submit_message(&mut app, "/retain-thinking");
     assert_eq!(action, ChatAction::Continue);
     assert!(!app.retain_thinking());
-    let (lines, _) = app.peek_scrollback(120);
+    let lines = app.transcript_lines(120);
     let text = lines_text(&lines);
     assert!(text.contains("retain thinking: off"), "{text}");
 
     let action = submit_message(&mut app, "/retain-thinking");
     assert_eq!(action, ChatAction::Continue);
     assert!(app.retain_thinking());
-    let (lines, _) = app.peek_scrollback(120);
+    let lines = app.transcript_lines(120);
     let text = lines_text(&lines);
     assert!(text.contains("retain thinking: on"), "{text}");
 }
@@ -481,7 +440,7 @@ fn slash_model_no_args_opens_interactive_picker() {
     let action = submit_message(&mut app, "/model");
     assert_eq!(action, ChatAction::Continue);
     assert!(app.model_picker_visible());
-    let panel = lines_text(&app.panel_lines(100, 30));
+    let panel = lines_text(&app.frame(100, 30));
     // Cursor starts on the active pair, which also carries the check mark.
     assert!(panel.contains("› deepseek-v4-pro [deepseek] ✓"));
     assert!(panel.contains("deepseek-v4-flash [deepseek]"));
@@ -502,7 +461,7 @@ fn picker_cursor_starts_on_active_pair() {
         ("glm".to_string(), vec!["glm-5.2".to_string()]),
     ]);
     submit_message(&mut app, "/model");
-    let panel = lines_text(&app.panel_lines(100, 30));
+    let panel = lines_text(&app.frame(100, 30));
     assert!(panel.contains("› glm-5.2 [glm] ✓"));
     assert!(panel.contains("(3/3)"));
 }
@@ -542,7 +501,7 @@ fn picker_typing_filters_and_enter_picks_the_match() {
     for ch in "glm".chars() {
         app.handle_key(key(KeyCode::Char(ch)));
     }
-    let panel = lines_text(&app.panel_lines(100, 30));
+    let panel = lines_text(&app.frame(100, 30));
     assert!(panel.contains("(1/1)"));
     // Picker rows tag the provider in brackets; the filtered-out deepseek
     // rows are gone (the status row still shows the active deepseek label).
@@ -638,28 +597,28 @@ fn slash_provider_shows_active_provider() {
 }
 
 #[test]
-fn slash_new_returns_new_session_and_resets_emitted() {
+fn slash_new_returns_new_session_and_empties_the_transcript() {
     let mut app = app();
     app.push_user_message("old turn");
-    app.take_scrollback(80);
-    assert!(app.emitted() > 0);
+    assert!(lines_text(&app.frame(80, 20)).contains("old turn"));
 
     let action = submit_message(&mut app, "/new");
     assert_eq!(action, ChatAction::NewSession);
     assert!(app.transcript_text().is_empty());
-    assert_eq!(app.emitted(), 0);
+    assert!(app.transcript_lines(80).is_empty());
+    assert!(!lines_text(&app.frame(80, 20)).contains("old turn"));
     assert_eq!(app.input(), "");
 }
 
 #[test]
-fn slash_clear_empties_transcript_and_resets_emitted() {
+fn slash_clear_empties_the_transcript_on_screen_too() {
     let mut app = app();
-    app.push_user_message("hi");
-    app.take_scrollback(80);
+    app.push_user_message("hi there");
+    assert!(lines_text(&app.frame(80, 20)).contains("hi there"));
     let action = submit_message(&mut app, "/clear");
-    assert_eq!(action, ChatAction::ClearScreen);
+    assert_eq!(action, ChatAction::Continue);
     assert!(app.transcript_text().is_empty());
-    assert_eq!(app.emitted(), 0);
+    assert!(!lines_text(&app.frame(80, 20)).contains("hi there"));
 }
 
 #[test]
@@ -670,7 +629,7 @@ fn slash_help_opens_palette_and_any_key_closes_it() {
     assert!(app.help_visible());
 
     // The palette content is part of the pinned panel.
-    let panel = lines_text(&app.panel_lines(100, 20));
+    let panel = lines_text(&app.frame(100, 20));
     assert!(panel.contains("Commands"));
     assert!(panel.contains("/model [N | MODEL | PROVIDER MODEL]"));
 
@@ -873,8 +832,8 @@ fn started(app: &mut ChatApp, id: &str, name: &str, arguments: serde_json::Value
     });
 }
 
-fn card_rows(app: &ChatApp, width: usize) -> Vec<String> {
-    app.panel_lines(width, 40)
+fn card_rows(app: &mut ChatApp, width: usize) -> Vec<String> {
+    app.frame(width, 40)
         .iter()
         .map(Line::text)
         .filter(|row| !row.is_empty())
@@ -891,7 +850,7 @@ fn running_card_shows_a_spinner_and_the_headline_argument() {
         "read_file",
         json!({"file_path": "src/chat.rs"}),
     );
-    let rows = card_rows(&app, 80);
+    let rows = card_rows(&mut app, 80);
     let card = rows
         .iter()
         .find(|row| row.contains("file.read"))
@@ -916,7 +875,7 @@ fn search_card_shows_pattern_and_path() {
         "grep",
         json!({"pattern": "fn main", "path": "src"}),
     );
-    let rows = card_rows(&app, 80);
+    let rows = card_rows(&mut app, 80);
     assert!(
         rows.iter().any(|row| row.contains("fn main · src")),
         "{rows:?}"
@@ -938,7 +897,7 @@ fn shell_card_shows_the_output_tail_and_a_failing_exit_code() {
         metadata: json!({"exit_code": 101}),
         ..ok_result("c1", "shell.exec", &output)
     }));
-    let rows = card_rows(&app, 80);
+    let rows = card_rows(&mut app, 80);
     let card = rows
         .iter()
         .position(|row| row.contains("shell.exec cargo test"))
@@ -948,6 +907,60 @@ fn shell_card_shows_the_output_tail_and_a_failing_exit_code() {
     assert_eq!(rows[card + 2], "    line 4");
     assert_eq!(rows[card + 6], "    line 8");
     assert_eq!(rows[card + 7], "    exit 101");
+}
+
+#[test]
+fn failed_shell_card_keeps_the_output_tail_not_a_bare_failed() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "shell.exec",
+        json!({"command": "cargo test"}),
+    );
+    app.push_agent_event(&AgentEvent::ToolResult(ToolBatchResult {
+        ok: false,
+        metadata: json!({"exit_code": 101}),
+        ..ok_result("c1", "shell.exec", "test a ... ok\ntest b ... FAILED\n")
+    }));
+    let rows = card_rows(&mut app, 80);
+    let card = rows
+        .iter()
+        .position(|row| row.contains("shell.exec cargo test"))
+        .unwrap();
+    assert!(rows[card].starts_with("✗ "), "{:?}", rows[card]);
+    assert_eq!(rows[card + 1], "  ⎿ test a ... ok");
+    assert_eq!(rows[card + 2], "    test b ... FAILED");
+    assert_eq!(rows[card + 3], "    exit 101");
+    assert!(
+        !rows.iter().any(|row| row.ends_with("⎿ failed")),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn timed_out_shell_card_says_why() {
+    let mut app = app();
+    app.set_busy(true);
+    started(
+        &mut app,
+        "c1",
+        "shell.exec",
+        json!({"command": "cargo build"}),
+    );
+    app.push_agent_event(&AgentEvent::ToolResult(ToolBatchResult {
+        ok: false,
+        error: Some("shell command timed out after 30s".to_string()),
+        ..ok_result("c1", "shell.exec", "Compiling harness\n")
+    }));
+    let rows = card_rows(&mut app, 80);
+    let card = rows
+        .iter()
+        .position(|row| row.contains("shell.exec cargo build"))
+        .unwrap();
+    assert_eq!(rows[card + 1], "  ⎿ Compiling harness");
+    assert_eq!(rows[card + 2], "    shell command timed out after 30s");
 }
 
 #[test]
@@ -965,7 +978,7 @@ fn edit_card_shows_a_colored_diff_from_the_call_arguments() {
         "file.replace",
         "replaced 1 occurrence(s) in a.txt",
     )));
-    let lines = app.panel_lines(40, 40);
+    let lines = app.frame(40, 40);
     let rows: Vec<String> = lines.iter().map(Line::text).collect();
     let card = rows
         .iter()
@@ -994,7 +1007,7 @@ fn read_card_reports_size_not_the_first_line() {
         "file.read",
         "alpha\nbeta\ngamma\n",
     )));
-    let rows = card_rows(&app, 80);
+    let rows = card_rows(&mut app, 80);
     assert!(rows.iter().any(|row| row == "  ⎿ 3 lines"), "{rows:?}");
     assert!(!rows.iter().any(|row| row.contains("alpha")), "{rows:?}");
 }
@@ -1008,7 +1021,7 @@ fn failed_card_shows_the_error_in_the_error_color() {
         error: Some("file not found: missing.txt".to_string()),
         ..ok_result("c1", "file.read", "")
     }));
-    let lines = app.panel_lines(80, 40);
+    let lines = app.frame(80, 40);
     let error = lines
         .iter()
         .find(|line| line.text().contains("file not found"))
@@ -1033,7 +1046,7 @@ fn run_end_marks_unfinished_calls_interrupted() {
         json!({"command": "sleep 100"}),
     );
     app.set_busy(false);
-    let flushed: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    let flushed: Vec<String> = app.transcript_lines(80).iter().map(Line::text).collect();
     assert!(
         flushed
             .iter()
@@ -1066,7 +1079,7 @@ fn assistant_markdown_renders_heading_and_bullet() {
         "# Title\n- item".to_string(),
     ));
 
-    let panel = lines_text(&app.panel_lines(100, 50));
+    let panel = lines_text(&app.frame(100, 50));
     assert!(panel.contains("Title"));
     assert!(!panel.contains("# Title"));
     assert!(panel.contains("• item"));
@@ -1080,7 +1093,7 @@ fn assistant_markdown_table_renders_aligned_without_pipes() {
             .to_string(),
     ));
 
-    let panel = lines_text(&app.panel_lines(120, 60));
+    let panel = lines_text(&app.frame(120, 60));
     assert!(!panel.contains('|'), "pipes must not leak: {panel}");
     let rows: Vec<&str> = panel.lines().collect();
     let header = rows.iter().find(|row| row.contains("Name")).unwrap();
@@ -1092,19 +1105,183 @@ fn assistant_markdown_table_renders_aligned_without_pipes() {
     );
 }
 
+/// The six-column table from a real Kimi answer: far wider than a terminal.
+const WIDE_TABLE: &str = "| # | Область | Где | Проблема | Что сделать | Эффект |\n\
+|---|---|---|---|---|---|\n\
+| 1 | Сборка | `Cargo.toml` | Нет `[profile.release]`: без LTO, 16 CU, с символами; бинарь 4.55 МБ | `lto=\"thin\"`, `codegen-units=1`, `strip=true` | -20-30% размера, быстрее холодный старт |\n\
+| 2 | Сеть | `src/http.rs` | Новый `ureq::Agent` на каждый запрос, TCP+TLS хендшейк на каждом раунде | Мемоизировать агент по ключу | Секунды на многораундовом ране |";
+
+/// The table rows of a rendered transcript, without the entry indent.
+fn grid_rows(app: &mut ChatApp, width: usize) -> Vec<String> {
+    app.transcript_lines(width)
+        .iter()
+        .map(|line| line.text().trim_start().to_string())
+        .filter(|row| row.starts_with(['┌', '│', '├', '└']))
+        .collect()
+}
+
+#[test]
+fn table_is_a_full_grid_with_alignment_and_escaped_pipes() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(
+        "| Cmd | Count |\n|---|---:|\n| `ls \\| wc` | 5 |\n| `a|b` | 100 |".to_string(),
+    ));
+    assert_eq!(
+        grid_rows(&mut app, 80),
+        [
+            "┌─────────┬───────┐",
+            "│ Cmd     │ Count │",
+            "├─────────┼───────┤",
+            "│ ls | wc │     5 │",
+            "├─────────┼───────┤",
+            "│ a|b     │   100 │",
+            "└─────────┴───────┘",
+        ]
+    );
+}
+
+#[test]
+fn wide_table_wraps_text_inside_the_cells() {
+    for width in [80, 100, 165] {
+        let mut app = app();
+        app.push_agent_event(&AgentEvent::FinalContentDelta(WIDE_TABLE.to_string()));
+        for line in app.transcript_lines(width) {
+            assert!(line.width() <= width, "row overflows {width}: {line:?}");
+        }
+        let rows = grid_rows(&mut app, width);
+        // A closed rectangle: every row as wide as the top border, and a rule
+        // under the header and between the two data rows.
+        let top = visible_width(&rows[0]);
+        assert!(
+            rows.iter().all(|row| visible_width(row) == top),
+            "{rows:#?}"
+        );
+        assert!(rows[0].starts_with('┌') && rows.last().unwrap().starts_with('└'));
+        assert_eq!(rows.iter().filter(|row| row.starts_with('├')).count(), 2);
+        if width >= 100 {
+            // Columns are wide enough for every word: wrapping loses none.
+            let text = rows.join(" ");
+            for word in ["[profile.release]:", "codegen-units=1,", "многораундовом"] {
+                assert!(text.contains(word), "{word} in {rows:#?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn long_code_line_wraps_with_a_continuation_marker() {
+    let source = r"\begin{longtable}{@{}p{0.04\textwidth}p{0.11\textwidth}p{0.16\textwidth}p{0.27\textwidth}@{}}";
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(format!(
+        "```latex\n{source}\n```"
+    )));
+    let lines = app.transcript_lines(40);
+
+    for line in &lines {
+        assert!(line.width() <= 40, "row overflows: {line:?}");
+    }
+    let rows: Vec<String> = lines.iter().map(|line| line.text()).collect();
+    let first = rows
+        .iter()
+        .position(|row| row.trim_start().starts_with(r"\begin"))
+        .expect("first code row");
+    let tail: Vec<&String> = rows[first + 1..]
+        .iter()
+        .take_while(|row| row.trim_start().starts_with('↪'))
+        .collect();
+    assert!(!tail.is_empty(), "continuations are marked: {rows:#?}");
+    // Stripping the markers gives back the source line.
+    let rebuilt = std::iter::once(rows[first].trim())
+        .chain(
+            tail.iter()
+                .map(|row| row.trim_start().trim_start_matches("↪ ")),
+        )
+        .collect::<String>();
+    assert_eq!(rebuilt, source);
+}
+
+#[test]
+fn math_in_answers_renders_as_unicode() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(
+        r"Корни $x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}$, сложность \(O(N^2)\), цена $5 и $10.
+
+$$
+\sum_{i=1}^{n} x_i^2
+$$
+
+Тулы web_search / web_fetch."
+            .to_string(),
+    ));
+    let rows: Vec<String> = app
+        .transcript_lines(120)
+        .iter()
+        .map(|line| line.text().trim().to_string())
+        .collect();
+    for expected in [
+        "Корни x = (-b ± √(b²-4ac))/(2a), сложность O(N²), цена $5 и $10.",
+        // A display block is a line of its own.
+        "∑ᵢ₌₁ⁿ xᵢ²",
+        // `_` inside a word is not emphasis.
+        "Тулы web_search / web_fetch.",
+    ] {
+        assert!(
+            rows.iter().any(|row| row == expected),
+            "{expected} in {rows:#?}"
+        );
+    }
+}
+
+#[test]
+fn display_math_still_streaming_stays_raw_text() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta(
+        "$$\n\\sum_i x_i".to_string(),
+    ));
+    let text = lines_text(&app.transcript_lines(80));
+    assert!(
+        text.contains("$$") && text.contains(r"\sum_i x_i"),
+        "{text}"
+    );
+}
+
+#[test]
+fn copy_command_copies_the_last_answer_as_raw_markdown() {
+    let mut app = app();
+    assert_eq!(submit_message(&mut app, "/copy"), ChatAction::Continue);
+    assert!(lines_text(&app.frame(80, 20)).contains("nothing to copy"));
+
+    app.push_agent_event(&AgentEvent::FinalContentDelta("first answer".to_string()));
+    app.push_user_message("again");
+    app.push_agent_event(&AgentEvent::FinalContentDelta(WIDE_TABLE.to_string()));
+    assert_eq!(
+        submit_message(&mut app, "/copy"),
+        ChatAction::Copy(WIDE_TABLE.to_string())
+    );
+    assert!(lines_text(&app.frame(80, 20)).contains("copied"));
+
+    // A local command: it copies at once while the agent works.
+    app.set_busy(true);
+    assert_eq!(
+        submit_message(&mut app, "/copy"),
+        ChatAction::Copy(WIDE_TABLE.to_string())
+    );
+    assert_eq!(app.queued_len(), 0);
+}
+
 // --- panel ---
 
 #[test]
 fn panel_contains_editor_prompt_and_status_row() {
     let mut app = app();
-    let panel = lines_text(&app.panel_lines(100, 20));
+    let panel = lines_text(&app.frame(100, 20));
     assert!(panel.contains("Ask anything"));
     assert!(panel.contains("deepseek/deepseek-v4-pro"));
     assert!(panel.contains("C:/work/project"));
 
     // The editor prompt row keeps the "› " prefix once text is typed.
     type_text(&mut app, "next question");
-    let panel = lines_text(&app.panel_lines(100, 20));
+    let panel = lines_text(&app.frame(100, 20));
     assert!(panel.contains("› next question"));
 }
 
@@ -1112,11 +1289,7 @@ fn panel_contains_editor_prompt_and_status_row() {
 fn editor_sits_between_full_width_rules_without_side_borders() {
     let mut app = app();
     type_text(&mut app, "hello");
-    let rows: Vec<String> = app
-        .panel_lines(40, 20)
-        .iter()
-        .map(|line| line.text())
-        .collect();
+    let rows: Vec<String> = app.frame(40, 20).iter().map(|line| line.text()).collect();
     let editor = rows
         .iter()
         .position(|row| row.contains("› hello"))
@@ -1133,7 +1306,7 @@ fn editor_sits_between_full_width_rules_without_side_borders() {
 fn user_turn_is_a_full_width_strip() {
     let mut app = app();
     app.push_user_message("a question long enough to wrap onto a second row");
-    let lines = app.take_scrollback(30);
+    let lines = app.transcript_lines(30);
     let strip: Vec<&Line> = lines.iter().filter(|line| line.width() > 0).collect();
     assert!(strip.len() >= 2, "expected a wrapped turn: {strip:?}");
     for row in &strip {
@@ -1161,7 +1334,7 @@ fn assistant_answer_is_unmarked_and_code_copies_clean() {
     app.push_agent_event(&AgentEvent::FinalContentDelta(
         "Run this:\n```rust\nfn main() {}\n```".to_string(),
     ));
-    let rows: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    let rows: Vec<String> = app.transcript_lines(80).iter().map(Line::text).collect();
     assert_eq!(rows[0], "  Run this:", "no marker, two-column indent");
     assert_eq!(rows[1], "  ```rust", "fences stay literal");
     assert_eq!(rows[2], "  fn main() {}", "code has no gutter glyph");
@@ -1172,7 +1345,7 @@ fn assistant_answer_is_unmarked_and_code_copies_clean() {
 fn answer_trailing_newlines_add_no_extra_blank_rows() {
     let mut app = app();
     app.push_agent_event(&AgentEvent::FinalContentDelta("done.\n\n".to_string()));
-    let rows: Vec<String> = app.take_scrollback(80).iter().map(Line::text).collect();
+    let rows: Vec<String> = app.transcript_lines(80).iter().map(Line::text).collect();
     // The answer row, then exactly one separator row.
     assert_eq!(rows, vec!["  done.".to_string(), String::new()]);
 }
@@ -1183,7 +1356,7 @@ fn ordered_list_items_hang_under_their_text() {
     app.push_agent_event(&AgentEvent::FinalContentDelta(
         "12. alpha beta gamma delta".to_string(),
     ));
-    let rows: Vec<String> = app.take_scrollback(16).iter().map(Line::text).collect();
+    let rows: Vec<String> = app.transcript_lines(16).iter().map(Line::text).collect();
     assert_eq!(rows[0], "  12. alpha");
     assert!(
         rows[1].starts_with("      "),
@@ -1194,10 +1367,9 @@ fn ordered_list_items_hang_under_their_text() {
 #[test]
 fn reasoning_is_never_italic() {
     let mut app = app();
-    submit_message(&mut app, "/thinking");
     app.push_agent_event(&AgentEvent::Thinking("weighing options".to_string()));
     app.push_agent_event(&AgentEvent::FinalContentDelta("done".to_string()));
-    let lines = app.take_scrollback(80);
+    let lines = app.transcript_lines(80);
     assert!(lines_text(&lines).contains("weighing options"));
     let reasoning: Vec<&Line> = lines
         .iter()
@@ -1218,7 +1390,7 @@ fn live_reasoning_shows_a_timer_and_only_the_newest_rows() {
     app.set_busy(true);
     let text: String = (1..=9).map(|i| format!("step {i}\n")).collect();
     app.push_agent_event(&AgentEvent::Thinking(text));
-    let panel = lines_text(&app.panel_lines(80, 30));
+    let panel = lines_text(&app.frame(80, 30));
     assert!(panel.contains("∴ Thinking… 0s"), "{panel}");
     assert!(
         panel.contains("step 9") && panel.contains("step 6"),
@@ -1231,67 +1403,17 @@ fn live_reasoning_shows_a_timer_and_only_the_newest_rows() {
 }
 
 #[test]
-fn finished_reasoning_commits_as_one_summary_line() {
-    let mut app = app();
-    app.set_busy(true);
-    app.push_agent_event(&AgentEvent::Thinking("secret plan\nmore".to_string()));
-    app.push_agent_event(&AgentEvent::FinalContentDelta("answer".to_string()));
-    let flushed = lines_text(&app.take_scrollback(80));
-    assert!(
-        flushed.contains("∴ Thought for 1s · ctrl+o to expand"),
-        "{flushed}"
-    );
-    assert!(
-        !flushed.contains("secret plan"),
-        "collapsed by default: {flushed}"
-    );
-    // The plain projection (traces, non-TTY) keeps the full text.
-    assert!(app.transcript_text().contains("thinking: secret plan"));
-}
-
-#[test]
 fn run_end_closes_a_reasoning_block_that_was_still_streaming() {
     let mut app = app();
     app.set_busy(true);
     app.push_agent_event(&AgentEvent::Thinking("half a thought".to_string()));
     app.set_busy(false);
-    let flushed = lines_text(&app.take_scrollback(80));
+    let flushed = lines_text(&app.transcript_lines(80));
     assert!(flushed.contains("∴ Thought for"), "{flushed}");
     assert!(
         !flushed.contains("Thinking…"),
         "no live header in history: {flushed}"
     );
-}
-
-#[test]
-fn ctrl_o_replays_the_latest_reasoning_in_full() {
-    let mut app = app();
-    app.push_agent_event(&AgentEvent::Thinking("first idea".to_string()));
-    app.push_agent_event(&AgentEvent::FinalContentDelta("one".to_string()));
-    app.push_agent_event(&AgentEvent::Thinking("second idea".to_string()));
-    app.push_agent_event(&AgentEvent::FinalContentDelta("two".to_string()));
-    app.take_scrollback(80);
-    assert_eq!(
-        app.handle_key(KeyEvent::ctrl(KeyCode::Char('o'))),
-        ChatAction::Continue
-    );
-    let replay = lines_text(&app.take_scrollback(80));
-    assert!(replay.contains("second idea"), "{replay}");
-    assert!(
-        !replay.contains("first idea"),
-        "only the latest block: {replay}"
-    );
-    assert!(
-        !replay.contains("ctrl+o"),
-        "the expanded copy needs no hint: {replay}"
-    );
-}
-
-#[test]
-fn ctrl_o_without_reasoning_says_so() {
-    let mut app = app();
-    app.handle_key(KeyEvent::ctrl(KeyCode::Char('o')));
-    assert!(app.transcript_text().contains("no reasoning to show yet"));
 }
 
 #[test]
@@ -1304,7 +1426,7 @@ fn status_row_shows_git_branch_and_session_usage() {
     )
     .unwrap();
     let mut app = ChatApp::new("deepseek/deepseek-v4-pro", workspace.path());
-    let status = app.panel_lines(120, 10).pop().unwrap().text();
+    let status = app.frame(120, 10).pop().unwrap().text();
     assert!(status.contains("(feature/tui)"), "{status:?}");
     assert!(!status.contains('↑'), "no usage before the first response");
 
@@ -1314,10 +1436,97 @@ fn status_row_shows_git_branch_and_session_usage() {
         prompt_tokens: 12_300,
         cached_tokens: 6_150,
         completion_tokens: 3_400,
+        ..Default::default()
     }));
     app.set_busy(false);
-    let status = app.panel_lines(120, 10).pop().unwrap().text();
+    let status = app.frame(120, 10).pop().unwrap().text();
     assert!(status.contains("↑12.3k ↓3.4k · cache 50%"), "{status:?}");
+}
+
+fn context_usage(app: &mut ChatApp, context_tokens: u64) {
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::UsageUpdated(harness_cli::agent::UsageTotals {
+        requests: 1,
+        prompt_tokens: context_tokens,
+        context_tokens,
+        ..Default::default()
+    }));
+    app.set_busy(false);
+}
+
+fn status(app: &mut ChatApp, width: usize) -> Line {
+    app.frame(width, 10).pop().unwrap()
+}
+
+/// Color of the context bar: its first span after the model and usage.
+fn bar_color(line: &Line) -> Color {
+    line.spans
+        .iter()
+        .find(|span| span.text.contains('█'))
+        .map(|span| span.style.fg)
+        .expect("a filled bar cell")
+}
+
+#[test]
+fn status_row_shows_how_full_the_context_window_is() {
+    let mut app = app();
+    app.set_context_window(Some(1_048_576));
+    let before = status(&mut app, 140).text();
+    assert!(
+        !before.contains("1M"),
+        "no meter before the first response: {before:?}"
+    );
+
+    context_usage(&mut app, 474_000);
+    let row = status(&mut app, 140);
+    let text = row.text();
+    assert!(text.ends_with("████▌░░░░░ 474k/1M 45% "), "{text:?}");
+    assert!(text.contains("deepseek/deepseek-v4-pro"), "{text:?}");
+    assert_eq!(row.width(), 140);
+}
+
+#[test]
+fn the_context_bar_turns_warning_then_error_as_it_fills() {
+    let theme = harness_tui::theme::Theme::dark();
+    let mut app = app();
+    app.set_context_window(Some(200_000));
+    context_usage(&mut app, 50_000);
+    assert_eq!(bar_color(&status(&mut app, 140)), theme.success);
+    context_usage(&mut app, 140_000);
+    assert_eq!(bar_color(&status(&mut app, 140)), theme.warning);
+    context_usage(&mut app, 190_000);
+    let row = status(&mut app, 140);
+    assert_eq!(bar_color(&row), theme.error);
+    assert!(row.text().contains("190k/200k 95%"), "{:?}", row.text());
+}
+
+#[test]
+fn context_without_a_known_window_shows_the_token_count() {
+    let mut app = app();
+    context_usage(&mut app, 45_210);
+    let text = status(&mut app, 140).text();
+    assert!(text.ends_with("ctx 45.2k "), "{text:?}");
+    assert!(!text.contains('░'), "no bar without a window: {text:?}");
+}
+
+#[test]
+fn a_narrow_status_row_keeps_the_context_meter_over_session_totals() {
+    let mut app = app();
+    app.set_context_window(Some(1_048_576));
+    context_usage(&mut app, 474_000);
+    let text = status(&mut app, 70).text();
+    assert!(text.contains("474k/1M 45%"), "{text:?}");
+    assert!(!text.contains('↑'), "session totals go first: {text:?}");
+}
+
+#[test]
+fn a_new_session_resets_the_context_meter() {
+    let mut app = app();
+    app.set_context_window(Some(1_048_576));
+    context_usage(&mut app, 474_000);
+    submit_message(&mut app, "/new");
+    let text = status(&mut app, 140).text();
+    assert!(!text.contains("474k"), "{text:?}");
 }
 
 #[test]
@@ -1326,7 +1535,7 @@ fn busy_panel_shows_working_row_with_spacer_and_live_entry() {
     app.push_user_message("long task");
     app.set_busy(true);
 
-    let lines = app.panel_lines(100, 20);
+    let lines = app.frame(100, 20);
     let panel = lines_text(&lines);
     assert!(panel.contains("long task"), "live entry stays visible");
 
@@ -1348,179 +1557,362 @@ fn panel_caps_live_rows_to_the_tail() {
     for i in 0..30 {
         app.push_system_line(format!("note {i}"));
     }
-    let panel = lines_text(&app.panel_lines(100, 10));
+    let panel = lines_text(&app.frame(100, 10));
     assert!(!panel.contains("note 0"), "old rows drop off the cap");
     assert!(panel.contains("note 29"), "the newest rows stay visible");
 }
 
-// --- scrollback flushing ---
+// --- transcript rows ---
 
 #[test]
-fn long_streaming_answer_freezes_prefix_into_scrollback() {
-    let mut app = app();
-    app.push_user_message("вопрос");
-    app.set_busy(true);
-    app.take_scrollback(80);
-
-    let mut delta = String::new();
-    for i in 0..30 {
-        delta.push_str(&format!("параграф {i}\n\n"));
-    }
-    app.push_agent_event(&AgentEvent::FinalContentDelta(delta));
-    app.freeze_streaming_overflow(80, 10);
-
-    // The frozen prefix flushes to scrollback while STILL busy…
-    let (frozen, limit) = app.peek_scrollback(80);
-    let frozen_text = lines_text(&frozen);
-    assert!(
-        frozen_text.contains("параграф 0"),
-        "frozen prefix must flush: {frozen_text}"
-    );
-    app.acknowledge_emitted(limit);
-
-    // …the live tail stays within budget and keeps the newest text…
-    let live = lines_text(&app.panel_lines(80, 10));
-    assert!(
-        live.contains("параграф 29"),
-        "newest text stays live: {live}"
-    );
-    assert!(
-        !live.contains("параграф 0"),
-        "head must not be live: {live}"
-    );
-
-    // …and further deltas keep appending to the live tail.
-    app.push_agent_event(&AgentEvent::FinalContentDelta("хвост".to_string()));
-    let live = lines_text(&app.panel_lines(80, 10));
-    assert!(live.contains("хвост"));
-
-    // The continuation renders without a second "● " bullet.
-    app.set_busy(false);
-    let (tail, _) = app.peek_scrollback(80);
-    assert!(
-        !lines_text(&tail).contains('●'),
-        "continuation must not repeat the marker: {}",
-        lines_text(&tail)
-    );
-}
-
-#[test]
-fn freeze_never_splits_inside_a_code_fence() {
-    let mut app = app();
-    app.set_busy(true);
-    let mut text = String::from("intro\n\n```rust\n");
-    for i in 0..30 {
-        text.push_str(&format!("let x{i} = {i};\n\n"));
-    }
-    app.push_agent_event(&AgentEvent::FinalContentDelta(text));
-    app.freeze_streaming_overflow(80, 10);
-
-    let (frozen, _) = app.peek_scrollback(80);
-    let flushed = lines_text(&frozen);
-    // The only safe boundary is right after "intro" — blank lines inside
-    // the unclosed fence must not be used.
-    assert!(flushed.contains("intro"), "{flushed}");
-    assert!(
-        !flushed.contains("let x0"),
-        "split landed inside the fence: {flushed}"
-    );
-}
-
-#[test]
-fn freeze_without_safe_boundary_leaves_the_entry_alone() {
-    let mut app = app();
-    app.set_busy(true);
-    // One giant paragraph: no blank lines at all.
-    let text = "слово ".repeat(2000);
-    app.push_agent_event(&AgentEvent::FinalContentDelta(text));
-    app.freeze_streaming_overflow(80, 10);
-    // Nothing to flush — the entry stays live (head-clip is the backstop).
-    let (frozen, _) = app.peek_scrollback(80);
-    assert!(frozen.is_empty());
-}
-
-#[test]
-fn peek_scrollback_is_side_effect_free_until_acknowledged() {
-    let mut app = app();
-    app.push_user_message("hi");
-    app.push_system_line("note");
-
-    let (first, limit) = app.peek_scrollback(80);
-    assert!(!first.is_empty());
-    assert_eq!(app.emitted(), 0, "peek must not advance emitted");
-
-    // A failed terminal write means the same plan is offered again.
-    let (second, limit_again) = app.peek_scrollback(80);
-    assert_eq!(limit, limit_again);
-    assert_eq!(lines_text(&first), lines_text(&second));
-
-    app.acknowledge_emitted(limit);
-    assert_eq!(app.emitted(), limit);
-    let (third, _) = app.peek_scrollback(80);
-    assert!(third.is_empty());
-}
-
-#[test]
-fn take_scrollback_flushes_user_and_system_while_busy_but_not_running_tool() {
-    let mut app = app();
-    app.push_user_message("hello");
-    app.push_system_line("note");
-    app.push_agent_event(&AgentEvent::ToolCallStarted {
-        round: 1,
-        id: "c1".to_string(),
-        name: "file.read".to_string(),
-        arguments: json!({"path": "Cargo.toml"}),
-    });
-    app.set_busy(true);
-
-    let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("› hello"), "user turn flushes: {flushed}");
-    assert!(flushed.contains("· note"), "system line flushes");
-    assert!(
-        !flushed.contains("file.read"),
-        "a Running tool card must stay live"
-    );
-    assert_eq!(app.emitted(), 2);
-
-    // Once the run ends everything flushes.
-    app.set_busy(false);
-    let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("file.read"));
-    assert_eq!(app.emitted(), app.transcript_len());
-}
-
-#[test]
-fn take_scrollback_keeps_streaming_assistant_live_while_busy() {
-    let mut app = app();
-    app.push_user_message("question");
-    app.set_busy(true);
-    app.push_agent_event(&AgentEvent::FinalContentDelta("partial answer".to_string()));
-
-    let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("› question"));
-    assert!(
-        !flushed.contains("partial answer"),
-        "the streaming tail must stay in the live panel"
-    );
-
-    app.set_busy(false);
-    let flushed = lines_text(&app.take_scrollback(80));
-    assert!(flushed.contains("partial answer"));
-    assert_eq!(app.emitted(), app.transcript_len());
-}
-
-#[test]
-fn take_scrollback_appends_a_blank_line_after_each_entry() {
+fn transcript_lines_put_a_blank_line_after_each_entry() {
     let mut app = app();
     app.push_user_message("hello");
     app.push_system_line("note");
 
-    let lines = app.take_scrollback(80);
+    let lines = app.transcript_lines(80);
     let texts: Vec<String> = lines.iter().map(|line| line.text()).collect();
     assert_eq!(texts.iter().filter(|text| text.is_empty()).count(), 2);
     assert!(texts.last().unwrap().is_empty(), "trailing blank line");
-    // Nothing left to flush on a second call.
-    assert!(app.take_scrollback(80).is_empty());
+    // The transcript is not consumed: the exit print sees it all again.
+    assert_eq!(app.transcript_lines(80), lines);
+}
+
+// --- reasoning display ---
+
+fn thinking_steps(app: &mut ChatApp, steps: usize) {
+    let text: String = (1..=steps).map(|i| format!("step {i}\n")).collect();
+    app.push_agent_event(&AgentEvent::Thinking(text));
+    app.push_agent_event(&AgentEvent::FinalContentDelta("answer".to_string()));
+}
+
+#[test]
+fn finished_reasoning_keeps_its_newest_four_rows_under_the_header() {
+    let mut app = app();
+    thinking_steps(&mut app, 9);
+    let rows: Vec<String> = app.transcript_lines(80).iter().map(Line::text).collect();
+    let header = rows
+        .iter()
+        .position(|row| row.starts_with("∴ Thought for"))
+        .expect("header");
+    assert!(
+        rows[header].ends_with("· +5 lines · ctrl+o to expand"),
+        "{:?}",
+        rows[header]
+    );
+    assert_eq!(rows[header + 1].trim(), "step 6");
+    assert_eq!(rows[header + 4].trim(), "step 9");
+    assert!(!rows.iter().any(|row| row.trim() == "step 5"), "{rows:?}");
+    // The plain projection (traces, non-TTY) keeps the full text.
+    assert!(app.transcript_text().contains("step 1"));
+}
+
+#[test]
+fn short_reasoning_needs_no_expand_hint() {
+    let mut app = app();
+    thinking_steps(&mut app, 2);
+    let text = lines_text(&app.transcript_lines(80));
+    assert!(text.contains("step 1") && text.contains("step 2"), "{text}");
+    assert!(!text.contains("ctrl+o"), "{text}");
+}
+
+#[test]
+fn ctrl_o_expands_every_reasoning_block_in_place_and_folds_it_back() {
+    let mut app = app();
+    thinking_steps(&mut app, 9);
+    let folded = app.transcript_lines(80);
+    let entries = app.transcript_len();
+
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('o')));
+    let expanded = lines_text(&app.transcript_lines(80));
+    assert_eq!(
+        app.transcript_len(),
+        entries,
+        "no new entry, the same block grows"
+    );
+    assert!(
+        expanded.contains("step 1") && expanded.contains("step 9"),
+        "{expanded}"
+    );
+    assert!(expanded.contains("ctrl+o to fold"), "{expanded}");
+    assert!(
+        lines_text(&app.frame(80, 30)).contains("reasoning expanded"),
+        "the status row confirms the toggle"
+    );
+
+    app.handle_key(KeyEvent::ctrl(KeyCode::Char('o')));
+    assert_eq!(app.transcript_lines(80), folded);
+}
+
+#[test]
+fn the_exit_transcript_drops_key_hints_and_reveals_everything() {
+    let mut app = app().with_animations(true);
+    thinking_steps(&mut app, 9);
+    let printed = lines_text(&app.exit_transcript(80));
+    assert!(printed.contains("∴ Thought for"), "{printed}");
+    assert!(printed.contains("+5 lines"), "{printed}");
+    assert!(
+        !printed.contains("ctrl+o"),
+        "keys do not work after exit: {printed}"
+    );
+    assert!(
+        printed.contains("answer"),
+        "animated text is fully shown: {printed}"
+    );
+    // The live screen keeps its hints.
+    assert!(lines_text(&app.transcript_lines(80)).contains("ctrl+o to expand"));
+}
+
+#[test]
+fn slash_thinking_hides_reasoning_and_shows_it_again() {
+    let mut app = app();
+    thinking_steps(&mut app, 3);
+    submit_message(&mut app, "/thinking");
+    let hidden = lines_text(&app.transcript_lines(80));
+    assert!(
+        !hidden.contains("step 1") && !hidden.contains("∴"),
+        "{hidden}"
+    );
+    assert!(hidden.contains("thinking: hidden"), "{hidden}");
+    assert!(hidden.contains("answer"));
+
+    submit_message(&mut app, "/thinking");
+    let shown = lines_text(&app.transcript_lines(80));
+    assert!(
+        shown.contains("step 1") && shown.contains("∴ Thought for"),
+        "{shown}"
+    );
+}
+
+// --- full-screen frame ---
+
+#[test]
+fn frame_fills_the_screen_with_the_status_row_on_the_bottom_edge() {
+    let mut app = app();
+    app.push_banner("0.1.0");
+    app.push_user_message("hello");
+    let frame = app.frame(60, 20);
+    assert_eq!(frame.len(), 20);
+    assert!(
+        frame[0].text().starts_with("harness"),
+        "banner on top: {:?}",
+        frame[0].text()
+    );
+    assert!(frame[19].text().contains("deepseek/deepseek-v4-pro"));
+    let editor = frame
+        .iter()
+        .position(|line| line.text().contains("Ask anything"))
+        .unwrap();
+    assert_eq!(editor, 17, "editor right above its rule and the status row");
+}
+
+fn long_app(rows: usize) -> ChatApp {
+    let mut app = app();
+    for i in 0..rows {
+        app.push_system_line(format!("note {i}"));
+    }
+    app
+}
+
+#[test]
+fn wheel_and_page_keys_scroll_the_transcript_and_the_rule_says_how_far() {
+    let mut app = long_app(40);
+    let bottom = lines_text(&app.frame(60, 20));
+    assert!(
+        bottom.contains("note 39") && !bottom.contains("note 20"),
+        "{bottom}"
+    );
+
+    app.handle_event(Event::WheelUp);
+    let scrolled = lines_text(&app.frame(60, 20));
+    assert!(!scrolled.contains("note 39"), "{scrolled}");
+    assert!(scrolled.contains("↓ 3 more rows · PgDn"), "{scrolled}");
+
+    app.handle_key(key(KeyCode::PageUp));
+    let paged = lines_text(&app.frame(60, 20));
+    // A page is the transcript area (16 rows here) minus two rows of overlap.
+    assert!(paged.contains("↓ 17 more rows"), "{paged}");
+
+    app.handle_key(key(KeyCode::PageDown));
+    app.handle_event(Event::WheelDown);
+    app.handle_event(Event::WheelDown);
+    let back = lines_text(&app.frame(60, 20));
+    assert!(
+        back.contains("note 39") && !back.contains("more rows"),
+        "{back}"
+    );
+}
+
+#[test]
+fn a_scrolled_view_stays_put_while_new_rows_arrive_and_submit_jumps_down() {
+    let mut app = long_app(40);
+    app.frame(60, 20);
+    for _ in 0..3 {
+        app.handle_event(Event::WheelUp);
+    }
+    let before = app.frame(60, 20);
+    app.push_system_line("fresh news");
+    let after = app.frame(60, 20);
+    let rows = |frame: &[Line]| frame[..10].iter().map(Line::text).collect::<Vec<_>>();
+    assert_eq!(rows(&before), rows(&after), "the visible rows do not move");
+    assert!(!lines_text(&after).contains("fresh news"));
+
+    submit_message(&mut app, "next question");
+    let jumped = lines_text(&app.frame(60, 20));
+    assert!(jumped.contains("next question"), "{jumped}");
+}
+
+#[test]
+fn scrolling_past_either_end_is_clamped() {
+    let mut app = long_app(40);
+    for _ in 0..100 {
+        app.handle_event(Event::WheelUp);
+    }
+    let top = lines_text(&app.frame(60, 20));
+    assert!(top.starts_with("· note 0"), "{top}");
+    for _ in 0..100 {
+        app.handle_event(Event::WheelDown);
+    }
+    assert!(lines_text(&app.frame(60, 20)).contains("note 39"));
+}
+
+// --- mouse selection ---
+
+fn mouse(kind: MouseKind, column: u16, row: u16) -> Event {
+    Event::Mouse(MouseEvent { kind, column, row })
+}
+
+#[test]
+fn dragging_over_the_transcript_copies_the_selected_text() {
+    let mut app = app();
+    app.push_system_line("alpha beta");
+    app.push_system_line("gamma delta");
+    let frame = app.frame(60, 20);
+    let first = frame
+        .iter()
+        .position(|line| line.text() == "· alpha beta")
+        .unwrap() as u16;
+    let second = frame
+        .iter()
+        .position(|line| line.text() == "· gamma delta")
+        .unwrap() as u16;
+
+    assert_eq!(
+        app.handle_event(mouse(MouseKind::Down, 8, first)),
+        ChatAction::Continue
+    );
+    assert_eq!(
+        app.handle_event(mouse(MouseKind::Drag, 6, second)),
+        ChatAction::Continue
+    );
+    let action = app.handle_event(mouse(MouseKind::Up, 6, second));
+    assert_eq!(action, ChatAction::Copy("beta\n\n· gamma".to_string()));
+
+    // The selection is painted and the status row confirms the copy.
+    let frame = app.frame(60, 20);
+    let lit = &frame[first as usize];
+    assert!(
+        lit.spans
+            .iter()
+            .any(|span| span.text.contains("beta") && span.style.bg != Color::Default),
+        "{lit:?}"
+    );
+    assert!(lines_text(&frame).contains("copied 13 chars"));
+
+    // Typing clears the highlight.
+    app.handle_key(key(KeyCode::Char('x')));
+    let frame = app.frame(60, 20);
+    assert!(
+        frame[first as usize]
+            .spans
+            .iter()
+            .all(|span| span.style.bg == Color::Default)
+    );
+}
+
+#[test]
+fn a_click_without_a_drag_copies_nothing() {
+    let mut app = app();
+    app.push_system_line("alpha");
+    app.frame(60, 20);
+    app.handle_event(mouse(MouseKind::Down, 3, 4));
+    assert_eq!(
+        app.handle_event(mouse(MouseKind::Up, 3, 4)),
+        ChatAction::Continue
+    );
+}
+
+#[test]
+fn a_drag_that_starts_on_the_panel_selects_nothing() {
+    let mut app = app();
+    app.frame(60, 20);
+    app.handle_event(mouse(MouseKind::Down, 3, 19));
+    app.handle_event(mouse(MouseKind::Drag, 9, 2));
+    assert_eq!(
+        app.handle_event(mouse(MouseKind::Up, 9, 2)),
+        ChatAction::Continue
+    );
+}
+
+#[test]
+fn right_click_pastes_like_the_terminal_does() {
+    let mut app = app();
+    assert_eq!(
+        app.handle_event(mouse(MouseKind::RightDown, 0, 0)),
+        ChatAction::CaptureClipboard
+    );
+}
+
+// --- paced reveal ---
+
+#[test]
+fn streamed_text_is_revealed_over_frames_and_fades_in() {
+    use std::time::{Duration, Instant};
+    let mut app = app()
+        .with_animations(true)
+        .with_terminal_colors(Some((220, 220, 220)), Some((10, 10, 10)));
+    let answer = "word ".repeat(120);
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::FinalContentDelta(answer.clone()));
+
+    let t0 = Instant::now();
+    app.animate(t0);
+    app.animate(t0 + Duration::from_millis(33));
+    let early = lines_text(&app.transcript_lines(200));
+    let shown = early.matches("word").count();
+    assert!(shown > 0 && shown < 120, "a slice is visible: {shown}");
+    assert!(app.is_animating());
+
+    // The newest characters are tinted toward the background.
+    let rows = app.transcript_lines(200);
+    let last = rows
+        .iter()
+        .rev()
+        .find(|line| !line.text().trim().is_empty())
+        .unwrap();
+    assert!(
+        last.spans
+            .iter()
+            .any(|span| matches!(span.style.fg, Color::Rgb(..))),
+        "{last:?}"
+    );
+
+    let mut now = t0 + Duration::from_millis(33);
+    for _ in 0..200 {
+        now += Duration::from_millis(33);
+        app.animate(now);
+    }
+    app.set_busy(false);
+    let done = lines_text(&app.transcript_lines(200));
+    assert_eq!(done.matches("word").count(), 120);
+    assert!(!app.is_animating(), "nothing left to animate");
+}
+
+#[test]
+fn without_animations_every_delta_shows_at_once() {
+    let mut app = app();
+    app.push_agent_event(&AgentEvent::FinalContentDelta("all of it".to_string()));
+    assert!(lines_text(&app.transcript_lines(80)).contains("all of it"));
 }
 
 // --- plain projection ---
@@ -1586,7 +1978,7 @@ fn enter_while_busy_queues_the_prompt_and_sends_it_after_the_run() {
     assert_eq!(action, ChatAction::Continue, "nothing is sent mid-run");
     assert_eq!(app.queued_len(), 1);
     assert_eq!(app.input(), "", "the editor is free for the next draft");
-    let panel = lines_text(&app.panel_lines(80, 20));
+    let panel = lines_text(&app.frame(80, 20));
     assert!(panel.contains("⏵ queued and then the docs"), "{panel}");
     assert!(
         panel.contains("Queue a follow-up"),
@@ -1628,36 +2020,6 @@ fn an_interrupted_run_hands_queued_prompts_back_to_the_editor() {
     assert_eq!(app.input(), "step one\nstep two\ndraft");
     assert_eq!(app.take_queued(), None);
 }
-
-#[test]
-fn stale_running_card_from_cancelled_run_does_not_block_next_flush() {
-    let mut app = app();
-    app.set_busy(true);
-    app.push_agent_event(&AgentEvent::ToolCallStarted {
-        round: 1,
-        id: "c-stale".to_string(),
-        name: "file.read".to_string(),
-        arguments: json!({"path": "a.txt"}),
-    });
-    // Cancelled run: no ToolResult ever arrives for the card.
-    app.set_busy(false);
-    assert!(!app.take_scrollback(80).is_empty());
-
-    // Next turn: finalized entries must keep flushing while busy even
-    // though a flushed Running card exists earlier in the transcript.
-    app.push_user_message("next question");
-    app.set_busy(true);
-    app.push_agent_event(&AgentEvent::FinalContentDelta("thinking...".to_string()));
-    let flushed = app.take_scrollback(80);
-    assert!(
-        flushed
-            .iter()
-            .any(|line| line.text().contains("next question")),
-        "user entry must flush during the next busy turn"
-    );
-}
-
-// --- editing keys ---
 
 #[test]
 fn modified_enter_and_ctrl_j_compose_newlines() {
@@ -1718,4 +2080,98 @@ fn up_moves_inside_a_multiline_prompt_before_recalling_history() {
         "older prompt",
         "Up on the first line recalls history"
     );
+}
+
+// --- /provider add ---
+
+#[test]
+fn provider_add_opens_the_wizard_fetches_and_saves() {
+    let mut app = app();
+    assert_eq!(
+        submit_message(&mut app, "/provider add"),
+        ChatAction::Continue
+    );
+    assert!(app.provider_wizard_open());
+    assert!(lines_text(&app.frame(100, 40)).contains("Select provider"));
+
+    app.handle_key(key(KeyCode::Up)); // wraps to custom
+    app.handle_key(key(KeyCode::Enter));
+    type_text(&mut app, "router");
+    app.handle_key(key(KeyCode::Enter));
+    type_text(&mut app, "https://router.example/v1");
+    app.handle_key(key(KeyCode::Enter));
+    // A pasted key keeps out of the chat editor.
+    app.handle_paste("sk-router\n");
+    let ChatAction::FetchModels(provider) = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("the key step must ask the loop for the model list");
+    };
+    assert_eq!(provider.api_key(), "sk-router");
+    assert!(lines_text(&app.frame(100, 40)).contains("Fetching models"));
+
+    let discovery = harness_cli::providers::ModelDiscovery::from_openai_compatible_response(
+        &provider,
+        r#"{"data":[{"id":"m-1"},{"id":"m-2","context_length":64000}]}"#,
+    )
+    .unwrap();
+    app.models_loaded(Ok((provider, discovery)));
+    app.handle_key(key(KeyCode::Down)); // Add all -> m-1
+    app.handle_key(key(KeyCode::Down)); // m-1 -> m-2
+    let ChatAction::SaveProvider { provider, model } = app.handle_key(key(KeyCode::Enter)) else {
+        panic!("Enter on a model must save");
+    };
+    assert_eq!(provider.name(), "router");
+    assert_eq!(model, "m-2");
+    assert!(!app.provider_wizard_open());
+    // The editor never saw the wizard's typing.
+    assert_eq!(submit_message(&mut app, ""), ChatAction::Continue);
+}
+
+#[test]
+fn esc_closes_the_provider_wizard_without_arming_exit() {
+    let mut app = app();
+    submit_message(&mut app, "/provider add");
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
+    assert!(!app.provider_wizard_open());
+    // The next Esc arms the exit confirmation; it does not exit yet.
+    assert_eq!(app.handle_key(key(KeyCode::Esc)), ChatAction::Continue);
+}
+
+#[test]
+fn provider_add_waits_for_a_busy_run_while_plain_provider_runs_at_once() {
+    let mut app = app();
+    app.set_busy(true);
+    submit_message(&mut app, "/provider add");
+    assert!(
+        !app.provider_wizard_open(),
+        "a fetch cannot run during a busy turn"
+    );
+    assert_eq!(app.queued_len(), 1);
+
+    submit_message(&mut app, "/provider");
+    assert_eq!(app.queued_len(), 1, "the listing still runs while busy");
+}
+
+#[test]
+fn cost_command_uses_prices_saved_from_the_model_list() {
+    let mut app = ChatApp::new("router/m-2", "C:/work/project");
+    app.set_pricing(Some(harness_cli::providers::ModelPricing {
+        input_per_mtok: 1.0,
+        cached_input_per_mtok: 1.0,
+        output_per_mtok: 2.0,
+        as_of: "2026-10-09".to_string(),
+    }));
+    app.set_busy(true);
+    app.push_agent_event(&AgentEvent::UsageUpdated(harness_cli::agent::UsageTotals {
+        requests: 1,
+        prompt_tokens: 1_000_000,
+        cached_tokens: 0,
+        completion_tokens: 1_000_000,
+        ..Default::default()
+    }));
+    app.set_busy(false);
+
+    submit_message(&mut app, "/cost");
+    let text = lines_text(&app.transcript_lines(120));
+    assert!(text.contains("$3.0000"), "{text}");
+    assert!(text.contains("2026-10-09"), "{text}");
 }

@@ -123,9 +123,23 @@ change.
 On first launch, if no provider is configured yet, `harness` opens a
 harness-tui terminal setup screen with a status header, workspace/config
 paths, command hints, and the `[no provider] >` prompt. From there, run
-`/provider add` to start provider setup from the interface; the current provider
-wizard still reuses the existing prompt flow. After a provider with at least one
-model is saved, the same launch starts the REPL with that provider; later
+`/provider add` to start the provider wizard:
+
+1. Select a built-in family, or `custom` for any OpenAI- or Anthropic-compatible API.
+2. For `custom`, type the provider name.
+3. Type the base URL (the address before `/models`). Built-in families fill it in.
+4. Type or paste the API key. Enter sends `GET {base URL}/models`.
+5. Select a model, or `Add all`. Type to filter the list. Enter saves.
+
+The wizard reads the model ids, the context window (`context_length`,
+`context_window`, `max_model_len`, Anthropic `max_input_tokens`) and the
+OpenRouter prices from the list. It saves them to `model_info` in
+`providers.json`. The chat uses the saved window for its context meter and the
+saved prices for `/cost`. A `custom` provider that rejects the Bearer key (401/403)
+gets a second request with `x-api-key` and `anthropic-version`. When that request
+succeeds, or the list has the Anthropic shape, the provider uses the Anthropic
+Messages API. When the request fails, Enter goes back to the URL and Tab lets you
+type the model id. After the save, the same launch starts the REPL with that provider; later
 `harness` opens the REPL directly. Non-interactive runs fall back to the
 line-mode setup screen so tests and pipes do not enter raw mode.
 
@@ -279,31 +293,59 @@ Start the interactive REPL. On a real terminal it opens the **harness-tui chat
 TUI** (our own line-based library in `crates/harness-tui`, no ratatui/crossterm);
 piped/non-TTY callers fall back to line mode. The chat TUI:
 
-- **Streams** responses over SSE (OpenAI-compatible providers). While the
-  model reasons, the panel shows `∴ Thinking… 4s` and the newest four lines.
-  When the block ends, the transcript keeps one line: `∴ Thought for 4s ·
-  ctrl+o to expand`. Ctrl+O prints the latest reasoning again in full.
-  `/thinking` keeps future reasoning expanded.
+- **Streams** responses over SSE (OpenAI-compatible providers). Text appears
+  at a steady pace, not in network bursts: the display trails the stream by
+  about 0.3 s, and the newest characters fade in from the background color.
+  The spinner and the `Working…` shimmer run on a clock, so they do not
+  speed up when deltas arrive fast.
+- Shows **reasoning** by default: a `∴ Thinking… 4s` header (then `∴ Thought
+  for 4s`) over the newest four lines of each block. Ctrl+O expands every
+  block in place and folds it back. `/thinking` hides reasoning and shows it
+  again.
 - Shows each **tool call** as a card. The status glyph is a spinner while the
   call runs, then `✓`, `✗`, or `○` (interrupted). The card shows the tool name
   and its main argument (command, query, pattern, path, URL), not raw JSON.
   Calls of 2s and longer show their time. `shell.exec` cards show the last
-  five output lines and a non-zero exit code. `file.replace` cards show a
-  diff on tinted rows. A `memo:` line appears when the forgiving runtime
+  five output lines and a non-zero exit code, also when the command failed;
+  a timeout shows its reason. `file.replace` cards show a diff on tinted
+  rows. A `memo:` line appears when the forgiving runtime
   corrected the call.
-- Uses a **native-scrollback screen**: finished chat blocks go into the
-  terminal's own scrollback. They stay selectable, wheel-scrollable, and
-  survive exit. Your turns are `›` lines on a full-width strip; answers have
-  no marker. Only the live panel is repainted: the streaming tail, the
-  `⠹ Working… (12s · ↓ 1.2k tokens · esc to interrupt)` row, the editor
+- Runs **full screen** (the alternate screen buffer). The editor and the
+  status line stay on the bottom edge while the transcript scrolls above
+  them: mouse wheel, PgUp/PgDn. When you scroll up, the rule above the
+  editor shows `↓ 42 more rows · PgDn`, and new output does not move the
+  view; sending a message jumps back to the newest rows. Your turns are `›`
+  lines on a full-width strip; answers have no marker. Below the transcript:
+  the `⠹ Working… (12s · ↓ 1.2k tokens · esc to interrupt)` row, the editor
   between two rules, and the status line. The status line shows the
   workspace and git branch on the left, the model and session tokens
   (`↑12.3k ↓3.4k · cache 85%`) on the right. Key hints appear there only
   when they apply.
+- Shows **how full the context window is** at the right end of the status
+  line: `████▌░░░░░ 474k/1M 45%`. The count is the latest request's prompt
+  plus completion, i.e. the conversation the next request carries. The
+  window comes from the provider's `/models` list (`context_length`,
+  `context_window` or `max_model_len`), fetched in the background at start
+  and after `/model`. The bar turns orange at 60% and red at 85%. When the
+  provider does not report a window (DeepSeek), the line shows `ctx 45.2k`.
+  On a narrow terminal the session totals go first, then the model name.
+- **Select with the mouse**: drag over the transcript to highlight text; on
+  release it goes to the clipboard (OSC 52) and the status line shows
+  `copied N chars`. The right button pastes. Shift+drag still gives the
+  terminal's own selection.
+- **On exit** the terminal shows its own screen again, as it was before the
+  session, and the conversation is printed into its scrollback (all text
+  revealed, no key hints).
 - Renders assistant answers as **Markdown**: headings, bullet and numbered
   lists, block quotes, tables, fenced code blocks, rules, and inline
   `**bold**`/`*italic*`/`` `code` ``. Code fences stay literal and code lines
-  have no gutter, so a mouse selection copies valid markdown.
+  have no gutter, so a selection copies valid markdown. Tables are a grid
+  with box-drawing borders and the column alignment of the separator row.
+  When a table is wider than the screen, text wraps inside its cells. A code
+  line wider than the screen continues on rows that start with `↪`. Math
+  (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) shows as one line of Unicode:
+  `$\alpha_1 \le x^2$` becomes `α₁ ≤ x²`. `/copy` puts the last answer on the
+  clipboard as raw markdown.
 - Picks its **palette from the terminal**: it asks the terminal for its
   background color (OSC 11) and uses a dark or a light 24-bit palette. On
   terminals without truecolor it uses the nearest 256 colors. Grays are
@@ -312,8 +354,8 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   input (`/p` → `/provider`, typed prefix highlighted, usage + description per row);
   Up/Down select, Tab completes, Esc closes, Enter runs. Typing `/model ` extends
   the menu with the saved provider/model pairs themselves.
-  Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider`, `/paste`,
-  `/history QUERY`, `/clear`, `/new`, `/cost`, `/thinking`,
+  Commands: `/model [N | MODEL | PROVIDER MODEL]`, `/provider [add]`, `/paste`,
+  `/copy`, `/history QUERY`, `/clear`, `/new`, `/cost`, `/thinking`,
   `/retain-thinking`, `/help`, `/exit`.
 - **Interactive model picker**: `/model` alone opens a selector under the
   input — `› deepseek-v4-pro [deepseek] ✓` rows (cursor marker, muted provider,
@@ -322,17 +364,16 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   name, or the full pair still switch directly. A model name the config has
   never seen switches to it AND saves it to the provider (`model X saved to
   provider Y`), so typing a brand-new model is enough to add it. `/provider`
-  lists all saved providers with their models. (The line-mode REPL prints the
+  lists all saved providers with their models. `/provider add` opens the same
+  provider wizard as the setup screen; after the save the chat switches to the
+  new provider. While the agent works, `/provider add` waits in the queue. (The line-mode REPL prints the
   same list as numbered text.)
 - **Resumes the last chat on launch**: the conversation is persisted per
   workspace and reloaded at startup (a `resumed session … (N messages)` notice
   appears in the transcript). `/new` abandons it and starts a fresh session.
-- **Docked layout with a welcome banner**: the conversation flows from the
-  top, and the editor and status rows sit on the bottom edge. Blank filler
-  between them belongs to the panel, so it never goes into the scrollback:
-  opening and closing a menu leaves no gap in the history. The startup
-  banner (`harness vX`, active model, workspace, key hints) is the first
-  transcript entry.
+- **Welcome banner**: the conversation flows from the top, blank rows fill
+  the space down to the editor. The startup banner (`harness vX`, active
+  model, workspace, key hints) is the first transcript entry.
 - **Type ahead while the agent works**: keys go to the editor during a run.
   Enter queues the prompt (`⏵ queued …` above the editor), and the queue is
   sent in order when the run ends. Local commands (`/help`, `/cost`,
@@ -364,16 +405,12 @@ piped/non-TTY callers fall back to line mode. The chat TUI:
   Windows Terminal in particular swallows it entirely when the clipboard holds
   an image (its own paste action finds no text and the key never reaches the
   app), so use `/paste` there.
-- Recalls prompt history with Up/Down. The transcript scrolls with the terminal's
-  own **mouse wheel and scrollbar** (the mouse is not captured), and text
-  selection/copy works natively.
-- **Survives window resizing without ghost panels**: width changes make the
-  terminal reflow its buffer, which used to smear the painted input panel into
-  broken border fragments. Now a width change erases the viewport immediately
-  and, once the size has been stable for ~150ms, repaints the visible
-  transcript tail and the panel re-wrapped to the new width (typed input is
-  preserved). Height changes take the same path, because the docked status
-  row keeps the cursor on the last row and the terminal may scroll.
+- Recalls prompt history with Up/Down.
+- **Survives window resizing**: the alternate screen has no scrollback for
+  the terminal to reflow, so a resize repaints every row at the new size.
+  The old inline screen let Windows Terminal push the painted panel into
+  its scrollback on resize (`ESC [2J` there scrolls the viewport up), which
+  left a ghost input box in the middle of the history.
 
 ```powershell
 harness repl --config .harness/providers.json --workspace . --provider custom --model deepseek-v4-pro --timeout-ms 60000 --max-rounds 4 --max-tool-concurrency 4 --tool-timeout-ms 10000
@@ -484,8 +521,9 @@ Done (each item is verified by tests and/or the agent benchmark):
 - ✅ Chat TUI — markdown rendering, slash-command autocomplete, interactive model picker, streaming tool cards
 - ✅ Session & trace persistence under `~/.harness` with resume on launch
 - ✅ Clipboard & attachments — Ctrl+V / `/paste`, PNG capture into `.harness/attachments`
-- ✅ Window-resize survival — immediate erase + 150 ms debounce + full repaint, no ghost panels
+- ✅ Window-resize survival — full-screen repaint, no ghost panels
 - ✅ TUI redesign — docked layout without history gaps, light/dark truecolor palette, collapsible reasoning, tool cards with output tails and diffs, type-ahead queue, editing keys, Windows Terminal profile
+- ✅ Full-screen chat — pinned editor, own scrolling, drag-to-copy (OSC 52), in-place reasoning expand, paced text reveal with fade-in
 - ✅ Agent self-awareness — environment line + harness usage notes in the system prompt
 
 Planned:
@@ -571,6 +609,18 @@ Planned:
   move/rename.
 - `file.list` stops traversal after `max_results + 1` visited entries, enough to
   report truncation without collecting the whole workspace tree.
+- `file.search` and `file.list` follow ripgrep's rules: hidden entries and
+  paths in the workspace root `.gitignore` are not walked (`file.list` still
+  shows an ignored directory, it does not enter it). An explicit `path`
+  inside such a directory is searched as asked. A search without matches
+  names the skipped paths, so "no matches" does not read as "not in the
+  project". Entries that vanish or cannot be read mid-walk (a build running
+  next to the search) are passed over instead of failing the call.
+- `shell.exec` on Windows PowerShell reports a POSIX-like exit code: the
+  last native program's code, else 0 unless a real error happened.
+  `NativeCommandError` records from `2>&1` (cargo prints progress to stderr)
+  no longer fail the call, and delayed table output (`Select-Object
+  @{N=...}`) is flushed before the process exits.
 - Attachment read tool repairs `image file: ...` references and only reads from
   workspace `.harness/attachments` or user `.codex/attachments` roots.
 - Native shell command timeout, per-call `timeout_ms`, and bounded stdout/stderr

@@ -1,10 +1,12 @@
 use harness_tui::components::editor::Editor;
 use harness_tui::components::menu::{MenuItem, menu_lines};
+use harness_tui::components::reveal::{FADE_CHARS, FADE_OUT_SECS, LAG_SECS, Reveal, fade_in};
 use harness_tui::components::select::select_lines;
-use harness_tui::components::spinner::{format_elapsed, spinner_lines};
+use harness_tui::components::spinner::{format_elapsed, shimmer, working_line};
 use harness_tui::components::status::status_line;
-use harness_tui::text::{Line, Span};
+use harness_tui::text::{Color, Line, Span, Style};
 use harness_tui::theme::Theme;
+use std::time::{Duration, Instant};
 
 fn plain(lines: &[Line]) -> Vec<String> {
     lines.iter().map(Line::text).collect()
@@ -131,21 +133,140 @@ fn editor_rows_reports_full_height() {
 // --- Spinner ---
 
 #[test]
-fn spinner_shows_detail_with_spacer() {
-    let lines = spinner_lines(&Theme::dark(), 0, "5s · esc to interrupt");
-    assert_eq!(lines.len(), 2);
-    assert_eq!(lines[0].text(), "");
-    assert!(lines[1].text().contains("Working… (5s · esc to interrupt)"));
+fn working_line_shows_glyph_label_and_detail() {
+    let line = working_line(&Theme::dark(), 0, "5s · esc to interrupt", 0.5);
+    assert_eq!(line.text(), " ⠋ Working… (5s · esc to interrupt)");
 }
 
 #[test]
-fn spinner_without_detail_drops_the_parentheses() {
-    let lines = spinner_lines(&Theme::dark(), 3, "");
+fn working_line_without_detail_drops_the_parentheses() {
+    let line = working_line(&Theme::dark(), 3, "", 0.0);
+    assert!(line.text().ends_with("Working…"), "{:?}", line.text());
+}
+
+#[test]
+fn shimmer_brightens_a_band_that_moves_with_the_phase() {
+    let base = Color::Rgb(0x80, 0x80, 0x80);
+    let bright = Color::Rgb(0xff, 0xff, 0xff);
+    let brightest = |phase: f32| {
+        let spans = shimmer("Working…", base, bright, phase);
+        assert_eq!(
+            spans.iter().map(|s| s.text.as_str()).collect::<String>(),
+            "Working…"
+        );
+        (0..spans.len())
+            .max_by_key(|&i| match spans[i].style.fg {
+                Color::Rgb(r, _, _) => r,
+                _ => 0,
+            })
+            .unwrap()
+    };
     assert!(
-        lines[1].text().ends_with("Working…"),
-        "{:?}",
-        lines[1].text()
+        brightest(0.3) < brightest(0.7),
+        "the band sweeps left to right"
     );
+    // Outside the band every character keeps the base color.
+    let at_start = shimmer("Working…", base, bright, 0.0);
+    assert!(
+        at_start.iter().all(|span| span.style.fg == base),
+        "{at_start:?}"
+    );
+    // Palette colors cannot blend: one plain span.
+    assert_eq!(shimmer("Working…", Color::Ansi(8), bright, 0.5).len(), 1);
+}
+
+// --- Reveal ---
+
+#[test]
+fn reveal_paces_a_burst_instead_of_printing_it_at_once() {
+    let text = "x".repeat(600);
+    let t0 = Instant::now();
+    let mut reveal = Reveal::new();
+    assert_eq!(
+        reveal.advance(&text, t0),
+        "",
+        "the first call starts the clock"
+    );
+    let frame = Duration::from_millis(33);
+    let first = reveal.advance(&text, t0 + frame).len();
+    assert!(first > 0 && first < 120, "one frame shows a slice: {first}");
+    // The pace follows the backlog: the whole burst shows within a few
+    // multiples of the lag, never instantly and never stuck.
+    let mut now = t0 + frame;
+    let mut frames = 1;
+    while !reveal.is_done(&text) {
+        now += frame;
+        reveal.advance(&text, now);
+        frames += 1;
+        assert!(frames < 200, "the reveal must finish");
+    }
+    let secs = frames as f64 * 0.033;
+    assert!(secs > LAG_SECS && secs < LAG_SECS * 12.0, "{secs}s");
+}
+
+#[test]
+fn reveal_keeps_up_with_text_that_keeps_arriving_and_respects_char_boundaries() {
+    let mut text = String::new();
+    let t0 = Instant::now();
+    let mut reveal = Reveal::new();
+    reveal.advance(&text, t0);
+    for frame in 1..=60u32 {
+        text.push_str("привет мир ");
+        let shown = reveal.advance(&text, t0 + Duration::from_millis(33) * frame);
+        assert!(text.starts_with(shown));
+    }
+    let backlog = text[reveal.shown()..].chars().count();
+    assert!(
+        backlog < 200,
+        "the display trails the stream, not more: {backlog}"
+    );
+}
+
+#[test]
+fn finished_reveal_fades_its_tail_out_then_stops_animating() {
+    let text = "done";
+    let t0 = Instant::now();
+    let mut reveal = Reveal::new();
+    reveal.advance(text, t0);
+    reveal.advance(text, t0 + Duration::from_secs(1));
+    assert!(reveal.is_done(text));
+    let done = t0 + Duration::from_secs(1);
+    assert_eq!(reveal.fade_len(text, done), FADE_CHARS);
+    let half = done + Duration::from_secs_f64(FADE_OUT_SECS / 2.0);
+    assert!(reveal.fade_len(text, half) < FADE_CHARS);
+    let after = done + Duration::from_secs_f64(FADE_OUT_SECS * 2.0);
+    assert_eq!(reveal.fade_len(text, after), 0);
+    assert!(!reveal.is_animating(text, after));
+}
+
+#[test]
+fn fade_in_steps_the_newest_characters_from_the_background() {
+    let background = (0, 0, 0);
+    let foreground = (200, 200, 200);
+    let mut lines = vec![
+        Line::raw("old row"),
+        Line {
+            spans: vec![
+                Span::raw("ab "),
+                Span::styled("cd", Style::fg(Color::Rgb(100, 0, 0))),
+            ],
+        },
+    ];
+    fade_in(&mut lines, 3, background, foreground);
+    assert_eq!(lines[0], Line::raw("old row"), "older rows are untouched");
+    let colors: Vec<Color> = lines[1]
+        .spans
+        .iter()
+        .flat_map(|span| span.text.chars().map(move |_| span.style.fg))
+        .collect();
+    // "a" is outside the faded tail, the space is skipped, then b, c, d
+    // step toward the background (d, the newest, is the darkest).
+    assert_eq!(colors[0], Color::Default);
+    assert_eq!(colors[2], Color::Default, "spaces are not faded");
+    assert_eq!(colors[1], Color::Rgb(150, 150, 150), "b: 3/4 of the way");
+    assert_eq!(colors[3], Color::Rgb(50, 0, 0), "c: 2/4 toward its own red");
+    assert_eq!(colors[4], Color::Rgb(25, 0, 0), "d: 1/4");
+    assert_eq!(lines[1].text(), "ab cd");
 }
 
 #[test]

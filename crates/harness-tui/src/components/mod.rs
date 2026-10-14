@@ -2,6 +2,7 @@
 
 pub mod editor;
 pub mod menu;
+pub mod reveal;
 pub mod select;
 pub mod spinner;
 pub mod status;

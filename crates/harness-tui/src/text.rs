@@ -124,13 +124,44 @@ pub fn visible_width(text: &str) -> usize {
 
 /// One grapheme cluster with its display width and inherited style.
 #[derive(Clone, Copy)]
-struct Cell<'a> {
-    grapheme: &'a str,
-    width: usize,
-    style: Style,
+pub(crate) struct Cell<'a> {
+    pub(crate) grapheme: &'a str,
+    pub(crate) width: usize,
+    pub(crate) style: Style,
 }
 
-fn line_cells(line: &Line) -> Vec<Cell<'_>> {
+/// Restyle the cells that start in columns `from..to` (0-based, `to`
+/// exclusive) — a selection highlight. Text and widths do not change.
+pub fn highlight(line: &Line, from: usize, to: usize, paint: impl Fn(Style) -> Style) -> Line {
+    let mut column = 0usize;
+    let cells = line_cells(line)
+        .into_iter()
+        .map(|mut cell| {
+            if (from..to).contains(&column) {
+                cell.style = paint(cell.style);
+            }
+            column += cell.width;
+            cell
+        })
+        .collect();
+    cells_to_line(cells)
+}
+
+/// Plain text of the cells that start in columns `from..to` (0-based,
+/// `to` exclusive) — what a selection copies from one row.
+pub fn columns_text(line: &Line, from: usize, to: usize) -> String {
+    let mut column = 0usize;
+    let mut text = String::new();
+    for cell in line_cells(line) {
+        if (from..to).contains(&column) {
+            text.push_str(cell.grapheme);
+        }
+        column += cell.width;
+    }
+    text
+}
+
+pub(crate) fn line_cells(line: &Line) -> Vec<Cell<'_>> {
     line.spans
         .iter()
         .flat_map(|span| {
@@ -344,7 +375,7 @@ pub fn render_ansi(line: &Line) -> String {
 }
 
 /// Rebuild a line from cells, merging adjacent cells with equal style.
-fn cells_to_line(cells: Vec<Cell<'_>>) -> Line {
+pub(crate) fn cells_to_line(cells: Vec<Cell<'_>>) -> Line {
     let mut spans: Vec<Span> = Vec::new();
     for cell in cells {
         match spans.last_mut() {

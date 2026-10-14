@@ -33,3 +33,29 @@ fn openai_compatible_model_discovery_includes_add_all_choice() {
         ]
     );
 }
+
+#[test]
+fn model_discovery_reads_the_context_window_under_its_common_names() {
+    // baseten and OpenRouter: `context_length`; Groq-style: `context_window`;
+    // vLLM: `max_model_len`. DeepSeek reports none.
+    let raw = r#"{
+        "object": "list",
+        "data": [
+            {"id": "moonshotai/Kimi-K3", "context_length": 1048576, "max_completion_tokens": 262144},
+            {"id": "llama-groq", "context_window": 131072},
+            {"id": "local-vllm", "max_model_len": 32768},
+            {"id": "deepseek-v4-pro", "object": "model", "owned_by": "deepseek"}
+        ]
+    }"#;
+    let provider = ProviderConfig::new("baseten", "https://inference.baseten.co/v1", "sk-test");
+    let discovery = ModelDiscovery::from_openai_compatible_response(&provider, raw).unwrap();
+
+    assert_eq!(
+        discovery.context_window("moonshotai/Kimi-K3"),
+        Some(1_048_576)
+    );
+    assert_eq!(discovery.context_window("llama-groq"), Some(131_072));
+    assert_eq!(discovery.context_window("local-vllm"), Some(32_768));
+    assert_eq!(discovery.context_window("deepseek-v4-pro"), None);
+    assert_eq!(discovery.context_window("not-listed"), None);
+}

@@ -1,9 +1,29 @@
-//! Shared blocking-HTTP agent builder, used by the chat client and the web
-//! tools so both follow the same proxy policy.
+//! Shared blocking-HTTP agents, used by the chat client and the web tools so
+//! both follow the same proxy policy.
 
+use std::collections::BTreeMap;
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
-/// Build the blocking HTTP agent. Non-2xx statuses come back as regular
+/// The process-wide agent for one (kind, timeout, proxy) setting. An agent
+/// owns the connection pool, so consecutive requests to a provider reuse a
+/// warm connection instead of a new TCP+TLS handshake (0.30–0.37 s to
+/// DeepSeek, Baseten, and OpenRouter, measured 2026-10-09). ureq probes a
+/// pooled connection before reuse and drops one the server has closed.
+fn shared_agent(
+    streaming: bool,
+    timeout: Duration,
+    proxy: Option<&str>,
+    build: impl FnOnce() -> ureq::Agent,
+) -> ureq::Agent {
+    type Key = (bool, Duration, Option<String>);
+    static AGENTS: Mutex<BTreeMap<Key, ureq::Agent>> = Mutex::new(BTreeMap::new());
+    let key = (streaming, timeout, proxy.map(str::to_string));
+    let mut agents = AGENTS.lock().unwrap_or_else(PoisonError::into_inner);
+    agents.entry(key).or_insert_with(build).clone()
+}
+
+/// The blocking HTTP agent. Non-2xx statuses come back as regular
 /// responses (`http_status_as_error(false)`) so callers can surface the
 /// server's own error body instead of a bare status code.
 ///
@@ -12,12 +32,14 @@ use std::time::Duration;
 /// environment can never silently reroute traffic), `"env"` opts into the
 /// environment variables, anything else is a proxy URL.
 pub fn http_agent(timeout: Duration, proxy: Option<&str>) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_global(Some(timeout))
-        .http_status_as_error(false)
-        .proxy(resolve_proxy(proxy))
-        .build()
-        .into()
+    shared_agent(false, timeout, proxy, || {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout))
+            .http_status_as_error(false)
+            .proxy(resolve_proxy(proxy))
+            .build()
+            .into()
+    })
 }
 
 /// Agent for SSE streaming: a live stream from a thinking model legitimately
@@ -35,14 +57,16 @@ pub fn http_agent(timeout: Duration, proxy: Option<&str>) -> ureq::Agent {
 /// reads anchored at the header-arrival instant, which is exactly the
 /// kill-a-live-stream behaviour this agent exists to avoid.
 pub fn streaming_http_agent(timeout: Duration, proxy: Option<&str>) -> ureq::Agent {
-    ureq::Agent::config_builder()
-        .timeout_connect(Some(timeout))
-        .timeout_send_request(Some(timeout))
-        .timeout_recv_body(Some(stream_idle_timeout(timeout)))
-        .http_status_as_error(false)
-        .proxy(resolve_proxy(proxy))
-        .build()
-        .into()
+    shared_agent(true, timeout, proxy, || {
+        ureq::Agent::config_builder()
+            .timeout_connect(Some(timeout))
+            .timeout_send_request(Some(timeout))
+            .timeout_recv_body(Some(stream_idle_timeout(timeout)))
+            .http_status_as_error(false)
+            .proxy(resolve_proxy(proxy))
+            .build()
+            .into()
+    })
 }
 
 /// Floor for the per-read idle cap of an SSE stream. Some providers buffer a

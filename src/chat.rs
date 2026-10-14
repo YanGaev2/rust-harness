@@ -1,13 +1,13 @@
 //! Pure chat-session state machine on the `harness-tui` library.
 //!
-//! A faithful port of the previous chat TUI state machine onto
-//! `harness_tui` primitives: terminal key events become
-//! `harness_tui::input` events, styled lines become
-//! `harness_tui::text::Line`s, and the hand-rolled transcript scrolling is
-//! gone entirely — finished entries are flushed to native terminal
-//! scrollback via [`ChatApp::take_scrollback`] while the pinned panel
-//! ([`ChatApp::panel_lines`]) shows only the live tail, the editor, and the
-//! status row.
+//! Input events go in ([`ChatApp::handle_event`]), [`ChatAction`]s and
+//! whole screen frames come out ([`ChatApp::frame`]). The chat runs full
+//! screen: the transcript scrolls inside the frame (wheel, PgUp/PgDn),
+//! the editor and status rows stay on the bottom edge, and a mouse drag
+//! selects transcript text for the clipboard. Rendered rows of finished
+//! entries are cached per entry; only entries that still change (a
+//! streaming answer, a running tool, live reasoning) render every frame.
+//! Streamed text is revealed at a steady pace with a soft fade-in.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -15,14 +15,20 @@ use std::time::{Duration, Instant};
 
 use harness_tui::components::editor::Editor;
 use harness_tui::components::menu::{MenuItem, menu_lines};
-use harness_tui::components::spinner::{FRAMES, format_elapsed, spinner_lines};
+use harness_tui::components::reveal::{Reveal, fade_in};
+use harness_tui::components::spinner::{FRAMES, format_elapsed, working_line};
 use harness_tui::components::status::status_line;
-use harness_tui::input::{Event, KeyCode, KeyEvent};
-use harness_tui::text::{Line, Span, Style, truncate, visible_width, wrap_hanging};
+use harness_tui::input::{Event, KeyCode, KeyEvent, MouseEvent, MouseKind};
+use harness_tui::text::{
+    Line, Span, Style, columns_text, highlight, truncate, visible_width, wrap_hanging,
+};
 use harness_tui::theme::Theme;
 
+use crate::provider_wizard::{ProviderWizard, WizardAction};
+use crate::providers::{ModelDiscovery, ModelPricing, ProviderConfig};
+
 /// What the event loop should do after the app handled an input event.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ChatAction {
     Continue,
     Submit(String),
@@ -37,9 +43,16 @@ pub enum ChatAction {
     /// `/new`: ask the loop to abandon the resumed conversation and start a
     /// fresh session file (the transcript is already cleared by the app).
     NewSession,
-    /// `/clear`: the transcript is already cleared by the app; the loop must
-    /// wipe the terminal screen and scrollback so old blocks disappear too.
-    ClearScreen,
+    /// A mouse selection ended: put this text on the system clipboard.
+    Copy(String),
+    /// `/provider add`: fetch this provider's model list, then call
+    /// `ChatApp::models_loaded`.
+    FetchModels(ProviderConfig),
+    /// `/provider add` finished: save the provider and switch to `model`.
+    SaveProvider {
+        provider: ProviderConfig,
+        model: String,
+    },
     Exit,
 }
 
@@ -87,13 +100,18 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
     },
     ChatCommand {
         name: "/provider",
-        usage: "/provider",
-        description: "list saved providers and their models",
+        usage: "/provider [add]",
+        description: "list saved providers, or add one from its /models list",
     },
     ChatCommand {
         name: "/paste",
         usage: "/paste",
         description: "capture the system clipboard (text or image)",
+    },
+    ChatCommand {
+        name: "/copy",
+        usage: "/copy",
+        description: "copy the last answer as raw markdown",
     },
     ChatCommand {
         name: "/history",
@@ -118,7 +136,7 @@ const CHAT_COMMANDS: &[ChatCommand] = &[
     ChatCommand {
         name: "/thinking",
         usage: "/thinking",
-        description: "toggle full reasoning in the transcript",
+        description: "show or hide reasoning (Ctrl+O expands it)",
     },
     ChatCommand {
         name: "/retain-thinking",
@@ -191,17 +209,15 @@ enum ToolDetail {
     },
 }
 
-/// A reasoning block. While it streams (`elapsed` unset) the panel shows a
-/// live `∴ Thinking… Ns` header over the newest lines; once closed it
-/// renders as a one-line `∴ Thought for Ns` summary, or in full when
-/// `expanded` (the `/thinking` mode or a Ctrl+O replay). Native scrollback
-/// cannot be edited, so collapsing happens at commit time.
+/// A reasoning block: a `∴ Thinking… Ns` header while it streams
+/// (`elapsed` unset), `∴ Thought for Ns` once closed, over its newest
+/// rows — or all rows while Ctrl+O expands reasoning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ThinkingEntry {
     text: String,
     started: Instant,
     elapsed: Option<Duration>,
-    expanded: bool,
+    reveal: Reveal,
 }
 
 /// A single block in the transcript. Tool calls are a structured entry so a
@@ -216,23 +232,59 @@ enum ChatEntry {
         model: String,
         workspace: String,
     },
-    /// Streamed assistant output. `continued` marks a frozen-off tail of an
-    /// answer whose head already flushed — same hanging indent, no second
-    /// `● ` marker (Qwen-style progressive commit of long streams).
+    /// Streamed assistant output and how much of it is revealed.
     Assistant {
         text: String,
-        continued: bool,
+        reveal: Reveal,
     },
     Thinking(ThinkingEntry),
     Tool(ToolEntry),
     System(String),
 }
 
+/// Where the transcript sat in the last frame: screen row 0 shows
+/// transcript row `top`, and the transcript fills `rows` screen rows.
+/// Maps mouse rows to transcript rows.
+#[derive(Debug, Clone, Copy, Default)]
+struct View {
+    top: usize,
+    rows: usize,
+}
+
+/// A mouse selection in transcript coordinates — (row, column), both
+/// ends inclusive. `dragging` until the button is released.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+    dragging: bool,
+}
+
+impl Selection {
+    /// The two ends in reading order.
+    fn ordered(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+}
+
+/// An 8-bit-per-channel color as terminals report it.
+type Rgb = (u8, u8, u8);
+
+/// How long a status notice (`copied 42 chars`) stays visible.
+const NOTICE_TTL: Duration = Duration::from_secs(2);
+/// Rows the mouse wheel scrolls per notch.
+const WHEEL_ROWS: usize = 3;
+/// One spinner frame, and one sweep of the `Working…` shimmer.
+const SPINNER_FRAME_MS: u128 = 80;
+const SHIMMER_PERIOD_MS: u128 = 1800;
+
 /// The chat session state machine: a transcript of user turns, tool
 /// activity, and streamed assistant output, plus a prompt editor. Pure —
-/// input events go in, [`ChatAction`]s and rendered lines come out. There is
-/// no scroll state: finalized entries flush to native scrollback and only
-/// the live tail stays pinned.
+/// input events go in, [`ChatAction`]s and whole screen frames come out.
 pub struct ChatApp {
     provider_label: String,
     workspace: PathBuf,
@@ -242,12 +294,37 @@ pub struct ChatApp {
     git_branch: Option<String>,
     editor: Editor,
     transcript: Vec<ChatEntry>,
-    /// How many transcript entries are already flushed to scrollback.
-    emitted: usize,
+    /// Rendered rows of settled entries, by transcript index, for
+    /// `cache_width` columns. Unsettled entries are `None`.
+    cache: Vec<Option<Vec<Line>>>,
+    cache_width: usize,
+    /// Transcript rows hidden below the screen; 0 follows the newest row.
+    scroll: usize,
+    /// Transcript height in the last frame, to keep a scrolled view
+    /// still while new rows arrive below it.
+    last_total: usize,
+    view: View,
+    selection: Option<Selection>,
+    /// A short status message and when it was set.
+    notice: Option<(String, Instant)>,
     streaming_assistant: bool,
     streaming_thinking: bool,
-    /// `/thinking`: commit reasoning in full instead of one summary line.
+    /// Ctrl+O: show every reasoning row instead of the newest few.
     thinking_expanded: bool,
+    /// `/thinking`: leave reasoning out of the transcript.
+    thinking_hidden: bool,
+    /// Name the keys in rendered hints (`ctrl+o to expand`); off for the
+    /// transcript printed on exit, where the keys no longer work.
+    key_hints: bool,
+    /// Pace streamed text and fade it in (the REPL turns this on; tests
+    /// see every text at once).
+    animations: bool,
+    /// The terminal's (text, background) colors: the fade-in blends
+    /// between them.
+    terminal_colors: Option<(Rgb, Rgb)>,
+    /// Animation clock: `now` is the frame time set by `animate`.
+    clock: Instant,
+    now: Instant,
     retain_thinking: bool,
     history: Vec<String>,
     history_cursor: Option<usize>,
@@ -264,13 +341,18 @@ pub struct ChatApp {
     /// note, so a provider silently buffering a big tool call (baseten/Kimi)
     /// is distinguishable from a frozen run.
     stream_activity: Option<Instant>,
-    spinner_frame: usize,
     /// Cumulative token usage across the whole REPL session (all runs),
     /// updated from `AgentEvent::UsageUpdated`; shown by `/cost`.
     session_usage: crate::agent::UsageTotals,
     /// Usage at the start of the current run, so per-run deltas fold into
     /// the session total without double-counting.
     run_usage_base: crate::agent::UsageTotals,
+    /// The active model's context window, once the provider reported it.
+    context_window: Option<u64>,
+    /// Size of the conversation the next request carries (the latest
+    /// request's prompt + completion); unknown until a provider reports
+    /// usage in this session.
+    context_tokens: Option<u64>,
     /// Saved providers and their models, for the `/model` menu, shorthand
     /// switching, and argument completions. Empty when the host never
     /// attached one (tests, bare sessions) — `/model` then shows usage only.
@@ -278,6 +360,9 @@ pub struct ChatApp {
     /// Interactive model picker opened by bare `/model` (arrow keys +
     /// type-to-filter, like the reference agents' model selectors).
     model_picker: Option<ModelPicker>,
+    provider_wizard: Option<ProviderWizard>,
+    /// Prices of the active model (saved from `/models` or built in).
+    pricing: Option<ModelPricing>,
     /// True after a first Esc press: the status row asks for a second
     /// Esc to confirm the exit; any other input disarms it.
     exit_armed: bool,
@@ -343,6 +428,7 @@ impl ChatApp {
         let theme = Theme::default();
         let mut editor = Editor::new(EDITOR_PROMPT, EDITOR_PLACEHOLDER);
         editor.set_styles(Style::fg(theme.accent), Style::fg(theme.muted));
+        let now = Instant::now();
         Self {
             provider_label: provider_label.into(),
             git_branch: git_branch(&workspace),
@@ -350,10 +436,22 @@ impl ChatApp {
             theme,
             editor,
             transcript: Vec::new(),
-            emitted: 0,
+            cache: Vec::new(),
+            cache_width: 0,
+            scroll: 0,
+            last_total: 0,
+            view: View::default(),
+            selection: None,
+            notice: None,
             streaming_assistant: false,
             streaming_thinking: false,
             thinking_expanded: false,
+            thinking_hidden: false,
+            key_hints: true,
+            animations: false,
+            terminal_colors: None,
+            clock: now,
+            now,
             // On by default: the thinking models this harness targets
             // (DeepSeek V4 / Kimi / MiMo) require the reasoning echo, and it
             // is what lets an interrupted turn resume with its thinking.
@@ -366,11 +464,14 @@ impl ChatApp {
             busy: false,
             busy_since: None,
             stream_activity: None,
-            spinner_frame: 0,
             session_usage: crate::agent::UsageTotals::default(),
             run_usage_base: crate::agent::UsageTotals::default(),
+            context_window: None,
+            context_tokens: None,
             catalog: Vec::new(),
             model_picker: None,
+            provider_wizard: None,
+            pricing: None,
             exit_armed: false,
             pasted_blocks: Vec::new(),
             paste_seq: 0,
@@ -392,8 +493,82 @@ impl ChatApp {
         self
     }
 
+    /// Pace streamed text instead of showing every delta at once; the
+    /// host drives the clock with [`ChatApp::animate`].
+    pub fn with_animations(mut self, on: bool) -> Self {
+        self.animations = on;
+        self
+    }
+
+    /// The terminal's text and background colors (OSC 10/11). With both
+    /// known, newly revealed text fades in from the background.
+    pub fn with_terminal_colors(
+        mut self,
+        foreground: Option<Rgb>,
+        background: Option<Rgb>,
+    ) -> Self {
+        self.terminal_colors = foreground.zip(background);
+        self
+    }
+
+    /// Advance animations to `now`: streamed text reveals, the spinner
+    /// and the shimmer move, an old notice expires.
+    pub fn animate(&mut self, now: Instant) {
+        self.now = now;
+        if self
+            .notice
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= NOTICE_TTL)
+        {
+            self.notice = None;
+        }
+        if !self.animations {
+            return;
+        }
+        for entry in &mut self.transcript {
+            match entry {
+                ChatEntry::Assistant { text, reveal }
+                | ChatEntry::Thinking(ThinkingEntry { text, reveal, .. })
+                    if !reveal.is_done(text) =>
+                {
+                    reveal.advance(text, now);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// True while frames still change without input: a run is going, text
+    /// is being revealed, or a notice waits to expire. The host polls
+    /// faster then.
+    pub fn is_animating(&self) -> bool {
+        if self.busy || self.notice.is_some() {
+            return true;
+        }
+        self.animations
+            && self.transcript.iter().any(|entry| match entry {
+                ChatEntry::Assistant { text, reveal }
+                | ChatEntry::Thinking(ThinkingEntry { text, reveal, .. }) => {
+                    reveal.is_animating(text, self.now)
+                }
+                _ => false,
+            })
+    }
+
+    /// Show all text at once: resumed history, or the transcript printed
+    /// on exit.
+    pub fn finish_reveals(&mut self) {
+        for entry in &mut self.transcript {
+            if let ChatEntry::Assistant { text, reveal }
+            | ChatEntry::Thinking(ThinkingEntry { text, reveal, .. }) = entry
+            {
+                reveal.finish(text);
+            }
+        }
+    }
+
     /// Push the startup banner (version, active model, workspace) into the
-    /// transcript, so it flows into native scrollback like the rest.
+    /// transcript as its first entry.
     pub fn push_banner(&mut self, version: &str) {
         self.transcript.push(ChatEntry::Banner {
             version: version.to_string(),
@@ -467,6 +642,9 @@ impl ChatApp {
         if !busy {
             self.close_thinking();
             self.cancel_running_tools();
+            // No more deltas: the last answer settles and its rows cache.
+            self.streaming_assistant = false;
+            self.streaming_thinking = false;
             self.git_branch = git_branch(&self.workspace);
         }
     }
@@ -488,7 +666,10 @@ impl ChatApp {
     }
 
     fn overlay_open(&self) -> bool {
-        self.help_visible || self.model_picker.is_some() || self.completion_visible()
+        self.help_visible
+            || self.model_picker.is_some()
+            || self.provider_wizard.is_some()
+            || self.completion_visible()
     }
 
     /// How many prompts wait for the current run to finish.
@@ -529,11 +710,6 @@ impl ChatApp {
         self.busy_since
             .map(|since| since.elapsed().as_secs())
             .unwrap_or(0)
-    }
-
-    /// Advance the spinner animation by one frame.
-    pub fn tick(&mut self) {
-        self.spinner_frame = self.spinner_frame.wrapping_add(1);
     }
 
     /// Whole seconds since the current run last produced an agent event
@@ -581,11 +757,6 @@ impl ChatApp {
         self.provider_label = label.into();
     }
 
-    /// How many transcript entries have been flushed to scrollback.
-    pub fn emitted(&self) -> usize {
-        self.emitted
-    }
-
     pub fn transcript_len(&self) -> usize {
         self.transcript.len()
     }
@@ -599,10 +770,105 @@ impl ChatApp {
             .join("\n")
     }
 
+    /// Route one terminal event: keys, pastes, the wheel and the mouse.
+    pub fn handle_event(&mut self, event: Event) -> ChatAction {
+        match event {
+            Event::Key(key) => self.handle_key(key),
+            Event::Paste(text) => self.handle_paste(&text),
+            Event::WheelUp => {
+                self.scroll_up(WHEEL_ROWS);
+                ChatAction::Continue
+            }
+            Event::WheelDown => {
+                self.scroll_down(WHEEL_ROWS);
+                ChatAction::Continue
+            }
+            Event::Mouse(mouse) => self.handle_mouse(mouse),
+            Event::Resize(..) => ChatAction::Continue,
+        }
+    }
+
+    fn scroll_up(&mut self, rows: usize) {
+        // `frame` clamps the offset to the transcript height.
+        self.scroll = self.scroll.saturating_add(rows);
+    }
+
+    fn scroll_down(&mut self, rows: usize) {
+        self.scroll = self.scroll.saturating_sub(rows);
+    }
+
+    /// One screen of transcript rows minus an overlap row for context.
+    fn page_rows(&self) -> usize {
+        self.view.rows.saturating_sub(2).max(1)
+    }
+
+    /// Left drag selects transcript text and copies it on release; the
+    /// right button pastes, as it does in the terminal without capture.
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ChatAction {
+        let row = mouse.row as usize;
+        let column = mouse.column as usize;
+        match mouse.kind {
+            MouseKind::RightDown => ChatAction::CaptureClipboard,
+            MouseKind::Down => {
+                self.selection = (row < self.view.rows).then(|| {
+                    let point = (self.view.top + row, column);
+                    Selection {
+                        anchor: point,
+                        head: point,
+                        dragging: true,
+                    }
+                });
+                ChatAction::Continue
+            }
+            MouseKind::Drag => {
+                if !self.selection.is_some_and(|selection| selection.dragging) {
+                    return ChatAction::Continue;
+                }
+                // Dragging onto the top or bottom edge scrolls one row.
+                if row == 0 && self.view.top > 0 {
+                    self.scroll_up(1);
+                } else if row + 1 >= self.view.rows {
+                    self.scroll_down(1);
+                }
+                let row = row.min(self.view.rows.saturating_sub(1));
+                if let Some(selection) = self.selection.as_mut() {
+                    selection.head = (self.view.top + row, column);
+                }
+                ChatAction::Continue
+            }
+            MouseKind::Up => {
+                let Some(mut selection) = self.selection.filter(|s| s.dragging) else {
+                    return ChatAction::Continue;
+                };
+                selection.dragging = false;
+                if selection.anchor == selection.head {
+                    // A plain click clears the selection.
+                    self.selection = None;
+                    return ChatAction::Continue;
+                }
+                self.selection = Some(selection);
+                let text = self.selection_text(selection);
+                if text.is_empty() {
+                    return ChatAction::Continue;
+                }
+                self.set_notice(format!("copied {} chars", text.chars().count()));
+                ChatAction::Copy(text)
+            }
+        }
+    }
+
+    fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), self.now));
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> ChatAction {
         // Any key other than Esc drops the pending exit confirmation.
         if key.code != KeyCode::Esc {
             self.exit_armed = false;
+        }
+        // Typing ends a finished mouse selection.
+        if self.selection.is_some_and(|selection| !selection.dragging) {
+            self.selection = None;
         }
 
         // Ctrl+C always exits, even with the palette open.
@@ -610,9 +876,15 @@ impl ChatApp {
             return ChatAction::Exit;
         }
 
-        // Ctrl+O replays the latest collapsed reasoning in full.
+        // Ctrl+O expands every reasoning block in place, or folds them back.
         if key.mods.ctrl && key.code == KeyCode::Char('o') {
-            self.expand_last_thinking();
+            self.thinking_expanded = !self.thinking_expanded;
+            self.invalidate_cache();
+            self.set_notice(if self.thinking_expanded {
+                "reasoning expanded · ctrl+o folds it"
+            } else {
+                "reasoning folded to the newest lines"
+            });
             return ChatAction::Continue;
         }
 
@@ -625,6 +897,22 @@ impl ChatApp {
         if self.help_visible {
             self.help_visible = false;
             return ChatAction::Continue;
+        }
+
+        // The provider wizard owns the keyboard while it is open; Esc closes it.
+        if let Some(wizard) = &mut self.provider_wizard {
+            if key.code == KeyCode::Esc {
+                self.provider_wizard = None;
+                return ChatAction::Continue;
+            }
+            return match wizard.handle_key(key) {
+                WizardAction::Continue => ChatAction::Continue,
+                WizardAction::Fetch(provider) => ChatAction::FetchModels(provider),
+                WizardAction::Save { provider, model } => {
+                    self.provider_wizard = None;
+                    ChatAction::SaveProvider { provider, model }
+                }
+            };
         }
 
         // The interactive model picker owns the keyboard while it is open.
@@ -749,9 +1037,14 @@ impl ChatApp {
                 }
                 ChatAction::Continue
             }
-            // Native terminal scrollback replaces the hand-written transcript
-            // scrolling, so these keys are deliberately inert.
-            KeyCode::PageUp | KeyCode::PageDown => ChatAction::Continue,
+            KeyCode::PageUp => {
+                self.scroll_up(self.page_rows());
+                ChatAction::Continue
+            }
+            KeyCode::PageDown => {
+                self.scroll_down(self.page_rows());
+                ChatAction::Continue
+            }
             KeyCode::Char(ch) if !key.mods.ctrl => {
                 self.editor.insert_char(ch);
                 self.reset_completion();
@@ -766,6 +1059,10 @@ impl ChatApp {
         // inserted verbatim at the caret; it never submits because it is a
         // single event. Large pastes collapse to a placeholder.
         self.exit_armed = false;
+        if let Some(wizard) = &mut self.provider_wizard {
+            wizard.handle_paste(text);
+            return ChatAction::Continue;
+        }
         self.insert_text_block(text);
         self.reset_completion();
         ChatAction::Continue
@@ -899,6 +1196,8 @@ impl ChatApp {
         // model receives the fully expanded message.
         self.history.push(text.clone());
         self.push_user_message(&text);
+        // Sending jumps back to the newest rows.
+        self.scroll = 0;
         ChatAction::Submit(expand_pasted_blocks(&text, &blocks))
     }
 
@@ -910,25 +1209,44 @@ impl ChatApp {
                 ChatAction::Continue
             }
             Some("clear") => {
-                self.transcript.clear();
-                self.emitted = 0;
-                ChatAction::ClearScreen
+                self.clear_transcript();
+                ChatAction::Continue
             }
             Some("new") => {
-                self.transcript.clear();
-                self.emitted = 0;
+                self.clear_transcript();
+                // The fresh session starts with an empty conversation.
+                self.context_tokens = None;
                 ChatAction::NewSession
             }
             Some("exit") | Some("quit") => ChatAction::Exit,
             // Terminals often bind Ctrl+V themselves (Windows Terminal eats it
             // entirely for images), so the capture needs a key-free route.
             Some("paste") => ChatAction::CaptureClipboard,
+            // The source text, not the rendered rows: wrapped code and
+            // table cards would not survive a copy from the screen.
+            Some("copy") => {
+                let answer = self.transcript.iter().rev().find_map(|entry| match entry {
+                    ChatEntry::Assistant { text, .. } => Some(text.clone()),
+                    _ => None,
+                });
+                match answer {
+                    Some(text) => {
+                        self.set_notice(format!("copied {} chars", text.chars().count()));
+                        ChatAction::Copy(text)
+                    }
+                    None => {
+                        self.set_notice("nothing to copy yet");
+                        ChatAction::Continue
+                    }
+                }
+            }
             Some("thinking") => {
-                self.thinking_expanded = !self.thinking_expanded;
-                self.push_system_line(if self.thinking_expanded {
-                    "thinking: full — reasoning stays expanded in the transcript"
+                self.thinking_hidden = !self.thinking_hidden;
+                self.invalidate_cache();
+                self.push_system_line(if self.thinking_hidden {
+                    "thinking: hidden — reasoning is left out of the transcript"
                 } else {
-                    "thinking: collapsed — one summary line per block (Ctrl+O shows the last)"
+                    "thinking: shown — the newest lines of each block (Ctrl+O expands)"
                 });
                 ChatAction::Continue
             }
@@ -940,6 +1258,10 @@ impl ChatApp {
                     "retain thinking: off — reasoning stays in traces only"
                 };
                 self.push_system_line(status);
+                ChatAction::Continue
+            }
+            Some("provider") if parts.next() == Some("add") => {
+                self.provider_wizard = Some(ProviderWizard::new());
                 ChatAction::Continue
             }
             Some("provider") => {
@@ -964,12 +1286,13 @@ impl ChatApp {
                 ));
                 // The label is "provider/model"; the model half may itself
                 // contain slashes, so split at the first one only.
-                let estimate = self
-                    .provider_label
-                    .split_once('/')
-                    .and_then(|(provider, model)| {
-                        crate::providers::builtin_pricing(provider, model)
-                    });
+                let estimate = self.pricing.clone().or_else(|| {
+                    self.provider_label
+                        .split_once('/')
+                        .and_then(|(provider, model)| {
+                            crate::providers::builtin_pricing(provider, model)
+                        })
+                });
                 match estimate {
                     Some(pricing) => {
                         let cost = pricing.estimate_usd(
@@ -983,7 +1306,7 @@ impl ChatApp {
                         ));
                     }
                     None => {
-                        self.push_system_line("estimated cost: no built-in pricing for this model");
+                        self.push_system_line("estimated cost: no pricing known for this model");
                     }
                 }
                 ChatAction::Continue
@@ -1152,9 +1475,7 @@ impl ChatApp {
     /// A run that ended while calls were still running never reports their
     /// results: mark those cards cancelled so they stop spinning.
     fn cancel_running_tools(&mut self) {
-        // Running cards are never flushed, so only the live tail can hold them.
-        let live_from = self.emitted.min(self.transcript.len());
-        for entry in &mut self.transcript[live_from..] {
+        for entry in &mut self.transcript {
             if let ChatEntry::Tool(tool) = entry
                 && tool.status == ToolStatus::Running
             {
@@ -1175,21 +1496,20 @@ impl ChatApp {
         }
     }
 
-    /// Ctrl+O: lines already in native scrollback cannot be unfolded, so
-    /// the latest finished reasoning block is printed again, in full, as a
-    /// new transcript entry.
-    fn expand_last_thinking(&mut self) {
-        let latest = self.transcript.iter().rev().find_map(|entry| match entry {
-            ChatEntry::Thinking(thinking) if thinking.elapsed.is_some() => Some(thinking.clone()),
-            _ => None,
-        });
-        match latest {
-            Some(mut thinking) => {
-                thinking.expanded = true;
-                self.transcript.push(ChatEntry::Thinking(thinking));
-            }
-            None => self.push_system_line("no reasoning to show yet"),
-        }
+    /// Drop the whole transcript (`/clear`, `/new`) with its cached rows,
+    /// scroll position and selection.
+    fn clear_transcript(&mut self) {
+        self.transcript.clear();
+        self.cache.clear();
+        self.scroll = 0;
+        self.last_total = 0;
+        self.selection = None;
+    }
+
+    /// Forget every cached row: a display toggle changed how entries render.
+    fn invalidate_cache(&mut self) {
+        self.cache.clear();
+        self.selection = None;
     }
 
     /// Current `/retain-thinking` state; the REPL passes it to each run's
@@ -1203,7 +1523,6 @@ impl ChatApp {
         self.transcript.push(ChatEntry::User(message.to_string()));
         self.streaming_assistant = false;
         self.streaming_thinking = false;
-        self.tick();
     }
 
     /// Append a system/status line (welcome banner, error notice, etc.).
@@ -1212,19 +1531,20 @@ impl ChatApp {
         self.transcript.push(ChatEntry::System(text.into()));
         self.streaming_assistant = false;
         self.streaming_thinking = false;
-        self.tick();
     }
 
     /// Fold a streamed agent event into the transcript so the view updates as
     /// the agent works through tool rounds and the final answer.
     pub fn push_agent_event(&mut self, event: &crate::agent::AgentEvent) {
         use crate::agent::AgentEvent;
-        self.tick();
         self.stream_activity = Some(Instant::now());
         // Usage ticks arrive between deltas and must not break a growing
         // streaming block, so they bypass the flag reset below.
         if let AgentEvent::UsageUpdated(totals) = event {
             self.session_usage = self.run_usage_base.combined(*totals);
+            if totals.context_tokens > 0 {
+                self.context_tokens = Some(totals.context_tokens);
+            }
             return;
         }
         // Every other event ends any live streaming block; the two streaming
@@ -1246,7 +1566,7 @@ impl ChatApp {
                         text: text.clone(),
                         started: Instant::now(),
                         elapsed: None,
-                        expanded: self.thinking_expanded,
+                        reveal: Reveal::new(),
                     }));
                 }
                 self.streaming_thinking = true;
@@ -1302,7 +1622,7 @@ impl ChatApp {
                     _ => {
                         self.transcript.push(ChatEntry::Assistant {
                             text: delta.clone(),
-                            continued: false,
+                            reveal: Reveal::new(),
                         });
                     }
                 }
@@ -1363,62 +1683,290 @@ impl ChatApp {
         }
     }
 
-    /// The pinned bottom panel, top to bottom: the live (not yet flushed)
-    /// transcript tail, the busy spinner, the command palette, the editor,
-    /// the completion menu, and the status row.
-    pub fn panel_lines(&self, width: usize, max_live_rows: usize) -> Vec<Line> {
-        self.panel_frame(width, max_live_rows).0
+    /// The whole screen, `height` rows: the transcript scrolled to the
+    /// current position (blank rows below short content), then the panel
+    /// docked to the bottom edge — busy row, palette, queued prompts, the
+    /// editor between two rules, menus and the status row.
+    pub fn frame(&mut self, width: usize, height: usize) -> Vec<Line> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let fresh = self.refresh(width);
+        let (mut panel, mut rule_at) = self.panel_rows(width);
+        // Keep at least one transcript row: a panel taller than the screen
+        // loses its top rows (the editor and status row matter most).
+        let max_panel = height.saturating_sub(1).max(1);
+        if panel.len() > max_panel {
+            let cut = panel.len() - max_panel;
+            panel.drain(..cut);
+            rule_at = rule_at.and_then(|at| at.checked_sub(cut));
+        }
+        let area = height.saturating_sub(panel.len());
+
+        let total = self.total_rows(&fresh);
+        // A scrolled view stays still while rows arrive below it.
+        if self.scroll > 0 && total > self.last_total {
+            self.scroll += total - self.last_total;
+        }
+        self.last_total = total;
+        self.scroll = self.scroll.min(total.saturating_sub(area));
+        let end = total - self.scroll;
+        let start = end.saturating_sub(area);
+        self.view = View {
+            top: start,
+            rows: area,
+        };
+
+        let mut rows = self.rows_between(&fresh, start, end);
+        self.paint_selection(&mut rows, start);
+        rows.resize(area, Line::default());
+        if self.scroll > 0
+            && let Some(at) = rule_at
+        {
+            panel[at] = scroll_rule(width, self.scroll, &self.theme);
+        }
+        rows.extend(panel);
+        rows
     }
 
-    /// `panel_lines` with an explicit commit boundary — the draw loop
-    /// passes the boundary from `peek_scrollback` so the rows being
-    /// committed in the same frame are not also rendered as live.
-    pub fn panel_lines_after(&self, width: usize, max_live_rows: usize, from: usize) -> Vec<Line> {
-        self.panel_frame_after(width, max_live_rows, from).0
+    /// Every transcript row at `width`, a blank row after each entry —
+    /// what the REPL prints into the terminal's scrollback on exit.
+    pub fn transcript_lines(&mut self, width: usize) -> Vec<Line> {
+        let width = width.max(1);
+        let fresh = self.refresh(width);
+        let total = self.total_rows(&fresh);
+        self.rows_between(&fresh, 0, total)
     }
 
-    /// The panel plus how many of its trailing rows are docked to the
-    /// bottom edge of the terminal: everything from the spinner down
-    /// (spinner, palette, editor, menus, status). The live transcript
-    /// tail above them follows the content instead.
-    pub fn panel_frame(&self, width: usize, max_live_rows: usize) -> (Vec<Line>, usize) {
-        self.panel_frame_after(width, max_live_rows, self.emitted)
+    /// The transcript as the terminal keeps it after exit: every text
+    /// fully revealed, no key hints (the keys stop working once the chat
+    /// closes).
+    pub fn exit_transcript(&mut self, width: usize) -> Vec<Line> {
+        self.finish_reveals();
+        self.key_hints = false;
+        self.invalidate_cache();
+        let lines = self.transcript_lines(width);
+        self.key_hints = true;
+        self.invalidate_cache();
+        lines
     }
 
-    /// `panel_frame` with an explicit commit boundary (see
-    /// `panel_lines_after`).
-    pub fn panel_frame_after(
-        &self,
-        width: usize,
-        max_live_rows: usize,
-        from: usize,
-    ) -> (Vec<Line>, usize) {
-        let mut lines = Vec::new();
-
-        let mut live: Vec<Line> = Vec::new();
-        for entry in &self.transcript[from.min(self.transcript.len())..] {
-            if !live.is_empty() {
-                live.push(Line::default());
+    /// Bring the row cache up to date for `width` and render the entries
+    /// that still change. Returns those fresh rows by transcript index.
+    fn refresh(&mut self, width: usize) -> Vec<(usize, Vec<Line>)> {
+        if width != self.cache_width {
+            self.cache.clear();
+            self.cache_width = width;
+            self.selection = None;
+        }
+        self.cache.resize(self.transcript.len(), None);
+        let mut fresh = Vec::new();
+        for index in 0..self.transcript.len() {
+            if self.cache[index].is_some() {
+                continue;
             }
-            live.extend(entry_lines(entry, width, &self.theme, self.spinner_frame));
+            let rows = self.render_entry(&self.transcript[index], width);
+            if self.is_settled(index) {
+                self.cache[index] = Some(rows);
+            } else {
+                fresh.push((index, rows));
+            }
         }
-        // Over the cap, keep the tail — the newest rows matter while streaming.
-        if live.len() > max_live_rows {
-            live.drain(..live.len() - max_live_rows);
-        }
-        let has_live = !live.is_empty();
-        lines.extend(live);
-        if has_live && !self.busy {
-            lines.push(Line::default());
-        }
-        let body_rows = lines.len();
+        fresh
+    }
 
+    /// A settled entry renders the same until a display toggle changes:
+    /// its rows can be cached. Running tools, live reasoning, the
+    /// streaming answer and text still being revealed are not settled.
+    fn is_settled(&self, index: usize) -> bool {
+        let revealing =
+            |text: &str, reveal: &Reveal| self.animations && reveal.is_animating(text, self.now);
+        match &self.transcript[index] {
+            ChatEntry::Tool(tool) => tool.status != ToolStatus::Running,
+            ChatEntry::Thinking(thinking) => {
+                thinking.elapsed.is_some() && !revealing(&thinking.text, &thinking.reveal)
+            }
+            ChatEntry::Assistant { text, reveal } => {
+                let streaming = self.streaming_assistant && index + 1 == self.transcript.len();
+                !streaming && !revealing(text, reveal)
+            }
+            _ => true,
+        }
+    }
+
+    /// The rows of entry `index`: cached, or rendered this frame.
+    fn entry_rows<'a>(&'a self, fresh: &'a [(usize, Vec<Line>)], index: usize) -> &'a [Line] {
+        match self.cache.get(index) {
+            Some(Some(rows)) => rows,
+            _ => fresh
+                .iter()
+                .find(|(at, _)| *at == index)
+                .map_or(&[][..], |(_, rows)| rows.as_slice()),
+        }
+    }
+
+    /// Transcript height: each entry that shows anything, plus the blank
+    /// row after it.
+    fn total_rows(&self, fresh: &[(usize, Vec<Line>)]) -> usize {
+        (0..self.transcript.len())
+            .map(|index| match self.entry_rows(fresh, index).len() {
+                0 => 0,
+                rows => rows + 1,
+            })
+            .sum()
+    }
+
+    /// Transcript rows `start..end`, cloned out of the entry blocks.
+    fn rows_between(&self, fresh: &[(usize, Vec<Line>)], start: usize, end: usize) -> Vec<Line> {
+        let mut rows = Vec::with_capacity(end.saturating_sub(start));
+        let mut offset = 0usize;
+        for index in 0..self.transcript.len() {
+            if offset >= end {
+                break;
+            }
+            let block = self.entry_rows(fresh, index);
+            if block.is_empty() {
+                continue;
+            }
+            let height = block.len() + 1;
+            if offset + height > start {
+                for row in start.max(offset)..end.min(offset + height) {
+                    rows.push(block.get(row - offset).cloned().unwrap_or_default());
+                }
+            }
+            offset += height;
+        }
+        rows
+    }
+
+    /// Paint the selection highlight over transcript rows that start at
+    /// transcript row `first`.
+    fn paint_selection(&self, rows: &mut [Line], first: usize) {
+        let Some(selection) = self.selection else {
+            return;
+        };
+        let ((row0, col0), (row1, col1)) = selection.ordered();
+        let background = self.theme.selection;
+        for (offset, line) in rows.iter_mut().enumerate() {
+            let row = first + offset;
+            if row < row0 || row > row1 {
+                continue;
+            }
+            let from = if row == row0 { col0 } else { 0 };
+            let to = if row == row1 { col1 + 1 } else { usize::MAX };
+            *line = highlight(line, from, to, |style| style.bg(background));
+        }
+    }
+
+    /// The selected text: whole rows between the ends, partial rows at
+    /// the ends, trailing spaces trimmed (strips and padding are spaces).
+    fn selection_text(&mut self, selection: Selection) -> String {
+        let ((row0, col0), (row1, col1)) = selection.ordered();
+        let fresh = self.refresh(self.cache_width.max(1));
+        let rows = self.rows_between(&fresh, row0, row1 + 1);
+        rows.iter()
+            .enumerate()
+            .map(|(offset, line)| {
+                let row = row0 + offset;
+                let from = if row == row0 { col0 } else { 0 };
+                let to = if row == row1 { col1 + 1 } else { usize::MAX };
+                columns_text(line, from, to).trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// One entry's rows at `width` for the current display state.
+    fn render_entry(&self, entry: &ChatEntry, width: usize) -> Vec<Line> {
+        let theme = &self.theme;
+        match entry {
+            ChatEntry::User(text) => user_lines(text, width, theme),
+            ChatEntry::Banner {
+                version,
+                model,
+                workspace,
+            } => wrap_rows(banner_lines(version, model, workspace, theme), width),
+            ChatEntry::Assistant { text, reveal } => {
+                let visible = self.visible(text, reveal);
+                if visible.trim().is_empty() {
+                    return Vec::new();
+                }
+                // The rows sit two columns in, under the indent added here.
+                let rows = markdown_lines(visible.trim_end(), width.saturating_sub(2), theme)
+                    .into_iter()
+                    .map(|line| indent_line(line, "  "))
+                    .collect();
+                let mut rows = wrap_rows(rows, width);
+                self.fade(&mut rows, text, reveal);
+                rows
+            }
+            ChatEntry::Thinking(_) if self.thinking_hidden => Vec::new(),
+            ChatEntry::Thinking(thinking) => {
+                let visible = self.visible(&thinking.text, &thinking.reveal);
+                let mut rows = thinking_lines(
+                    thinking,
+                    visible,
+                    self.thinking_expanded,
+                    self.key_hints,
+                    width,
+                    theme,
+                );
+                // The header is not new text; only the body fades in.
+                self.fade(&mut rows[1..], &thinking.text, &thinking.reveal);
+                rows
+            }
+            ChatEntry::System(text) => {
+                let style = if text.starts_with("memo:") {
+                    Style::fg(theme.accent)
+                } else {
+                    Style::fg(theme.muted)
+                };
+                let row = Line {
+                    spans: vec![Span::styled("· ", style), Span::styled(text.clone(), style)],
+                };
+                wrap_rows(vec![row], width)
+            }
+            ChatEntry::Tool(tool) => tool_card_lines(tool, width, theme, self.spinner_frame()),
+        }
+    }
+
+    /// The revealed part of a streamed text (all of it without animations).
+    fn visible<'a>(&self, text: &'a str, reveal: &Reveal) -> &'a str {
+        if self.animations {
+            &text[..reveal.shown().min(text.len())]
+        } else {
+            text
+        }
+    }
+
+    /// Fade in the newest revealed characters of `rows`.
+    fn fade(&self, rows: &mut [Line], text: &str, reveal: &Reveal) {
+        let Some((foreground, background)) = self.terminal_colors.filter(|_| self.animations)
+        else {
+            return;
+        };
+        let count = reveal.fade_len(text, self.now);
+        if count > 0 {
+            fade_in(rows, count, background, foreground);
+        }
+    }
+
+    /// Spinner frame for the animation clock.
+    fn spinner_frame(&self) -> usize {
+        (self.now.saturating_duration_since(self.clock).as_millis() / SPINNER_FRAME_MS) as usize
+    }
+
+    /// The panel docked to the bottom edge, and the index of the rule
+    /// above the editor (it shows the scroll position when scrolled).
+    fn panel_rows(&self, width: usize) -> (Vec<Line>, Option<usize>) {
+        let mut lines = Vec::new();
         if self.busy {
-            // Two rows: a blank spacer, then ` ⠋ Working… (5s · …)`.
-            lines.extend(spinner_lines(
+            let elapsed = self.now.saturating_duration_since(self.clock).as_millis();
+            let phase = (elapsed % SHIMMER_PERIOD_MS) as f32 / SHIMMER_PERIOD_MS as f32;
+            lines.push(working_line(
                 &self.theme,
-                self.spinner_frame,
+                self.spinner_frame(),
                 &self.busy_detail(),
+                phase,
             ));
             if let Some(note) = stream_idle_note(self.stream_idle_secs()) {
                 lines.push(Line::styled(
@@ -1445,10 +1993,13 @@ impl ChatApp {
             lines.push(truncate(&row, width));
         }
 
+        let rule_at = lines.len();
         let editor_rows = self.editor.render(width, EDITOR_MAX_ROWS);
         lines.extend(ruled_lines(editor_rows, width, &self.theme));
 
-        if let Some(picker) = &self.model_picker {
+        if let Some(wizard) = &self.provider_wizard {
+            lines.extend(wizard.lines(&self.theme));
+        } else if let Some(picker) = &self.model_picker {
             lines.extend(model_picker_lines(
                 picker,
                 &self.provider_label,
@@ -1475,125 +2026,7 @@ impl ChatApp {
         }
 
         lines.push(self.status_row(width));
-        let docked = lines.len() - body_rows;
-        (lines, docked)
-    }
-
-    /// Flush finalized transcript entries to native scrollback: returns their
-    /// rendered lines (one blank line after each entry) and advances
-    /// `emitted`. While the agent is busy, only entries strictly before both
-    /// the last entry (it may still be streaming) and the first Running tool
-    /// card are final; once the run ends everything flushes.
-    pub fn take_scrollback(&mut self, width: usize) -> Vec<Line> {
-        let (lines, limit) = self.peek_scrollback(width);
-        self.acknowledge_emitted(limit);
-        lines
-    }
-
-    /// Side-effect-free flush plan: the finalized rows ready for native
-    /// scrollback and the transcript index they cover. `emitted` moves
-    /// only in `acknowledge_emitted` — AFTER the terminal write succeeds
-    /// — so a failed write offers the same rows again instead of losing
-    /// them.
-    pub fn peek_scrollback(&self, width: usize) -> (Vec<Line>, usize) {
-        let mut limit = self.transcript.len();
-        if self.busy {
-            limit = limit.saturating_sub(1);
-            // Only unflushed Running cards hold the prefix back — a
-            // stale card from a cancelled run was already emitted and
-            // must not freeze every later turn's flush.
-            if let Some(running) = self.transcript[self.emitted..].iter().position(
-                |entry| matches!(entry, ChatEntry::Tool(tool) if tool.status == ToolStatus::Running),
-            ) {
-                limit = limit.min(self.emitted + running);
-            }
-        }
-        if limit <= self.emitted {
-            return (Vec::new(), self.emitted);
-        }
-        let mut lines = Vec::new();
-        for entry in &self.transcript[self.emitted..limit] {
-            lines.extend(entry_lines(entry, width, &self.theme, self.spinner_frame));
-            lines.push(Line::default());
-        }
-        (lines, limit)
-    }
-
-    /// Advance the commit boundary after the rows from `peek_scrollback`
-    /// actually reached the terminal.
-    pub fn acknowledge_emitted(&mut self, through: usize) {
-        self.emitted = self.emitted.max(through.min(self.transcript.len()));
-    }
-
-    /// Re-wrapped tail of the already-flushed transcript for the resize
-    /// repaint: the last `rows` rendered lines of `transcript[..emitted]`
-    /// wrapped to `width`. Un-flushed entries are excluded — the panel
-    /// renders them as the live tail, so including them here would show
-    /// them twice. Entries are walked newest-first so a long session
-    /// only wraps what fits on screen.
-    pub fn viewport_tail(&self, width: usize, rows: usize) -> Vec<Line> {
-        let mut segments: Vec<Vec<Line>> = Vec::new();
-        let mut total = 0usize;
-        for entry in self.transcript[..self.emitted.min(self.transcript.len())]
-            .iter()
-            .rev()
-        {
-            let mut segment = entry_lines(entry, width, &self.theme, self.spinner_frame);
-            segment.push(Line::default());
-            total += segment.len();
-            segments.push(segment);
-            if total >= rows {
-                break;
-            }
-        }
-        let mut lines: Vec<Line> = segments.into_iter().rev().flatten().collect();
-        if lines.len() > rows {
-            lines.drain(..lines.len() - rows);
-        }
-        lines
-    }
-
-    /// Qwen-style progressive commit for long streams: when the live
-    /// streaming entry renders taller than the live budget, freeze its
-    /// stable prefix (up to the last blank line outside any code fence)
-    /// into a final entry so it can flush to native scrollback, keeping
-    /// only the fresh tail live. Without a safe boundary the entry is
-    /// left alone and the head-clip cap remains the backstop.
-    pub fn freeze_streaming_overflow(&mut self, width: usize, max_live_rows: usize) {
-        if !self.busy {
-            return;
-        }
-        let Some(last) = self.transcript.last() else {
-            return;
-        };
-        // A live reasoning block shows only its newest lines, so it never
-        // outgrows the live budget; only streamed answers need splitting.
-        let streaming_text = match last {
-            ChatEntry::Assistant { text, .. } if self.streaming_assistant => text,
-            _ => return,
-        };
-        if entry_lines(last, width, &self.theme, self.spinner_frame).len() <= max_live_rows {
-            return;
-        }
-        let Some(split) = safe_split_point(streaming_text) else {
-            return;
-        };
-        // The head keeps its own continuation flag; the tail is always a
-        // continuation of the same visual block.
-        match self.transcript.pop().expect("checked above") {
-            ChatEntry::Assistant { text, continued } => {
-                let (head, tail) = split_at_boundary(&text, split);
-                self.transcript.push(ChatEntry::Assistant {
-                    text: head,
-                    continued,
-                });
-                self.transcript.push(ChatEntry::Assistant {
-                    text: tail,
-                    continued: true,
-                });
-            }
-            _ => unreachable!("only streaming answers are split"),
-        }
+        (lines, Some(rule_at))
     }
 
     /// Detail shown in the busy spinner: elapsed time, output tokens of
@@ -1611,14 +2044,41 @@ impl ChatApp {
         detail
     }
 
+    /// The active model's context window in tokens (`None` = unknown);
+    /// the host learns it from the provider's model list.
+    pub fn set_context_window(&mut self, window: Option<u64>) {
+        self.context_window = window;
+    }
+
+    /// Prices of the active model for `/cost` (`None` = fall back to the
+    /// built-in price list).
+    pub fn set_pricing(&mut self, pricing: Option<ModelPricing>) {
+        self.pricing = pricing;
+    }
+
+    pub fn provider_wizard_open(&self) -> bool {
+        self.provider_wizard.is_some()
+    }
+
+    /// Hand the model list result to the open provider wizard (dropped
+    /// when the wizard was closed meanwhile).
+    pub fn models_loaded(&mut self, result: Result<(ProviderConfig, ModelDiscovery), String>) {
+        if let Some(wizard) = &mut self.provider_wizard {
+            wizard.models_loaded(result);
+        }
+    }
+
     /// Bottom status row. Left: where you are (workspace and git branch),
     /// replaced by the one hint that matters right now (exit confirmation,
-    /// picker/menu keys). Right: the active model and session token usage.
-    /// The right side is dropped first on narrow terminals.
+    /// picker/menu keys). Right: the active model, session token usage and
+    /// the context meter. Narrow rows drop the session usage first, then
+    /// the model name; the meter stays longest.
     fn status_row(&self, width: usize) -> Line {
         let muted = Style::fg(self.theme.muted);
         let left = if self.exit_armed {
             Line::styled(" Press Esc again to exit", Style::fg(self.theme.warning))
+        } else if let Some((notice, _)) = &self.notice {
+            Line::styled(format!(" {notice}"), Style::fg(self.theme.accent))
         } else if self.model_picker.is_some() {
             Line::styled(
                 " ↑↓ select · Enter switch · type to filter · Esc close",
@@ -1633,12 +2093,41 @@ impl ChatApp {
             }
             Line::styled(location, muted)
         };
-        let mut right = vec![Span::styled(self.provider_label.clone(), muted)];
-        if let Some(usage) = self.usage_summary() {
-            right.push(Span::styled(format!(" · {usage}"), muted));
+        let model = Span::styled(self.provider_label.clone(), muted);
+        let usage = self
+            .usage_summary()
+            .map(|usage| Span::styled(format!(" · {usage}"), muted));
+        let meter = self
+            .context_tokens
+            .map(|tokens| context_meter(tokens, self.context_window, &self.theme));
+        let row = |parts: Vec<Span>| {
+            let mut spans = parts;
+            spans.push(Span::raw(" "));
+            Line { spans }
+        };
+        let mut candidates = Vec::new();
+        let mut full = vec![model.clone()];
+        full.extend(usage);
+        if let Some(meter) = &meter {
+            full.push(Span::styled(" · ", muted));
+            full.extend(meter.iter().cloned());
+            candidates.push(row(full));
+            let mut short = vec![model.clone(), Span::styled(" · ", muted)];
+            short.extend(meter.iter().cloned());
+            candidates.push(row(short));
+            candidates.push(row(meter.clone()));
+        } else {
+            candidates.push(row(full));
+            candidates.push(row(vec![model]));
         }
-        right.push(Span::raw(" "));
-        status_line(width, left, Line { spans: right })
+        let fits = |right: &Line| left.width() + right.width() + 2 <= width;
+        let right = candidates
+            .iter()
+            .find(|right| fits(right))
+            .or(candidates.last())
+            .cloned()
+            .unwrap_or_default();
+        status_line(width, left, right)
     }
 
     /// `↑12.3k ↓3.4k · cache 85%` for the session so far; `None` before the
@@ -1658,6 +2147,62 @@ impl ChatApp {
             summary.push_str(&format!(" · cache {percent}%"));
         }
         Some(summary)
+    }
+}
+
+/// Cells of the context bar.
+const CONTEXT_BAR_CELLS: u64 = 10;
+/// Partial cells, in eighths: index 1 is ⅛ of a cell, 7 is ⅞.
+const BAR_EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+
+/// `████▌░░░░░ 474k/1M 45%`: how full the context window is. The bar fills
+/// in eighths of a cell, in the success color, then the warning color from
+/// 60%, the error color from 85%. Without a known window: `ctx 45.2k`.
+fn context_meter(tokens: u64, window: Option<u64>, theme: &Theme) -> Vec<Span> {
+    let muted = Style::fg(theme.muted);
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return vec![Span::styled(
+            format!("ctx {}", compact_tokens(tokens)),
+            muted,
+        )];
+    };
+    let percent = tokens.saturating_mul(100) / window;
+    let color = Style::fg(match percent {
+        0..=59 => theme.success,
+        60..=84 => theme.warning,
+        _ => theme.error,
+    });
+    let eighths = (u128::from(tokens.min(window)) * u128::from(CONTEXT_BAR_CELLS * 8)
+        / u128::from(window)) as u64;
+    let mut filled = "█".repeat((eighths / 8) as usize);
+    filled.push_str(BAR_EIGHTHS[(eighths % 8) as usize]);
+    let used = eighths.div_ceil(8);
+    vec![
+        Span::styled(filled, color),
+        Span::styled(
+            "░".repeat((CONTEXT_BAR_CELLS - used) as usize),
+            Style::fg(theme.faint),
+        ),
+        Span::styled(
+            format!(" {}/{} ", compact_tokens(tokens), compact_tokens(window)),
+            muted,
+        ),
+        Span::styled(format!("{percent}%"), color),
+    ]
+}
+
+/// Token counts for the context meter: `950`, `45.2k`, `474k`, `1M`,
+/// `1.5M`.
+fn compact_tokens(value: u64) -> String {
+    let one_decimal = |value: f64| {
+        let text = format!("{value:.1}");
+        text.strip_suffix(".0").map(str::to_string).unwrap_or(text)
+    };
+    match value {
+        0..=999 => value.to_string(),
+        1_000..=99_999 => format!("{}k", one_decimal(value as f64 / 1_000.0)),
+        100_000..=999_999 => format!("{}k", value / 1_000),
+        _ => format!("{}M", one_decimal(value as f64 / 1_000_000.0)),
     }
 }
 
@@ -1720,18 +2265,14 @@ fn runs_while_busy(text: &str) -> bool {
     let Some(command) = text.strip_prefix('/') else {
         return false;
     };
+    let mut words = command.split_whitespace();
+    // `/provider add` fetches and saves: it waits for the run like a prompt.
+    if words.next() == Some("provider") {
+        return words.next().is_none();
+    }
     matches!(
         command.split_whitespace().next(),
-        Some(
-            "help"
-                | "?"
-                | "cost"
-                | "provider"
-                | "history"
-                | "thinking"
-                | "retain-thinking"
-                | "paste"
-        )
+        Some("help" | "?" | "cost" | "history" | "thinking" | "retain-thinking" | "paste" | "copy")
     )
 }
 
@@ -1815,38 +2356,6 @@ fn model_picker_lines(picker: &ModelPicker, active_label: &str, theme: &Theme) -
     lines
 }
 
-/// Last byte offset right after a blank line that sits outside any
-/// fenced code block, such that both halves are non-empty — the safe
-/// place to freeze a streaming markdown prefix.
-fn safe_split_point(text: &str) -> Option<usize> {
-    let mut best = None;
-    let mut fences = 0usize;
-    let mut offset = 0usize;
-    for segment in text.split_inclusive('\n') {
-        if segment.trim_start().starts_with("```") {
-            fences += 1;
-        }
-        offset += segment.len();
-        if fences.is_multiple_of(2)
-            && segment.trim().is_empty()
-            && !text[..offset].trim().is_empty()
-            && !text[offset..].trim().is_empty()
-        {
-            best = Some(offset);
-        }
-    }
-    best
-}
-
-/// Split raw streaming text at a `safe_split_point`, trimming the blank
-/// seam — the flush blank line between entries restores the paragraph
-/// gap visually.
-fn split_at_boundary(text: &str, split: usize) -> (String, String) {
-    let head = text[..split].trim_end_matches('\n').to_string();
-    let tail = text[split..].trim_start_matches('\n').to_string();
-    (head, tail)
-}
-
 /// The editor between two full-width rules — no side borders, so a mouse
 /// selection copies only the typed text.
 fn ruled_lines(inner: Vec<Line>, width: usize, theme: &Theme) -> Vec<Line> {
@@ -1871,84 +2380,88 @@ fn palette_lines(theme: &Theme) -> Vec<Line> {
         });
     }
     lines.push(Line::styled(
-        " Alt/Shift/Ctrl+Enter newline · Up/Down recall · Ctrl+O last reasoning · Ctrl+V paste · Esc close",
+        " Alt/Shift/Ctrl+Enter newline · Up/Down recall · PgUp/PgDn scroll · drag to copy · Ctrl+O reasoning · Esc close",
         muted,
     ));
     lines
 }
 
-/// Render one transcript entry as styled lines wrapped to `width` columns,
-/// continuation rows hanging under the entry's marker: `›` on a full-width
-/// strip for user turns, unmarked indented markdown for answers, muted
-/// reasoning, status-marked tool cards.
-fn entry_lines(entry: &ChatEntry, width: usize, theme: &Theme, frame: usize) -> Vec<Line> {
-    let styled = match entry {
-        ChatEntry::User(text) => return user_lines(text, width, theme),
-        ChatEntry::Banner {
-            version,
-            model,
-            workspace,
-        } => banner_lines(version, model, workspace, theme),
-        ChatEntry::Assistant { text, .. } => markdown_lines(text.trim_end(), theme)
-            .into_iter()
-            .map(|line| indent_line(line, "  "))
-            .collect(),
-        ChatEntry::Thinking(thinking) => return thinking_lines(thinking, width, theme),
-        ChatEntry::System(text) => {
-            let style = if text.starts_with("memo:") {
-                Style::fg(theme.accent)
-            } else {
-                Style::fg(theme.muted)
-            };
-            vec![Line {
-                spans: vec![Span::styled("· ", style), Span::styled(text.clone(), style)],
-            }]
-        }
-        ChatEntry::Tool(tool) => return tool_card_lines(tool, width, theme, frame),
-    };
-    styled
-        .into_iter()
+/// Wrap styled rows to `width` with the chat's hanging indent.
+fn wrap_rows(rows: Vec<Line>, width: usize) -> Vec<Line> {
+    rows.into_iter()
         .flat_map(|line| wrap_styled_line(line, width))
         .collect()
 }
 
-/// Newest reasoning rows kept visible under a live `Thinking…` header.
+/// The rule above the editor while the view is scrolled up: how many
+/// rows are below the screen and the key that brings them back.
+fn scroll_rule(width: usize, below: usize, theme: &Theme) -> Line {
+    let label = format!(" ↓ {below} more rows · PgDn ");
+    let label_width = visible_width(&label);
+    if label_width + 4 > width {
+        return Line::styled("─".repeat(width.max(1)), Style::fg(theme.accent));
+    }
+    let faint = Style::fg(theme.faint);
+    Line {
+        spans: vec![
+            Span::styled("─".repeat(width - label_width - 2), faint),
+            Span::styled(label, Style::fg(theme.accent)),
+            Span::styled("──", faint),
+        ],
+    }
+}
+
+/// Reasoning rows kept visible under the header until Ctrl+O expands them.
 const THINKING_TAIL_ROWS: usize = 4;
 
-/// A reasoning block: live header plus its newest rows while streaming,
-/// one summary line once closed, the full muted text when expanded.
-fn thinking_lines(thinking: &ThinkingEntry, width: usize, theme: &Theme) -> Vec<Line> {
+/// A reasoning block: `∴ Thinking… Ns` while it streams, `∴ Thought for
+/// Ns` once closed, over its newest rows — all rows when `expanded`. The
+/// header counts the folded rows and, with `hints`, names the key that
+/// shows them.
+fn thinking_lines(
+    thinking: &ThinkingEntry,
+    visible: &str,
+    expanded: bool,
+    hints: bool,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line> {
     let muted = Style::fg(theme.muted);
-    let header = match thinking.elapsed {
-        None => format!(
-            "∴ Thinking… {}",
-            format_elapsed(thinking.started.elapsed().as_secs())
-        ),
-        Some(elapsed) if thinking.expanded => {
-            format!("∴ Thought for {}", format_elapsed(elapsed.as_secs().max(1)))
-        }
-        Some(elapsed) => format!(
-            "∴ Thought for {} · ctrl+o to expand",
-            format_elapsed(elapsed.as_secs().max(1))
-        ),
-    };
-    let mut lines = vec![Line::styled(header, muted)];
-    let live = thinking.elapsed.is_none();
-    if live || thinking.expanded {
-        let mut body: Vec<Line> = thinking
-            .text
-            .trim()
+    let visible = visible.trim();
+    let mut body: Vec<Line> = if visible.is_empty() {
+        Vec::new()
+    } else {
+        visible
             .split('\n')
             .map(|raw| Line {
                 spans: vec![Span::raw("  "), Span::styled(raw, muted)],
             })
             .flat_map(|line| wrap_styled_line(line, width))
-            .collect();
-        if live && body.len() > THINKING_TAIL_ROWS {
-            body.drain(..body.len() - THINKING_TAIL_ROWS);
+            .collect()
+    };
+    let folded = if expanded {
+        0
+    } else {
+        body.len().saturating_sub(THINKING_TAIL_ROWS)
+    };
+    body.drain(..folded);
+    let mut header = match thinking.elapsed {
+        None => format!(
+            "∴ Thinking… {}",
+            format_elapsed(thinking.started.elapsed().as_secs())
+        ),
+        Some(elapsed) => format!("∴ Thought for {}", format_elapsed(elapsed.as_secs().max(1))),
+    };
+    if folded > 0 {
+        header.push_str(&format!(" · +{folded} lines"));
+        if hints {
+            header.push_str(" · ctrl+o to expand");
         }
-        lines.extend(body);
+    } else if hints && expanded && body.len() > THINKING_TAIL_ROWS {
+        header.push_str(" · ctrl+o to fold");
     }
+    let mut lines = wrap_hanging(&Line::styled(header, muted), width, 2);
+    lines.extend(body);
     lines
 }
 
@@ -2023,30 +2536,22 @@ fn tool_card_lines(tool: &ToolEntry, width: usize, theme: &Theme, frame: usize) 
     let mut lines = wrap_hanging(&Line { spans }, width, 2);
 
     let first_row = |text: String| format!("  ⎿ {text}");
-    match (&tool.status, &tool.detail) {
-        (ToolStatus::Failed, _) => {
-            let error = tool.summary.clone().unwrap_or_else(|| "failed".to_string());
-            lines.push(truncate(
-                &Line::styled(first_row(error), Style::fg(theme.error)),
-                width,
-            ));
-        }
-        (
-            _,
-            ToolDetail::Output {
-                tail,
-                hidden,
-                exit_code,
-            },
-        ) => {
+    let failed = tool.status == ToolStatus::Failed;
+    match &tool.detail {
+        ToolDetail::Output {
+            tail,
+            hidden,
+            exit_code,
+        } => {
             let mut rows: Vec<String> = Vec::new();
             if *hidden > 0 {
                 rows.push(format!("… +{hidden} earlier lines"));
             }
             rows.extend(tail.iter().cloned());
-            if rows.is_empty() {
+            if rows.is_empty() && !failed {
                 rows.push("no output".to_string());
             }
+            let output_rows = rows.len();
             for (index, row) in rows.into_iter().enumerate() {
                 let text = if index == 0 {
                     first_row(row)
@@ -2055,14 +2560,37 @@ fn tool_card_lines(tool: &ToolEntry, width: usize, theme: &Theme, frame: usize) 
                 };
                 lines.push(truncate(&Line::styled(text, muted), width));
             }
-            if let Some(code) = exit_code.filter(|code| *code != 0) {
-                lines.push(Line::styled(
-                    format!("    exit {code}"),
+            let indent = |text: String| {
+                if output_rows == 0 {
+                    first_row(text)
+                } else {
+                    format!("    {text}")
+                }
+            };
+            match exit_code.filter(|code| *code != 0) {
+                Some(code) => lines.push(Line::styled(
+                    indent(format!("exit {code}")),
                     Style::fg(theme.error),
-                ));
+                )),
+                // No exit code: a timeout or a spawn error says why.
+                None if failed => {
+                    let error = tool.summary.clone().unwrap_or_else(|| "failed".to_string());
+                    lines.push(truncate(
+                        &Line::styled(indent(error), Style::fg(theme.error)),
+                        width,
+                    ));
+                }
+                None => {}
             }
         }
-        (_, ToolDetail::Diff { removed, added }) => {
+        _ if failed => {
+            let error = tool.summary.clone().unwrap_or_else(|| "failed".to_string());
+            lines.push(truncate(
+                &Line::styled(first_row(error), Style::fg(theme.error)),
+                width,
+            ));
+        }
+        ToolDetail::Diff { removed, added } => {
             lines.push(Line::styled(
                 first_row(format!("−{} +{}", removed.len(), added.len())),
                 muted,
@@ -2101,7 +2629,7 @@ fn tool_card_lines(tool: &ToolEntry, width: usize, theme: &Theme, frame: usize) 
                 ));
             }
         }
-        (_, ToolDetail::Summary) => {
+        ToolDetail::Summary => {
             if let Some(summary) = &tool.summary {
                 lines.push(truncate(
                     &Line::styled(first_row(summary.clone()), muted),
@@ -2148,11 +2676,12 @@ fn hanging_indent(text: &str) -> usize {
 
 /// Render a block of (lightweight) Markdown to styled lines: ATX headings,
 /// bullet and ordered lists, block quotes, fenced code blocks, horizontal
-/// rules, tables, and inline `**bold**`, `*italic*`, and `` `code` ``.
-/// Deliberately a pragmatic subset, not CommonMark. Code fences stay
-/// literal (muted) and code lines carry no gutter, so a mouse selection
-/// copies valid markdown and clean code.
-fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line> {
+/// rules, tables, and inline `**bold**`, `*italic*`, `` `code` ``, and
+/// `$math$`. Deliberately a pragmatic subset, not CommonMark. Code fences
+/// stay literal (muted) and code lines carry no gutter, so a mouse
+/// selection copies valid markdown and clean code. `width` lays out what
+/// generic wrapping would break: tables and over-long code lines.
+fn markdown_lines(text: &str, width: usize, theme: &Theme) -> Vec<Line> {
     // Terminal-default foreground so the transcript respects light/dark themes.
     let base = Style::default();
     let raw_lines: Vec<&str> = text.split('\n').collect();
@@ -2171,19 +2700,29 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line> {
             continue;
         }
         if in_code {
-            lines.push(Line::raw(raw));
+            lines.extend(code_rows(raw, width, theme));
             i += 1;
             continue;
         }
 
+        // Display math on lines of its own, indented under the text.
+        if let Some((tex, used)) = display_math(&raw_lines[i..]) {
+            lines.push(Line::styled(
+                format!("  {}", crate::math::to_unicode(&tex)),
+                base,
+            ));
+            i += used;
+            continue;
+        }
+
         // A run of `| … |` rows is a table: gather the whole block and lay it
-        // out as aligned columns instead of leaking raw pipes.
+        // out as a grid instead of leaking raw pipes.
         if is_table_row(trimmed) {
             let start = i;
             while i < raw_lines.len() && is_table_row(raw_lines[i].trim_start()) {
                 i += 1;
             }
-            lines.extend(table_lines(&raw_lines[start..i], base, theme));
+            lines.extend(table_lines(&raw_lines[start..i], width, base, theme));
             continue;
         }
 
@@ -2250,91 +2789,203 @@ fn markdown_lines(text: &str, theme: &Theme) -> Vec<Line> {
     lines
 }
 
+/// One fenced code line. A line wider than `width` breaks with a faint
+/// `↪` before each continuation, so a wrapped tail never passes for a line
+/// of its own (`/copy` gives the exact source).
+fn code_rows(raw: &str, width: usize, theme: &Theme) -> Vec<Line> {
+    let line = Line::raw(raw);
+    if line.width() <= width {
+        return vec![line];
+    }
+    let mut rows = wrap_hanging(&line, width.saturating_sub(2), 0);
+    for row in rows.iter_mut().skip(1) {
+        row.spans
+            .insert(0, Span::styled("↪ ", Style::fg(theme.faint)));
+    }
+    rows
+}
+
 /// A Markdown table row: starts with `|` and has at least one more pipe.
 /// Separator rows (`|---|---|`) also match — `table_lines` filters them out.
 fn is_table_row(line: &str) -> bool {
     line.starts_with('|') && line[1..].contains('|')
 }
 
-/// Lay a block of `| … |` rows out as padded columns: cells keep their inline
-/// markdown, the header (a row directly above a `|---|` separator) is bold
-/// and underlined by a rule sized to the real column widths.
-fn table_lines(rows: &[&str], base: Style, theme: &Theme) -> Vec<Line> {
-    const GAP: usize = 2;
-
-    let mut body: Vec<(bool, Vec<Vec<Span>>)> = Vec::new();
+/// Lay a block of `| … |` rows out as a grid: box-drawing borders, a rule
+/// under the header (the row directly above a `|---|` separator) and
+/// between rows, column alignment from the separator. Cells keep their
+/// inline markdown; a table wider than `width` wraps text inside its cells.
+fn table_lines(rows: &[&str], width: usize, base: Style, theme: &Theme) -> Vec<Line> {
+    let mut header = false;
+    let mut aligns: Vec<Align> = Vec::new();
+    let mut body: Vec<Vec<Vec<Span>>> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
-        let trimmed = row.trim();
-        if is_table_separator(trimmed) {
+        let cells = split_cells(row.trim());
+        if is_table_separator(row.trim()) {
             // The row above the first separator is the header.
-            if index == 1
-                && let Some(first) = body.first_mut()
-            {
-                first.0 = true;
+            if index == 1 {
+                header = true;
+                aligns = cells.iter().map(|cell| Align::of(cell.trim())).collect();
             }
             continue;
         }
-        let cells: Vec<Vec<Span>> = trimmed
-            .trim_start_matches('|')
-            .trim_end_matches('|')
-            .split('|')
-            .map(|cell| inline_spans(cell.trim(), base, theme))
-            .collect();
-        body.push((false, cells));
-    }
-
-    let span_width =
-        |spans: &[Span]| -> usize { spans.iter().map(|s| visible_width(&s.text)).sum() };
-    let columns = body.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
-    let mut widths = vec![0usize; columns];
-    for (_, cells) in &body {
-        for (column, cell) in cells.iter().enumerate() {
-            widths[column] = widths[column].max(span_width(cell));
-        }
-    }
-
-    let mut lines = Vec::new();
-    for (is_header, cells) in body {
-        let mut spans: Vec<Span> = Vec::new();
-        let last = cells.len().saturating_sub(1);
-        let mut cell_widths = Vec::new();
-        for (column, cell) in cells.into_iter().enumerate() {
-            let width = span_width(&cell);
-            cell_widths.push(width);
-            for span in cell {
-                let span = if is_header {
-                    Span::styled(span.text, span.style.bold())
-                } else {
-                    span
-                };
-                spans.push(span);
-            }
-            if column < last {
-                spans.push(Span::raw(
-                    " ".repeat(widths[column].saturating_sub(width) + GAP),
-                ));
-            }
-        }
-        lines.push(Line { spans });
-        if is_header {
-            // Underline each header cell only as far as its own text: rules
-            // sized to full column widths overflow the viewport on wide cells
-            // and wrap into a wall of dashes.
-            let rule = cell_widths
+        body.push(
+            cells
                 .iter()
-                .enumerate()
-                .map(|(column, cell_width)| {
-                    let pad = widths
-                        .get(column)
-                        .map_or(0, |width| width.saturating_sub(*cell_width));
-                    format!("{}{}", "─".repeat(*cell_width), " ".repeat(pad))
-                })
-                .collect::<Vec<_>>()
-                .join(&" ".repeat(GAP));
-            lines.push(Line::styled(rule.trim_end(), Style::fg(theme.faint)));
+                .map(|cell| inline_spans(cell.trim(), base, theme))
+                .collect(),
+        );
+    }
+    let columns = body.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    let mut natural = vec![1usize; columns];
+    for cells in &body {
+        for (column, cell) in cells.iter().enumerate() {
+            let cell_width = cell.iter().map(|span| visible_width(&span.text)).sum();
+            natural[column] = natural[column].max(cell_width);
         }
     }
+    // Each column costs its text plus `│ ` and ` `; the row adds a last `│`.
+    let widths = fit_columns(&natural, width.saturating_sub(3 * columns + 1));
+
+    let border = Style::fg(theme.faint);
+    let rule = |left: &str, middle: &str, right: &str| {
+        let segments: Vec<String> = widths.iter().map(|width| "─".repeat(width + 2)).collect();
+        Line::styled(format!("{left}{}{right}", segments.join(middle)), border)
+    };
+    let mut lines = vec![rule("┌", "┬", "┐")];
+    for (index, cells) in body.into_iter().enumerate() {
+        if index > 0 {
+            lines.push(rule("├", "┼", "┤"));
+        }
+        let bold = header && index == 0;
+        let wrapped: Vec<Vec<Line>> = cells
+            .into_iter()
+            .chain(std::iter::repeat_with(Vec::new))
+            .zip(&widths)
+            .map(|(spans, &width)| {
+                let spans = if bold {
+                    spans
+                        .into_iter()
+                        .map(|span| Span::styled(span.text, span.style.bold()))
+                        .collect()
+                } else {
+                    spans
+                };
+                wrap_hanging(&Line { spans }, width, 0)
+            })
+            .collect();
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        for row in 0..height {
+            let mut spans = vec![Span::styled("│", border)];
+            for (column, cell) in wrapped.iter().enumerate() {
+                let piece = cell.get(row).cloned().unwrap_or_default();
+                let pad = widths[column].saturating_sub(piece.width());
+                let before = match aligns.get(column) {
+                    Some(Align::Right) => pad,
+                    Some(Align::Center) => pad / 2,
+                    _ => 0,
+                };
+                spans.push(Span::raw(" ".repeat(before + 1)));
+                spans.extend(piece.spans);
+                spans.push(Span::raw(" ".repeat(pad - before + 1)));
+                spans.push(Span::styled("│", border));
+            }
+            lines.push(Line { spans });
+        }
+    }
+    lines.push(rule("└", "┴", "┘"));
     lines
+}
+
+/// Column alignment from the separator row: `---` or `:--` left, `--:`
+/// right, `:-:` center.
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+impl Align {
+    fn of(cell: &str) -> Self {
+        match (cell.starts_with(':'), cell.ends_with(':')) {
+            (true, true) => Align::Center,
+            (false, true) => Align::Right,
+            _ => Align::Left,
+        }
+    }
+}
+
+/// The cells of a table row. A `|` splits cells unless it is escaped (`\|`)
+/// or inside inline code: models often leave pipes in code unescaped.
+fn split_cells(row: &str) -> Vec<String> {
+    let row = row.strip_prefix('|').unwrap_or(row);
+    let row = row.strip_suffix('|').unwrap_or(row);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut in_code = false;
+    let mut chars = row.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                cell.push('|');
+            }
+            '|' if !in_code => cells.push(std::mem::take(&mut cell)),
+            _ => {
+                in_code ^= ch == '`';
+                cell.push(ch);
+            }
+        }
+    }
+    cells.push(cell);
+    cells
+}
+
+/// Fit column widths into `budget`: columns narrower than an equal share
+/// keep their width, the wider ones split what is left evenly.
+fn fit_columns(natural: &[usize], budget: usize) -> Vec<usize> {
+    let mut widths = natural.to_vec();
+    if natural.iter().sum::<usize>() <= budget {
+        return widths;
+    }
+    let mut open: Vec<usize> = (0..natural.len()).collect();
+    let mut left = budget;
+    loop {
+        let share = left / open.len().max(1);
+        let (fit, wide): (Vec<usize>, Vec<usize>) =
+            open.iter().partition(|&&column| natural[column] <= share);
+        if fit.is_empty() {
+            let extra = left % wide.len().max(1);
+            for (rank, &column) in wide.iter().enumerate() {
+                widths[column] = (share + usize::from(rank < extra)).max(1);
+            }
+            return widths;
+        }
+        left -= fit.iter().map(|&column| natural[column]).sum::<usize>();
+        open = wide;
+    }
+}
+
+/// Display math on lines of its own: `$$ … $$` or `\[ … \]` on one line, or
+/// a bare opener line through a bare closer line. Returns the TeX and the
+/// lines used; `None` while the closer has not arrived (the lines stay text).
+fn display_math(lines: &[&str]) -> Option<(String, usize)> {
+    let first = lines[0].trim();
+    let (open, close) = [("$$", "$$"), ("\\[", "\\]")]
+        .into_iter()
+        .find(|(open, _)| first.starts_with(open))?;
+    let rest = &first[open.len()..];
+    if rest.trim().is_empty() {
+        let end = lines.iter().skip(1).position(|line| line.trim() == close)? + 1;
+        return Some((lines[1..end].join(" "), end + 1));
+    }
+    let tex = rest.strip_suffix(close)?;
+    (!tex.contains(close)).then(|| (tex.to_string(), 1))
 }
 
 /// If `line` is an ATX heading (`#`..`######` + space), return its level and text.
@@ -2406,6 +3057,13 @@ fn inline_spans(text: &str, base: Style, theme: &Theme) -> Vec<Span> {
             i = end + 1;
             continue;
         }
+        // Math: rendered as Unicode before emphasis, so `_` and `*` in TeX
+        // stay math.
+        if let Some((tex, end)) = math_span(&chars, i) {
+            buf.push_str(&crate::math::to_unicode(&tex));
+            i = end;
+            continue;
+        }
         // Bold: **text**
         if c == '*'
             && i + 1 < chars.len()
@@ -2421,9 +3079,13 @@ fn inline_spans(text: &str, base: Style, theme: &Theme) -> Vec<Span> {
             continue;
         }
         // Italic: *text* or _text_ — short emphasis only, never whole blocks.
+        // As in CommonMark, `_` inside a word (`web_search`) is no emphasis.
+        let in_word = |at: Option<&char>| at.is_some_and(|ch| ch.is_alphanumeric());
         if (c == '*' || c == '_')
+            && !(c == '_' && in_word(i.checked_sub(1).and_then(|at| chars.get(at))))
             && let Some(end) = find_char(&chars, i + 1, c)
             && end > i + 1
+            && !(c == '_' && in_word(chars.get(end + 1)))
         {
             push_buf(&mut buf, &mut spans, base);
             spans.push(Span::styled(
@@ -2448,6 +3110,32 @@ fn push_buf(buf: &mut String, spans: &mut Vec<Span>, style: Style) {
     if !buf.is_empty() {
         spans.push(Span::styled(std::mem::take(buf), style));
     }
+}
+
+/// The math span that opens at `chars[start]` — `$…$`, `$$…$$`, `\(…\)`
+/// or `\[…\]` — as its TeX and the index past the closer. A single `$`
+/// follows the pandoc rule, which keeps prices like `$5 and $10` out: no
+/// space after the opener, no space before the closer, no digit after it.
+fn math_span(chars: &[char], start: usize) -> Option<(String, usize)> {
+    let close: &[char] = match chars.get(start..start + 2)? {
+        ['$', '$'] => &['$', '$'],
+        ['$', _] => &['$'],
+        ['\\', '('] => &['\\', ')'],
+        ['\\', '['] => &['\\', ']'],
+        _ => return None,
+    };
+    let single = close == ['$'];
+    let from = start + if single { 1 } else { 2 };
+    if single && chars[from].is_whitespace() {
+        return None;
+    }
+    let end = (from + 1..=chars.len().saturating_sub(close.len())).find(|&end| {
+        chars[end..].starts_with(close)
+            && !(single
+                && (chars[end - 1].is_whitespace()
+                    || chars.get(end + 1).is_some_and(char::is_ascii_digit)))
+    })?;
+    Some((chars[from..end].iter().collect(), end + close.len()))
 }
 
 fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
@@ -2545,10 +3233,9 @@ fn tool_detail(
     arguments: &serde_json::Value,
     result: &crate::runtime::ToolBatchResult,
 ) -> ToolDetail {
-    if !result.ok {
-        return ToolDetail::Summary;
-    }
     match name {
+        // A failed command keeps its output too: the tail says why, and
+        // the model read the same text.
         "shell.exec" => {
             let mut rows: Vec<String> = result
                 .content
@@ -2568,7 +3255,7 @@ fn tool_detail(
                     .and_then(serde_json::Value::as_i64),
             }
         }
-        "file.replace" => {
+        "file.replace" if result.ok => {
             let old = string_argument(arguments, crate::runtime::REPLACE_OLD_ALIASES);
             let new = string_argument(arguments, crate::runtime::REPLACE_NEW_ALIASES);
             match (old, new) {

@@ -8,23 +8,33 @@ use std::error::Error;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
-use harness_tui::components::select::select_lines;
 use harness_tui::components::status::status_line;
 use harness_tui::core::Screen;
 use harness_tui::input::{Event, KeyCode, KeyEvent};
 use harness_tui::terminal as tui_terminal;
 use harness_tui::text::{Color, Line, Span, Style};
+use harness_tui::theme::Theme;
 
-use crate::providers::BuiltinProvider;
+use crate::model_client::OpenAiCompatibleModelClient;
+use crate::provider_wizard::{ProviderWizard, WizardAction};
+use crate::providers::{ModelDiscovery, ProviderConfig};
 use crate::repl::InputPump;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum TuiAction {
     Continue,
     Command(TuiCommand),
-    SaveProvider(TuiProviderDraft),
+    /// Fetch this provider's model list, then call `TuiApp::models_loaded`.
+    FetchModels(ProviderConfig),
+    /// Save the provider and start the chat with `model`.
+    SaveProvider {
+        provider: ProviderConfig,
+        model: String,
+    },
     Exit,
 }
 
@@ -36,22 +46,14 @@ pub enum TuiCommand {
     Exit,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TuiProviderDraft {
-    pub name: String,
-    pub base_url: String,
-    pub api_key: String,
-    pub model: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TuiApp {
     command_name: String,
     config_path: PathBuf,
     workspace: PathBuf,
     input: String,
     status_message: String,
-    dialog: Option<TuiDialog>,
+    wizard: Option<ProviderWizard>,
     /// True after a first Esc press at the top level: the next Esc
     /// exits, anything else disarms.
     exit_armed: bool,
@@ -70,7 +72,7 @@ impl TuiApp {
             input: String::new(),
             status_message: "Type /provider add to configure a provider inside this interface."
                 .to_string(),
-            dialog: None,
+            wizard: None,
             exit_armed: false,
         }
     }
@@ -84,7 +86,15 @@ impl TuiApp {
     }
 
     pub fn dialog_title(&self) -> Option<&str> {
-        self.dialog.as_ref().map(TuiDialog::title)
+        self.wizard.as_ref().map(ProviderWizard::title)
+    }
+
+    /// Hand the model list result to the open wizard (dropped when the
+    /// wizard was closed meanwhile).
+    pub fn models_loaded(&mut self, result: Result<(ProviderConfig, ModelDiscovery), String>) {
+        if let Some(wizard) = &mut self.wizard {
+            wizard.models_loaded(result);
+        }
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> TuiAction {
@@ -92,19 +102,22 @@ impl TuiApp {
             self.exit_armed = false;
         }
 
-        if let Some(dialog) = &mut self.dialog {
+        if let Some(wizard) = &mut self.wizard {
             // Esc closes the dialog (as its own hints promise) instead of
             // killing the whole program.
             if key.code == KeyCode::Esc {
-                self.dialog = None;
+                self.wizard = None;
                 self.status_message = "Provider setup closed.".to_string();
                 return TuiAction::Continue;
             }
-            let action = dialog.handle_key(key);
-            if matches!(action, TuiAction::SaveProvider(_) | TuiAction::Exit) {
-                self.dialog = None;
-            }
-            return action;
+            return match wizard.handle_key(key) {
+                WizardAction::Continue => TuiAction::Continue,
+                WizardAction::Fetch(provider) => TuiAction::FetchModels(provider),
+                WizardAction::Save { provider, model } => {
+                    self.wizard = None;
+                    TuiAction::SaveProvider { provider, model }
+                }
+            };
         }
 
         match key.code {
@@ -144,8 +157,8 @@ impl TuiApp {
         if pasted.is_empty() {
             return TuiAction::Continue;
         }
-        if let Some(dialog) = &mut self.dialog {
-            dialog.handle_paste(&pasted);
+        if let Some(wizard) = &mut self.wizard {
+            wizard.handle_paste(&pasted);
         } else {
             self.input.push_str(&pasted);
         }
@@ -171,7 +184,7 @@ impl TuiApp {
         match command {
             TuiCommand::ProviderAdd => {
                 self.status_message = "Provider setup opened.".to_string();
-                self.dialog = Some(TuiDialog::ProviderWizard(ProviderWizard::new()));
+                self.wizard = Some(ProviderWizard::new());
                 TuiAction::Command(TuiCommand::ProviderAdd)
             }
             TuiCommand::Providers => {
@@ -190,237 +203,6 @@ impl TuiApp {
             }
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TuiDialog {
-    ProviderWizard(ProviderWizard),
-}
-
-impl TuiDialog {
-    fn title(&self) -> &str {
-        match self {
-            Self::ProviderWizard(wizard) => wizard.title(),
-        }
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> TuiAction {
-        match self {
-            Self::ProviderWizard(wizard) => wizard.handle_key(key),
-        }
-    }
-
-    fn handle_paste(&mut self, text: &str) {
-        match self {
-            Self::ProviderWizard(wizard) => wizard.handle_paste(text),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderWizard {
-    step: ProviderWizardStep,
-    selected_provider: usize,
-    base_url: String,
-    api_key: String,
-    model: String,
-    base_url_edited: bool,
-    api_key_edited: bool,
-    model_edited: bool,
-}
-
-impl ProviderWizard {
-    fn new() -> Self {
-        Self {
-            step: ProviderWizardStep::Provider,
-            selected_provider: 0,
-            base_url: String::new(),
-            api_key: String::new(),
-            model: String::new(),
-            base_url_edited: false,
-            api_key_edited: false,
-            model_edited: false,
-        }
-    }
-
-    fn title(&self) -> &str {
-        "Provider setup"
-    }
-
-    fn handle_key(&mut self, key: KeyEvent) -> TuiAction {
-        match self.step {
-            ProviderWizardStep::Provider => self.handle_provider_key(key),
-            ProviderWizardStep::BaseUrl => self.handle_text_key(key, TextTarget::BaseUrl),
-            ProviderWizardStep::ApiKey => self.handle_text_key(key, TextTarget::ApiKey),
-            ProviderWizardStep::Model => self.handle_model_key(key),
-        }
-    }
-
-    fn handle_provider_key(&mut self, key: KeyEvent) -> TuiAction {
-        // Esc never reaches the wizard: TuiApp::handle_key closes the
-        // dialog before dispatching here.
-        match key.code {
-            KeyCode::Up => {
-                if self.selected_provider == 0 {
-                    self.selected_provider = BuiltinProvider::ALL.len() - 1;
-                } else {
-                    self.selected_provider -= 1;
-                }
-                TuiAction::Continue
-            }
-            KeyCode::Down => {
-                self.selected_provider = (self.selected_provider + 1) % BuiltinProvider::ALL.len();
-                TuiAction::Continue
-            }
-            KeyCode::Enter => {
-                self.apply_provider_defaults();
-                self.step = ProviderWizardStep::BaseUrl;
-                TuiAction::Continue
-            }
-            _ => TuiAction::Continue,
-        }
-    }
-
-    fn handle_text_key(&mut self, key: KeyEvent, target: TextTarget) -> TuiAction {
-        match key.code {
-            KeyCode::Enter => {
-                if !self.active_text(target).trim().is_empty() {
-                    self.step = match target {
-                        TextTarget::BaseUrl => ProviderWizardStep::ApiKey,
-                        TextTarget::ApiKey => ProviderWizardStep::Model,
-                    };
-                }
-                TuiAction::Continue
-            }
-            KeyCode::Backspace => {
-                self.mark_text_edited(target);
-                self.active_text_mut(target).pop();
-                TuiAction::Continue
-            }
-            KeyCode::Char(ch) if !key.mods.ctrl => {
-                if !self.text_edited(target) {
-                    self.active_text_mut(target).clear();
-                    self.mark_text_edited(target);
-                }
-                self.active_text_mut(target).push(ch);
-                TuiAction::Continue
-            }
-            _ => TuiAction::Continue,
-        }
-    }
-
-    fn handle_model_key(&mut self, key: KeyEvent) -> TuiAction {
-        match key.code {
-            KeyCode::Backspace => {
-                self.model_edited = true;
-                self.model.pop();
-                TuiAction::Continue
-            }
-            KeyCode::Char(ch) if !key.mods.ctrl => {
-                if !self.model_edited {
-                    self.model.clear();
-                    self.model_edited = true;
-                }
-                self.model.push(ch);
-                TuiAction::Continue
-            }
-            KeyCode::Enter => {
-                if self.model.trim().is_empty() {
-                    return TuiAction::Continue;
-                }
-                TuiAction::SaveProvider(TuiProviderDraft {
-                    name: BuiltinProvider::ALL[self.selected_provider]
-                        .name()
-                        .to_string(),
-                    base_url: self.base_url.trim().to_string(),
-                    api_key: self.api_key.trim().to_string(),
-                    model: self.model.trim().to_string(),
-                })
-            }
-            _ => TuiAction::Continue,
-        }
-    }
-
-    fn handle_paste(&mut self, text: &str) {
-        match self.step {
-            ProviderWizardStep::Provider => {}
-            ProviderWizardStep::BaseUrl => self.paste_into_text(TextTarget::BaseUrl, text),
-            ProviderWizardStep::ApiKey => self.paste_into_text(TextTarget::ApiKey, text),
-            ProviderWizardStep::Model => {
-                if !self.model_edited {
-                    self.model.clear();
-                    self.model_edited = true;
-                }
-                self.model.push_str(text);
-            }
-        }
-    }
-
-    fn paste_into_text(&mut self, target: TextTarget, text: &str) {
-        if !self.text_edited(target) {
-            self.active_text_mut(target).clear();
-            self.mark_text_edited(target);
-        }
-        self.active_text_mut(target).push_str(text);
-    }
-
-    fn apply_provider_defaults(&mut self) {
-        // Canonical profile data only: families the profiles deliberately
-        // leave without a base_url get an empty field the user must fill.
-        let profile = BuiltinProvider::ALL[self.selected_provider].profile();
-        self.base_url = profile.base_url.unwrap_or_default().to_string();
-        self.model = profile
-            .model_hints
-            .first()
-            .copied()
-            .unwrap_or_default()
-            .to_string();
-        self.base_url_edited = false;
-        self.api_key_edited = false;
-        self.model_edited = false;
-    }
-
-    fn active_text(&self, target: TextTarget) -> &str {
-        match target {
-            TextTarget::BaseUrl => &self.base_url,
-            TextTarget::ApiKey => &self.api_key,
-        }
-    }
-
-    fn active_text_mut(&mut self, target: TextTarget) -> &mut String {
-        match target {
-            TextTarget::BaseUrl => &mut self.base_url,
-            TextTarget::ApiKey => &mut self.api_key,
-        }
-    }
-
-    fn text_edited(&self, target: TextTarget) -> bool {
-        match target {
-            TextTarget::BaseUrl => self.base_url_edited,
-            TextTarget::ApiKey => self.api_key_edited,
-        }
-    }
-
-    fn mark_text_edited(&mut self, target: TextTarget) {
-        match target {
-            TextTarget::BaseUrl => self.base_url_edited = true,
-            TextTarget::ApiKey => self.api_key_edited = true,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderWizardStep {
-    Provider,
-    BaseUrl,
-    ApiKey,
-    Model,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextTarget {
-    BaseUrl,
-    ApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,12 +248,19 @@ pub fn run_tui(
     screen.clear_screen().map_err(TuiError::Io)?;
     let mut app = TuiApp::new(command_name, config_path, workspace);
     let mut pump = InputPump::start();
+    let mut fetch: Option<mpsc::Receiver<FetchResult>> = None;
 
     loop {
+        if let Some(result) = fetch.as_ref().and_then(|receiver| receiver.try_recv().ok()) {
+            app.models_loaded(result);
+            fetch = None;
+        }
         let panel = setup_lines(&app, screen.width() as usize);
         draw_panel(&mut screen, panel)?;
+        // Poll faster while the model list loads so its answer shows at once.
+        let poll = if fetch.is_some() { 100 } else { 400 };
         let events = pump
-            .poll(Duration::from_millis(400))
+            .poll(Duration::from_millis(poll))
             .map_err(TuiError::Io)?;
         check_resize(&mut screen)?;
         for event in events {
@@ -482,6 +271,7 @@ pub fn run_tui(
             };
             match action {
                 TuiAction::Continue | TuiAction::Command(_) => {}
+                TuiAction::FetchModels(provider) => fetch = Some(spawn_model_fetch(provider)),
                 action => {
                     let _ = screen.release();
                     return Ok(action);
@@ -489,6 +279,24 @@ pub fn run_tui(
             }
         }
     }
+}
+
+/// What a model list fetch hands back to the wizard.
+pub type FetchResult = Result<(ProviderConfig, ModelDiscovery), String>;
+
+/// How long the wizard waits for `/models`.
+const MODEL_FETCH_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Run `discover` on a worker thread so the screen stays responsive.
+pub fn spawn_model_fetch(provider: ProviderConfig) -> mpsc::Receiver<FetchResult> {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let result = OpenAiCompatibleModelClient::new(MODEL_FETCH_TIMEOUT)
+            .discover(provider)
+            .map_err(|err| err.to_string());
+        let _ = sender.send(result);
+    });
+    receiver
 }
 
 /// Repaint the pinned panel, capped to the screen height so the panel
@@ -523,12 +331,12 @@ pub fn setup_lines(app: &TuiApp, width: usize) -> Vec<Line> {
         &app.status_message,
     ));
     lines.push(Line::raw(""));
-    match &app.dialog {
-        Some(TuiDialog::ProviderWizard(wizard)) => lines.extend(wizard_lines(wizard)),
+    match &app.wizard {
+        Some(wizard) => lines.extend(wizard.lines(&Theme::dark())),
         None => lines.extend(command_lines()),
     }
     lines.push(Line::raw(""));
-    lines.push(input_line(&app.input, app.dialog.is_none()));
+    lines.push(input_line(&app.input, app.wizard.is_none()));
     lines.push(footer_line(width));
     lines
 }
@@ -586,60 +394,6 @@ fn command_lines() -> Vec<Line> {
         .collect()
 }
 
-fn wizard_lines(wizard: &ProviderWizard) -> Vec<Line> {
-    let mut lines = vec![
-        Line::styled(wizard.title(), Style::default().bold()),
-        Line::raw(""),
-    ];
-    match wizard.step {
-        ProviderWizardStep::Provider => {
-            lines.push(Line::styled("Select provider", Style::default().bold()));
-            lines.push(Line::raw(""));
-            let names: Vec<&str> = BuiltinProvider::ALL
-                .iter()
-                .map(|provider| provider.name())
-                .collect();
-            lines.extend(select_lines(&names, wizard.selected_provider));
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Up/Down move  Enter accept  Esc close",
-                Style::default().dim(),
-            ));
-        }
-        ProviderWizardStep::BaseUrl => {
-            lines.push(Line::styled("Base URL", Style::default().bold()));
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(wizard.base_url.clone()));
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Enter accept  Esc close",
-                Style::default().dim(),
-            ));
-        }
-        ProviderWizardStep::ApiKey => {
-            lines.push(Line::styled("API key", Style::default().bold()));
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(mask_secret(&wizard.api_key)));
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Enter accept  Esc close",
-                Style::default().dim(),
-            ));
-        }
-        ProviderWizardStep::Model => {
-            lines.push(Line::styled("Model", Style::default().bold()));
-            lines.push(Line::raw(""));
-            lines.push(Line::raw(wizard.model.clone()));
-            lines.push(Line::raw(""));
-            lines.push(Line::styled(
-                "Enter save  Esc close",
-                Style::default().dim(),
-            ));
-        }
-    }
-    lines
-}
-
 /// The command prompt row. The caret is a reverse-styled cell at the end
 /// of the input; it is hidden while a dialog owns the keyboard.
 fn input_line(input: &str, show_caret: bool) -> Line {
@@ -680,13 +434,6 @@ fn sanitize_pasted_line(text: &str) -> String {
     text.chars()
         .filter(|ch| *ch != '\n' && *ch != '\r')
         .collect()
-}
-
-fn mask_secret(value: &str) -> String {
-    if value.is_empty() {
-        return String::new();
-    }
-    "*".repeat(value.chars().count().min(12))
 }
 
 fn display_path(path: &Path) -> String {

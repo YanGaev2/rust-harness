@@ -24,6 +24,65 @@ fn shell_tool_runs_command_with_native_profile() {
 
 #[cfg(windows)]
 #[test]
+fn native_stderr_merged_with_2_and_1_is_not_a_failure() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(20));
+
+    // PowerShell 5.1 wraps every stderr line of a native program merged
+    // by `2>&1` in a NativeCommandError record and sets `$?` to false:
+    // `cargo build 2>&1 | Select-Object -Last 5` exited 1 although cargo
+    // succeeded (it prints progress to stderr) — seen live with Kimi K3.
+    let output = tool
+        .run("cmd /c \"echo progress 1>&2\" 2>&1 | Select-Object -Last 5")
+        .unwrap();
+
+    assert_eq!(output.exit_code, Some(0), "{output:?}");
+    assert!(
+        format!("{}{}", output.stdout, output.stderr).contains("progress"),
+        "{output:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_keeps_delayed_table_output_before_the_exit_code() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("probe.txt"), "hi").unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(20));
+
+    // PowerShell holds implicit table output (custom objects from a
+    // calculated property) for ~300 ms to size the columns; an `exit`
+    // before that flushes drops the table — the model got an empty result
+    // for `Get-Item x | Select-Object @{N='SizeMB';E={...}}`.
+    let output = tool
+        .run("Get-Item probe.txt | Select-Object @{N='SizeKB';E={[math]::Round($_.Length/1KB,2)}}")
+        .unwrap();
+    assert_eq!(output.exit_code, Some(0), "{output:?}");
+    assert!(output.stdout.contains("SizeKB"), "{output:?}");
+
+    let exited = tool.run("'before'; exit 5").unwrap();
+    assert_eq!(exited.exit_code, Some(5), "{exited:?}");
+    assert!(exited.stdout.contains("before"), "{exited:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_exit_code_follows_the_last_command() {
+    let root = tempfile::tempdir().unwrap();
+    let tool = ShellTool::native(root.path(), Duration::from_secs(20));
+
+    let native_failure = tool.run("cmd /c exit 3").unwrap();
+    assert_eq!(native_failure.exit_code, Some(3), "{native_failure:?}");
+
+    let cmdlet_failure = tool.run("Get-Item does-not-exist").unwrap();
+    assert_ne!(cmdlet_failure.exit_code, Some(0), "{cmdlet_failure:?}");
+
+    let recovered = tool.run("Get-Item does-not-exist; cmd /c exit 0").unwrap();
+    assert_eq!(recovered.exit_code, Some(0), "{recovered:?}");
+}
+
+#[cfg(windows)]
+#[test]
 fn powershell_error_stream_reaches_the_model_as_valid_utf8() {
     let root = tempfile::tempdir().unwrap();
     let tool = ShellTool::native(root.path(), Duration::from_secs(10));

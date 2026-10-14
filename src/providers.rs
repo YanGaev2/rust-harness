@@ -1,9 +1,10 @@
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     name: String,
     base_url: String,
@@ -30,6 +31,10 @@ pub struct ProviderConfig {
     /// stream) always win on key collision.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extra_body: Option<serde_json::Value>,
+    /// What the provider's `/models` list reported per model (context
+    /// window, prices) when the provider was added.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    model_info: BTreeMap<String, ModelInfo>,
 }
 
 impl ProviderConfig {
@@ -49,6 +54,7 @@ impl ProviderConfig {
             key_env: None,
             proxy: None,
             extra_body: None,
+            model_info: BTreeMap::new(),
         }
     }
 
@@ -64,6 +70,7 @@ impl ProviderConfig {
             key_env: None,
             proxy: None,
             extra_body: None,
+            model_info: BTreeMap::new(),
         }
     }
 
@@ -168,6 +175,32 @@ impl ProviderConfig {
 
     pub fn key_env(&self) -> Option<&str> {
         self.key_env.as_deref()
+    }
+
+    /// Add `models` together with what `discovery` reported about them.
+    pub fn with_discovered_models(mut self, discovery: &ModelDiscovery, models: &[String]) -> Self {
+        for model in models {
+            let info = discovery.model_info(model);
+            if info != ModelInfo::default() {
+                self.model_info.insert(model.clone(), info);
+            }
+            self = self.with_model(model.clone());
+        }
+        self
+    }
+
+    /// What `/models` reported for `model` when the provider was added.
+    pub fn model_info(&self, model: &str) -> Option<&ModelInfo> {
+        self.model_info.get(model)
+    }
+
+    /// Prices for `model`: the saved `/models` prices first, then the
+    /// built-in price list.
+    pub fn pricing(&self, model: &str) -> Option<ModelPricing> {
+        self.model_info
+            .get(model)
+            .and_then(|info| info.pricing.clone())
+            .or_else(|| builtin_pricing(&self.name, model))
     }
 
     pub fn auth_header(&self) -> Option<(String, String)> {
@@ -368,6 +401,21 @@ impl BuiltinProvider {
     }
 }
 
+/// Provider seeded from the builtin profile when the name matches a family,
+/// plain otherwise.
+pub fn provider_from_profile(name: String, url: String, key: String) -> ProviderConfig {
+    if let Some(builtin) = BuiltinProvider::from_name(&name) {
+        let profile = builtin.profile();
+        ProviderConfig::new(profile.name, url, key)
+            .with_auth_scheme(profile.auth_scheme)
+            .with_cache_policy(profile.cache_policy)
+            .with_chat_api(profile.chat_api)
+            .with_key_env(profile.key_env)
+    } else {
+        ProviderConfig::new(name, url, key)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderProfile {
     pub name: &'static str,
@@ -381,14 +429,23 @@ pub struct ProviderProfile {
     pub base_url: Option<&'static str>,
 }
 
-/// USD per 1M tokens, from the provider's official price page on `as_of`.
-/// Estimates only — prices change; overrides belong in providers.json.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// USD per 1M tokens, from the provider's official price page or its
+/// `/models` list on `as_of`. Estimates only — prices change.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelPricing {
     pub input_per_mtok: f64,
     pub cached_input_per_mtok: f64,
     pub output_per_mtok: f64,
-    pub as_of: &'static str,
+    pub as_of: String,
+}
+
+/// What a provider's `/models` entry reports about one model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<ModelPricing>,
 }
 
 impl ModelPricing {
@@ -418,19 +475,19 @@ pub fn builtin_pricing(provider: &str, model: &str) -> Option<ModelPricing> {
             input_per_mtok: 1.40,
             cached_input_per_mtok: 0.26,
             output_per_mtok: 4.40,
-            as_of: "2026-07-13",
+            as_of: "2026-07-13".to_string(),
         }),
         (BuiltinProvider::DeepSeek, "deepseek-v4-pro") => Some(ModelPricing {
             input_per_mtok: 0.435,
             cached_input_per_mtok: 0.003625,
             output_per_mtok: 0.87,
-            as_of: "2026-07-13",
+            as_of: "2026-07-13".to_string(),
         }),
         (BuiltinProvider::DeepSeek, "deepseek-v4-flash" | "deepseek-chat") => Some(ModelPricing {
             input_per_mtok: 0.14,
             cached_input_per_mtok: 0.0028,
             output_per_mtok: 0.28,
-            as_of: "2026-07-13",
+            as_of: "2026-07-13".to_string(),
         }),
         _ => None,
     }
@@ -442,11 +499,15 @@ pub enum ModelChoice {
     Model(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModelDiscovery {
     provider_name: String,
     model_ids: Vec<String>,
     choices: Vec<ModelChoice>,
+    /// Context window and prices per model, for the entries that report them.
+    info: BTreeMap<String, ModelInfo>,
+    /// The list has the Anthropic Models API shape (`has_more` paging).
+    anthropic_shape: bool,
 }
 
 impl ModelDiscovery {
@@ -455,6 +516,22 @@ impl ModelDiscovery {
         raw_json: &str,
     ) -> Result<Self, ModelDiscoveryError> {
         let parsed: OpenAiModelsResponse = serde_json::from_str(raw_json)?;
+        let info = parsed
+            .data
+            .iter()
+            .filter_map(|entry| {
+                let info = ModelInfo {
+                    context_window: entry
+                        .context_length
+                        .or(entry.context_window)
+                        .or(entry.max_model_len)
+                        .or(entry.max_input_tokens),
+                    pricing: entry.pricing.as_ref().and_then(per_token_pricing),
+                };
+                (info != ModelInfo::default()).then(|| (entry.id.clone(), info))
+            })
+            .collect();
+        let anthropic_shape = parsed.has_more.is_some();
         let mut model_ids = parsed
             .data
             .into_iter()
@@ -472,7 +549,37 @@ impl ModelDiscovery {
             provider_name: provider.name().to_string(),
             model_ids,
             choices,
+            info,
+            anthropic_shape,
         })
+    }
+
+    /// The model's context window in tokens, when its `/models` entry
+    /// reports one.
+    pub fn context_window(&self, model: &str) -> Option<u64> {
+        self.info.get(model).and_then(|info| info.context_window)
+    }
+
+    /// Everything the model's `/models` entry reported (empty when nothing).
+    pub fn model_info(&self, model: &str) -> ModelInfo {
+        self.info.get(model).cloned().unwrap_or_default()
+    }
+
+    /// True when the list came from an Anthropic Models API endpoint.
+    pub fn is_anthropic_shape(&self) -> bool {
+        self.anthropic_shape
+    }
+
+    /// Stamp the prices read from this list with the day it was fetched.
+    pub fn with_pricing_date(mut self, date: &str) -> Self {
+        for pricing in self
+            .info
+            .values_mut()
+            .filter_map(|info| info.pricing.as_mut())
+        {
+            pricing.as_of = date.to_string();
+        }
+        self
     }
 
     pub fn provider_name(&self) -> &str {
@@ -578,9 +685,48 @@ impl From<serde_json::Error> for ModelDiscoveryError {
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     data: Vec<OpenAiModelEntry>,
+    /// Only the Anthropic Models API pages with `has_more`.
+    #[serde(default)]
+    has_more: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
 struct OpenAiModelEntry {
     id: String,
+    /// The context window under the names providers use: baseten and
+    /// OpenRouter `context_length`, Groq-style `context_window`, vLLM
+    /// `max_model_len`.
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    max_model_len: Option<u64>,
+    /// Anthropic Models API name for the context window.
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    /// OpenRouter prices: USD per token, as decimal strings.
+    #[serde(default)]
+    pricing: Option<serde_json::Value>,
+}
+
+/// Convert OpenRouter-style per-token prices (`prompt`, `completion`,
+/// optional `input_cache_read`; strings or numbers) to USD per 1M tokens.
+/// Negative prices (OpenRouter's `-1` for routers) mean "unknown".
+fn per_token_pricing(pricing: &serde_json::Value) -> Option<ModelPricing> {
+    let price = |field: &str| {
+        let per_token = match pricing.get(field)? {
+            serde_json::Value::String(text) => text.trim().parse::<f64>().ok()?,
+            other => other.as_f64()?,
+        };
+        (per_token >= 0.0).then_some(per_token * 1_000_000.0)
+    };
+    let input = price("prompt")?;
+    let output = price("completion")?;
+    Some(ModelPricing {
+        input_per_mtok: input,
+        cached_input_per_mtok: price("input_cache_read").unwrap_or(input),
+        output_per_mtok: output,
+        as_of: String::new(),
+    })
 }

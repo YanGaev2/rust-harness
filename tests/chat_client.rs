@@ -1594,3 +1594,89 @@ fn wire_tap_captures_raw_sse_data_lines() {
         .collect();
     assert_eq!(sse, lines);
 }
+
+/// A keep-alive server: answers every request on a connection with `reply`
+/// until the client hangs up, and counts the connections it accepted.
+fn keep_alive_server(
+    reply: &'static str,
+    content_type: &'static str,
+) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = connections.clone();
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let mut chunk = [0; 4096];
+                loop {
+                    let Some(end) = find_header_end(&buffer) else {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..end]).to_ascii_lowercase();
+                    let length = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .and_then(|value| value.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    while buffer.len() < end + 4 + length {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => return,
+                            Ok(read) => buffer.extend_from_slice(&chunk[..read]),
+                        }
+                    }
+                    buffer.drain(..end + 4 + length);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    if stream.write_all(response.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (addr, connections)
+}
+
+#[test]
+fn consecutive_requests_reuse_one_connection() {
+    let envelope = RequestEnvelope::new("deepseek", "deepseek-v4-pro")
+        .with_messages(vec![ChatMessage::user("hi")]);
+    let client = ProviderChatClient::new(Duration::from_secs(5));
+
+    // Streaming: the stream stops reading at [DONE]; the rest of the body is
+    // drained so the connection goes back to the pool.
+    let (addr, connections) = keep_alive_server(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+        "text/event-stream",
+    );
+    let provider = ProviderConfig::new("deepseek", format!("http://{addr}/v1"), "sk-test");
+    for _ in 0..2 {
+        let response = client.stream_chat(&provider, &envelope, |_| {}).unwrap();
+        assert_eq!(response.content.as_deref(), Some("ok"));
+        // The drain runs in the background; the next agent round starts
+        // after tool calls, never within microseconds.
+        thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let (addr, connections) = keep_alive_server(
+        r#"{"choices":[{"message":{"role":"assistant","content":"ok"}}]}"#,
+        "application/json",
+    );
+    let provider = ProviderConfig::new("deepseek", format!("http://{addr}/v1"), "sk-test");
+    for _ in 0..2 {
+        let response = client.send(&provider, &envelope).unwrap();
+        assert_eq!(response.content.as_deref(), Some("ok"));
+    }
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+}

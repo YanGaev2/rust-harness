@@ -56,7 +56,7 @@ impl ConfigStore {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct HarnessConfig {
     providers: BTreeMap<String, ProviderConfig>,
     /// Config-wide proxy (URL, "env", or "none") inherited by every provider

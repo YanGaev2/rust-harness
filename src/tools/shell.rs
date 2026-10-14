@@ -14,6 +14,25 @@ use crate::platform::{ShellKind, ShellProfile};
 
 pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+/// Runs after the model's PowerShell command and sets the process exit
+/// code the way a POSIX shell would: the exit code of the last native
+/// program, else success unless a real error happened. `powershell
+/// -Command` itself exits 1 whenever `$?` is false, and Windows
+/// PowerShell 5.1 sets `$?` to false for every stderr line of a native
+/// program merged by `2>&1` (a `NativeCommandError` record): `cargo build
+/// 2>&1 | Select-Object -Last 5` reported failure although cargo
+/// succeeded, because cargo prints its progress to stderr. It also turned
+/// every native exit code into 1. Starts on its own line, so a trailing
+/// comment in the command cannot swallow it. The code goes through
+/// `$host.SetShouldExit`, not `exit`: PowerShell holds implicit table
+/// output (custom objects, e.g. from a calculated property) for ~300 ms to
+/// size the columns, and an `exit` before that flush dropped the table.
+const POWERSHELL_EXIT_EPILOGUE: &str = "$__harness_ok=$?\n\
+if ($global:LASTEXITCODE) { $__harness_code = $global:LASTEXITCODE }\n\
+elseif ($__harness_ok -or -not ($Error | Where-Object { \"$($_.FullyQualifiedErrorId)\" -notlike 'NativeCommandError*' })) { $__harness_code = 0 }\n\
+else { $__harness_code = 1 }\n\
+$host.SetShouldExit($__harness_code)";
+
 #[derive(Debug, Clone)]
 pub struct ShellTool {
     cwd: PathBuf,
@@ -64,7 +83,8 @@ impl ShellTool {
             ShellKind::Pwsh | ShellKind::WindowsPowerShell => {
                 command_buf = format!(
                     "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8;\
-                     $OutputEncoding=[System.Text.Encoding]::UTF8; {command}"
+                     $OutputEncoding=[System.Text.Encoding]::UTF8;$global:LASTEXITCODE=0\n\
+                     {command}\n{POWERSHELL_EXIT_EPILOGUE}"
                 );
                 &command_buf
             }
